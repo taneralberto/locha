@@ -1,0 +1,21 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Base de datos local (nunca versionar datos financieros)
+/data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Cerrojo de la instancia local
+*.sqlite.lock/
+
+# Configuracion local (puede contener secretos en etapas posteriores)
+.env
+.env.*
+!.env.example
+
+.DS_Store

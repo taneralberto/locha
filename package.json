@@ -1,0 +1,47 @@
+{
+  "name": "locha",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Asistente financiero personal con IA - backend NestJS (Etapa A: dominio, persistencia, interpretacion, captura durable y bot de Telegram)",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "node scripts/dev.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "jest",
+    "test:e2e": "jest --config jest.e2e.config.js",
+    "cli": "node dist/cli.js",
+    "migration:run": "npm run build --silent && node dist/cli.js migration:run",
+    "account:add": "npm run build --silent && node dist/cli.js account:add",
+    "account:list": "npm run build --silent && node dist/cli.js account:list",
+    "backup": "npm run build --silent && node dist/cli.js backup",
+    "restore": "npm run build --silent && node dist/cli.js restore"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/typeorm": "^11.0.0",
+    "better-sqlite3": "^12.0.0",
+    "dotenv": "^17.4.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "typeorm": "^0.3.20",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^24.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "better-sqlite3": true
+  }
+}
