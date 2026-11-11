@@ -96,12 +96,14 @@ describe('Flujo completo del bot de Telegram', () => {
       transactions,
       financialService,
       operationInterpreter,
-      new InferenceBudgetService(source, transactions, LIMITS),
+      new InferenceBudgetService(transactions, LIMITS),
     );
     const commands = new TelegramCommands(
       capture,
       financialService,
       new AccountService(source, transactions),
+      new InferenceBudgetService(transactions, LIMITS),
+      LIMITS,
     );
     return new TelegramService(source, transactions, commands, telegramClient, SETTINGS);
   }

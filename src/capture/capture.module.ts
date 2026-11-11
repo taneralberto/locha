@@ -1,6 +1,5 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DataSource } from 'typeorm';
 import { AiLimits } from '../config/configuration';
 import { DataModule } from '../data/data.module';
 import { TransactionRunner } from '../data/transaction.runner';
@@ -18,13 +17,12 @@ import { InferenceBudgetService } from './inference-budget.service';
   providers: [
     {
       provide: InferenceBudgetService,
-      inject: [DataSource, TransactionRunner, ConfigService],
+      inject: [TransactionRunner, ConfigService],
       useFactory: (
-        dataSource: DataSource,
         transactions: TransactionRunner,
         config: ConfigService,
       ): InferenceBudgetService =>
-        new InferenceBudgetService(dataSource, transactions, config.getOrThrow<AiLimits>('ai.limits')),
+        new InferenceBudgetService(transactions, config.getOrThrow<AiLimits>('ai.limits')),
     },
     CaptureService,
   ],

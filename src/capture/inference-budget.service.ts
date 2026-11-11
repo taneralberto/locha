@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { DataSource } from 'typeorm';
 import { AiLimits } from '../config/configuration';
 import { TransactionRunner } from '../data/transaction.runner';
 import { dateInTimeZone } from '../domain/date';
@@ -28,7 +27,6 @@ export class BudgetExhaustedError extends Error {
 @Injectable()
 export class InferenceBudgetService {
   constructor(
-    private readonly dataSource: DataSource,
     private readonly transactions: TransactionRunner,
     private readonly limits: AiLimits,
   ) {}
@@ -63,9 +61,11 @@ export class InferenceBudgetService {
     });
   }
 
-  /** Consumo reservado del dia en curso. */
+  /** Consumo reservado del dia en curso. La lectura pasa por la cola de transacciones. */
   async current(): Promise<AiUsageDay | null> {
     const day = dateInTimeZone(new Date(), DEFAULT_TIME_ZONE);
-    return this.dataSource.getRepository(AiUsageDay).findOneBy({ day });
+    return this.transactions.run(async (manager) =>
+      manager.getRepository(AiUsageDay).findOneBy({ day }),
+    );
   }
 }

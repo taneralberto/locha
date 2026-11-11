@@ -79,7 +79,7 @@ describe('CaptureService', () => {
       transactions,
       financial ?? new FinancialService(transactions),
       interpreter,
-      new InferenceBudgetService(dataSource, transactions, limits),
+      new InferenceBudgetService(transactions, limits),
     );
   }
 
@@ -489,6 +489,55 @@ describe('CaptureService', () => {
       expect(interpreter.requests).toHaveLength(1);
     });
 
+    it('cancela el borrador anterior cuando la interpretacion falla', async () => {
+      const interpreter = new FakeInterpreter([
+        operation({ accountId: account.id }),
+        new InterpreterError('timeout', 'El proveedor no respondio a tiempo.'),
+        operation({ accountId: account.id }),
+      ]);
+      const service = buildService(interpreter);
+
+      const draft = await handle(service, { eventId: 'e1', text: 'Helado 2 dolares' });
+      expect(draft.captureState).toBe('awaiting_confirmation');
+
+      const failed = await handle(service, { eventId: 'e2', text: 'Era 5 dolares' });
+      expect(failed.reply).toContain('Vuelve a enviar el mensaje completo');
+
+      // El borrador anterior quedo cancelado: /confirm no registra nada.
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.reply).toContain('No hay ninguna operacion pendiente');
+      expect(await movementCount()).toBe(0);
+
+      const capture = await onlyRow(await database.dataSource.getRepository(Capture).find());
+      expect(capture.state).toBe('cancelled');
+      expect(capture.sourceText).toBeNull();
+
+      // La siguiente interpretacion no ve ningun borrador anterior.
+      await handle(service, { eventId: 'e4', text: 'Helado 2 dolares' });
+      expect(interpreter.requests[2]?.pending).toBeNull();
+    });
+
+    it('cancela el borrador cuando se recupera un evento a medias', async () => {
+      const interpreter = new FakeInterpreter([
+        operation({ accountId: account.id }),
+        operation({ accountId: account.id }),
+      ]);
+      const service = buildService(interpreter);
+
+      await handle(service, { eventId: 'e1', text: 'Helado 2 dolares' });
+
+      // El evento quedo a medias (por ejemplo, se corto la inferencia).
+      const events = database.dataSource.getRepository(CaptureEvent);
+      await events.update({ eventId: 'e1' }, { state: 'processing', reply: null });
+
+      const recovered = await handle(service, { eventId: 'e1', text: 'Helado 2 dolares' });
+      expect(recovered.reply).toContain('Vuelve a enviar el mensaje completo');
+
+      const capture = await onlyRow(await database.dataSource.getRepository(Capture).find());
+      expect(capture.state).toBe('cancelled');
+      expect(await movementCount()).toBe(0);
+    });
+
     it('consume la reserva aunque la llamada falle', async () => {
       const interpreter = new FakeInterpreter([
         new InterpreterError('invalid', 'La respuesta no cumple el esquema.'),
@@ -676,9 +725,14 @@ describe('CaptureService', () => {
     });
 
     it('el codigo fuente no contiene bytes de control literales', () => {
-      const source = readFileSync(join(__dirname, '../src/capture/capture.service.ts'));
+      const sources = [
+        join(__dirname, '../src/capture/capture.service.ts'),
+        join(__dirname, '../src/capture/source-key.ts'),
+      ];
 
-      expect(source.includes(0)).toBe(false);
+      for (const source of sources) {
+        expect(readFileSync(source).includes(0)).toBe(false);
+      }
     });
   });
 });

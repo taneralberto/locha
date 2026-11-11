@@ -1,7 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { AccountService } from '../accounts/account.service';
 import { CaptureService } from '../capture/capture.service';
-import { DEFAULT_TIME_ZONE } from '../capture/inference-budget.service';
+import { DEFAULT_TIME_ZONE, InferenceBudgetService } from '../capture/inference-budget.service';
+import { AiLimits } from '../config/configuration';
 import { dateInTimeZone, parseMonth } from '../domain/date';
 import { ValidationError } from '../domain/errors';
 import { formatAmount } from '../domain/money';
@@ -16,12 +17,19 @@ const RECENT_LIMIT = 10;
 /** Longitud de la descripcion en la lista de movimientos. */
 const MAX_DESCRIPTION_LENGTH = 40;
 
+/**
+ * El allowance local no es la factura del proveedor: la respuesta lo dice de forma
+ * explicita para que nadie lo lea como un consumo real.
+ */
+const USAGE_LEGEND = 'Reserva local conservadora; no es la factura real del proveedor.';
+
 const HELP_TEXT = [
   'Comandos disponibles:',
   '  /help o /start   Muestra esta ayuda',
   '  /accounts        Lista tus cuentas',
   '  /recent          Lista los ultimos movimientos',
   '  /summary         Totales del mes actual (o /summary YYYY-MM)',
+  '  /usage           Consumo reservado de inferencia del dia',
   '  /confirm         Registra la operacion que te mostre',
   '  /cancel          Descarta la operacion pendiente',
   '',
@@ -43,9 +51,10 @@ interface ParsedCommand {
 }
 
 /**
- * Comandos deterministas del bot. Las consultas (`/accounts`, `/recent`, `/summary`)
- * se calculan con los datos guardados: **nunca** llaman al modelo. Solo `/confirm` y
- * `/cancel` van a la captura, que tambien los resuelve sin llamar al modelo.
+ * Comandos deterministas del bot. Las consultas (`/accounts`, `/recent`, `/summary`,
+ * `/usage`) se calculan con los datos guardados: **nunca** llaman al modelo. Solo
+ * `/confirm` y `/cancel` van a la captura, que tambien los resuelve sin llamar al
+ * modelo.
  */
 @Injectable()
 export class TelegramCommands {
@@ -53,6 +62,8 @@ export class TelegramCommands {
     private readonly capture: CaptureService,
     private readonly financial: FinancialService,
     private readonly accounts: AccountService,
+    private readonly budget: InferenceBudgetService,
+    private readonly limits: AiLimits,
   ) {}
 
   /** Responde a un mensaje autorizado. */
@@ -71,6 +82,8 @@ export class TelegramCommands {
         return this.recentReply();
       case 'summary':
         return this.summaryReply(command.argument);
+      case 'usage':
+        return this.usageReply();
       case 'confirm':
       case 'cancel':
         return this.fromCapture(request);
@@ -121,6 +134,25 @@ export class TelegramCommands {
       return `  ${movement.occurredOn} | ${kind} | ${formatAmount(movement.amountMinor, movement.currency)} ${movement.currency} | ${account} | id ${movement.id}${description}`;
     });
     return ['Movimientos recientes:', ...lines].join('\n');
+  }
+
+  /**
+   * Consumo reservado de inferencia del dia. Es solo lectura: no llama al
+   * proveedor, no reserva nada y no toca el borrador de la conversacion.
+   */
+  private async usageReply(): Promise<string> {
+    const usage = await this.budget.current();
+    const day = usage?.day ?? dateInTimeZone(new Date(), DEFAULT_TIME_ZONE);
+    return [
+      `Consumo reservado del dia ${day} (${DEFAULT_TIME_ZONE}):`,
+      `  - llamadas reservadas: ${usage?.requests ?? 0} de ${this.limits.maxRequestsPerDay}`,
+      `  - tokens de entrada reservados: ${usage?.inputTokens ?? 0} (maximo por llamada: ${this.limits.maxInputTokensPerCall})`,
+      `  - tokens de salida reservados: ${usage?.outputTokens ?? 0} (maximo por llamada: ${this.limits.maxOutputTokensPerCall})`,
+      `  - costo reservado: ${usage?.costMicroUsd ?? 0} microUSD de ${this.limits.dailyBudgetMicroUsd} microUSD`,
+      `  - reserva maxima por llamada: ${this.limits.maxCostMicroUsdPerCall} microUSD`,
+      '',
+      USAGE_LEGEND,
+    ].join('\n');
   }
 
   private async summaryReply(argument: string): Promise<string> {

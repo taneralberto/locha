@@ -1,9 +1,11 @@
 # Locha — Asistente financiero personal con IA
 
-Backend NestJS + TypeORM + SQLite. Estado actual: **Etapa A en desarrollo**. Las
-**unidades 1 y 2 están aceptadas**; la **unidad 3 está implementada, pero pendiente de
-correcciones y revisión** (todavía no se da por aceptada). Las tres unidades son parte
-del [plan general](plan-general-asistente-financiero-ia.md):
+Backend NestJS + TypeORM + SQLite. Estado actual: **Etapa A — aceptación técnica local
+completa, habilitación operativa pendiente**. Las **unidades 1 y 2 están aceptadas**; la
+**unidad 3 está aceptada técnicamente para el alcance A** (implementada, corregida y
+verificada con pruebas automáticas), con **verificación operativa pendiente**: falta la
+prueba con el proveedor real y con Node 24, y una revisión de preparación para producción.
+Las tres unidades son parte del [plan general](plan-general-asistente-financiero-ia.md):
 
 - **Unidad 1** — contexto de aplicación ejecutable, modelo mínimo de cuentas y
   movimientos, migraciones, reglas monetarias exactas y un servicio de registro
@@ -12,30 +14,28 @@ del [plan general](plan-general-asistente-financiero-ia.md):
   (independiente del transporte). **Aceptada.**
 - **Unidad 3** — bot de Telegram por *long polling* en un chat privado, consultas
   deterministas, entrega durable de las respuestas, cerrojo de una sola instancia y
-  copia de seguridad con restauración. **Implementada, pendiente de correcciones y
-  revisión.**
+  copia de seguridad con restauración. **Aceptada técnicamente para el alcance A;
+  verificación operativa pendiente.**
 
-> **Aviso: no uses datos financieros reales todavía.** La unidad 3 tiene problemas
-> conocidos que aún no se han corregido ni revisado. Las categorías pendientes son:
+> **Aviso: no uses datos financieros reales todavía.** Las correcciones de la unidad 3
+> están aplicadas, revisadas localmente y comprobadas con pruebas automáticas, pero
+> **esta entrega no ha pasado una revisión de preparación para producción**. Lo que
+> sigue pendiente:
 >
-> - **Carrera del cerrojo obsoleto** (`src/lock/instance-lock.ts`): la comprobación y la
->   toma del cerrojo no son atómicas, así que dos procesos pueden acabar escribiendo en
->   la misma base.
-> - **Pérdida de actualizaciones en el sondeo** (`src/telegram/telegram.service.ts`): una
->   actualización aceptada cuyo procesamiento falla puede quedar sin atender después de
->   que el cursor ya haya avanzado.
-> - **Autorización en la recuperación** (`src/telegram/telegram.service.ts`): al retomar
->   trabajo pendiente, la revalidación del chat y del usuario autorizados no cubre
->   todos los caminos.
-> - **Planificación de reintentos** (`src/telegram/telegram.service.ts`): la espera entre
->   reintentos y el contador de intentos no se gestionan con fiabilidad en todos los
->   caminos.
-> - **Limpieza HTTP** (`src/http/bounded-fetch.ts`): la cancelación del cuerpo de una
->   respuesta que no se va a leer no siempre libera la conexión.
+> - **El modelo no está validado con frases reales.** Es una tarea manual del
+>   operador: elegir el modelo y comprobarlo con el proveedor real.
+> - **No se ha probado contra la API real de Telegram ni contra OpenRouter.** Las
+>   pruebas usan un Telegram y un OpenRouter simulados; ninguna prueba hace llamadas
+>   externas.
+> - **El cerrojo obsoleto no se recupera solo.** Si el proceso muere de golpe, el
+>   directorio del cerrojo hay que borrarlo a mano (decisión del operador, por
+>   prudencia). La exclusión entre procesos sí está comprobada.
+> - **La suite no se ha ejecutado en Node 24.** `package.json` exige Node >= 24 y la
+>   última verificación se hizo en Node 22.22.3: la compatibilidad con Node 24 **no está
+>   verificada**.
 >
-> Hasta que se corrijan y se revisen, **no introduzcas datos financieros reales** en esta
-> instalación: usa solo datos de prueba. Esta entrega **no ha pasado una revisión de
-> preparación para producción** y no debe usarse con datos reales.
+> Hasta que haya una revisión y una prueba con el proveedor real, **no introduzcas
+> datos financieros reales** en esta instalación: usa solo datos de prueba.
 
 El flujo completo es: **mensaje en Telegram → interpretación → resumen → `/confirm` →
 un movimiento guardado → `/summary` con los totales del mes**.
@@ -162,15 +162,21 @@ usuario, un mensaje editado o un mensaje que no sea de texto se ignoran **sin gu
 | `/recent`              | Lista los últimos movimientos, con su **id de movimiento**      |
 | `/summary`             | Totales del mes actual                                           |
 | `/summary 2026-11`     | Totales de un mes concreto (`YYYY-MM`)                           |
+| `/usage`               | Consumo **reservado** de inferencia del día                      |
 | `/confirm`             | Registra la operación que te acaba de mostrar                    |
 | `/cancel`              | Descarta la operación pendiente                                  |
 
 Cualquier otro comando con `/` muestra la ayuda. **Las consultas nunca llaman al modelo**:
-`/accounts`, `/recent` y `/summary` se calculan con los datos guardados.
+`/accounts`, `/recent`, `/summary` y `/usage` se calculan con los datos guardados.
 
 `/summary` muestra los **totales de la actividad registrada** en el mes (ingresos, gastos y
 neto por moneda) con importes exactos. **No son el saldo de tus cuentas**: no hay saldos
 iniciales ni transferencias todavía.
+
+`/usage` muestra el día de Caracas, las llamadas reservadas frente al límite, los tokens
+reservados, el costo reservado frente al presupuesto (en microUSD) y la reserva máxima por
+llamada. Es la **reserva local conservadora**, no la factura del proveedor: la propia
+respuesta lo dice. No llama al proveedor, no reserva nada y no toca el borrador pendiente.
 
 La respuesta de un registro incluye el **id del movimiento** (`Movimiento: <id>`), que es el
 mismo que aparece en `/recent`.
@@ -372,8 +378,12 @@ estados terminales se borra.
 - **Nunca se mantiene una transacción abierta durante la llamada al proveedor.** La reserva de
   presupuesto y la inferencia son pasos separados.
 - Si la inferencia se interrumpe (timeout, respuesta inválida, rechazo), el evento queda
-  `uncertain`, la reserva se consume y se responde “envíalo de nuevo o usa `/cancel`”. El
-  sistema **no reintenta solo**.
+  `uncertain`, la reserva se consume y el sistema **no reintenta solo**.
+- **Una corrección fallida cancela el borrador anterior.** Cuando la interpretación de un
+  mensaje falla, el borrador vivo de la conversación se cancela en la misma transacción y el
+  usuario tiene que **reenviar la operación completa**. Es una decisión de seguridad
+  financiera: un `/confirm` posterior no puede confirmar el borrador anterior a una
+  corrección que no se pudo interpretar.
 
 ### Interpretación (`src/interpreter`)
 
@@ -414,14 +424,27 @@ responder. Lo que no pasa el filtro no se guarda en ninguna tabla.
 | `telegram_outbox`  | Respuestas pendientes de enviar, con sus intentos y la hora del próximo intento |
 | `telegram_cursor`  | Último `update_id` aceptado o ignorado                                        |
 
-- El cursor **solo avanza** después de aceptar o ignorar una actualización de forma durable.
-- Si una actualización **no se puede atender, se corta el lote**: el cursor no puede
-  avanzar más allá de una actualización que falló, y el sondeo vuelve a empezar en el
-  cursor guardado.
-- Al arrancar se **procesa lo pendiente** antes de volver a consultar a Telegram.
-- La respuesta se escribe en la bandeja de salida **después** del commit de la captura. Si el
-  proceso se interrumpe justo ahí, al arrancar se vuelve a procesar la actualización: la
-  captura es idempotente, así que **no se duplica ningún movimiento**.
+El ciclo tiene **tres pasos separados**: aceptar (durable), procesar y entregar.
+
+- **Aceptar.** El cursor **solo avanza** después de aceptar o ignorar una actualización de
+  forma durable. Si la aceptación falla, **se corta el lote**: el cursor no avanza y la
+  actualización se vuelve a pedir en el sondeo siguiente.
+- **Procesar.** El procesamiento sale **solo** de la lectura ordenada de la bandeja de
+  entrada (por `update_id`): es la única vía, así que el orden durable se respeta siempre
+  y un `/confirm` nunca se aplica a un borrador anterior a una corrección pendiente. Al
+  arrancar se procesa lo pendiente antes de volver a consultar a Telegram, y lo que se
+  acaba de aceptar se procesa en el mismo ciclo (sin esperar al siguiente). Si **no se
+  puede leer** lo pendiente, no se procesa nada nuevo (sigue aceptando y entregando); si
+  **no se puede limpiar** lo revocado, tampoco se procesa nada: hasta que la limpieza
+  funcione no se toca ningún borrador. Si el procesamiento de una actualización falla, la
+  actualización **se conserva** y **su chat queda bloqueado**: no se procesa nada más de
+  ese chat, pero el bot **sigue sondeando, aceptando y entregando** lo que ya está
+  listo. El bloqueo espera con una espera acotada (1 s, 2 s, 4 s… hasta 60 s)
+  **independiente del sondeo**; al reiniciar se pierde (vive en memoria) y la
+  actualización se vuelve a intentar desde el principio.
+- **Entregar.** La respuesta se escribe en la bandeja de salida **después del commit de la
+  captura**. Si el proceso se interrumpe justo ahí, al arrancar se vuelve a procesar la
+  actualización: la captura es idempotente, así que **no se duplica ningún movimiento**.
 - El envío es **“al menos una vez”**: si el proceso se interrumpe después de enviar y antes de
   marcar la entrega como hecha, la respuesta puede llegar **dos veces**. Es el comportamiento
   documentado y aceptado: preferimos repetir un texto antes que perderlo. Un movimiento
@@ -431,18 +454,32 @@ responder. Lo que no pasa el filtro no se guarda en ninguna tabla.
   base, así que el retraso se respeta también después de un reinicio. Solo se descarta una
   respuesta cuando Telegram la rechaza de forma definitiva (un 4xx que no sea 408 ni 429) o
   cuando el chat o el usuario **ya no están autorizados**.
-- Al recuperar trabajo pendiente se **vuelve a comprobar la lista de autorizados**: si el
-  chat o el usuario ya no están en la configuración vigente, el mensaje se borra **sin
-  interpretarlo y sin responder**.
+- Las respuestas de un chat salen **en orden**: si una anterior está retrasada o falla de
+  forma transitoria, las siguientes de ese chat esperan su turno (con su intento y su
+  plazo guardados).
+- Al recuperar trabajo pendiente se **vuelve a comprobar la lista de autorizados**, en una
+  sola transacción: la actualización pendiente se descarta, la respuesta pendiente se
+  descarta (con su texto vaciado) y el **borrador vivo cuya origen en Telegram ya no está
+  autorizada se cancela** (para que un `/confirm` posterior no pueda confirmar un borrador
+  revocado). La procedencia del borrador se busca por su **clave estable**, que está
+  ligada a la actualización que lo creó: un borrador **nuevo** del usuario vigente no se
+  cancela por las filas históricas de otro usuario del mismo chat, y los borradores de
+  **otros transportes** (sin evidencia de que vengan de Telegram) no se tocan. Los
+  movimientos ya registrados y el historial de eventos **no se tocan**.
+- Lo que ya no está autorizado se descarta **antes** de mirar el plazo de reintento: su
+  texto no se queda pendiente aunque la entrega estuviera retrasada.
 - El texto original se borra de la bandeja de entrada cuando la actualización queda
-  procesada.
+  procesada, y el texto de una respuesta descartada se vacía.
 
 ### Red
 
 - Cada llamada tiene un **plazo que cubre cabeceras y cuerpo**, y la respuesta se lee con un
   **tope de bytes** (`src/http/bounded-fetch.ts`, la misma utilidad que usa OpenRouter).
 - Una respuesta con error **no se queda colgada**: su cuerpo se cancela y la llamada se
-  aborta antes de soltar el plazo.
+  aborta antes de soltar el plazo. La cancelación **no se espera**: una cancelación colgada
+  no puede romper el plazo ni el apagado.
+- Una lectura que termina **después de la cancelación no es una respuesta**: no se devuelve
+  un resultado parcial.
 - Los fallos de transporte se reintentan con una **espera acotada** (1 s, 2 s, 4 s… hasta
   60 s como máximo).
 - Las actualizaciones se procesan **de una en una**.
@@ -506,12 +543,28 @@ editados, de bot y sin texto, bandejas de entrada y de salida, actualización re
 entre reintentos respetado también tras un reinicio, respuesta que no se pierde tras muchos
 fallos, reanudación de lo pendiente, lote cortado cuando una actualización falla, trabajo
 pendiente de un chat que ya no está autorizado que se descarta sin interpretar ni responder,
-apagado ordenado que cancela el envío en vuelo), los comandos deterministas (ayuda, cuentas,
-recientes con id, resumen del mes con totales exactos, mes inválido, comando desconocido sin
-llamar al modelo), el cerrojo de una sola instancia (doble instancia, cerrojo obsoleto que **no**
-se roba, cerrojo desconocido, alias por enlace simbólico) y la copia de seguridad (copia
-válida, destino que ya existe, destino que aparece durante la copia, alias de la base que no se
-destruye, restauración en ruta nueva, archivo inválido).
+apagado ordenado que cancela el envío en vuelo), el **ciclo separado en tres pasos**
+(actualización que no se puede procesar que se conserva y bloquea a las siguientes de su
+chat sin dejar de sondear ni de entregar, recuperación en orden cuando el procesamiento
+vuelve a funcionar, espera de reintento de procesamiento independiente del sondeo, entrega
+por chat que no se adelanta cuando la anterior está retrasada o falla de forma transitoria,
+fallo puntual de la bandeja de salida que no para el ciclo, respuesta que se reproduce sin
+volver a interpretar cuando solo falla la creación de la bandeja de salida, revocación de un
+chat que descarta lo pendiente y cancela su borrador sin tocar lo ya registrado, y chat
+reautorizado que no puede confirmar un borrador revocado, **orden durable** (un `/confirm`
+nuevo no se procesa mientras no se puede leer lo pendiente, y al recuperarse se registra la
+corrección y no el borrador viejo; con la lectura o la limpieza fallando no se procesa
+nada; el borrador se cancela por su procedencia, no solo por su chat), los comandos
+deterministas (ayuda, cuentas, recientes con id, resumen del mes con totales exactos, mes
+inválido, `/usage` con el
+día de Caracas vacío, con consumo, con el límite alcanzado y con el cambio de día sin
+modificar el estado, comando desconocido sin llamar al modelo), las llamadas HTTP acotadas
+(cancelación normal, rechazada y colgada, tiempo agotado y cancelación externa sin éxito
+parcial), el cerrojo de una sola instancia (doble instancia, cerrojo obsoleto que **no**
+se roba, cerrojo desconocido, alias por enlace simbólico y **exclusión entre procesos** con
+un proceso limpio) y la copia de seguridad (copia válida, destino que ya existe, destino que
+aparece durante la copia, alias de la base que no se destruye, restauración en ruta nueva,
+archivo inválido).
 
 `npm run test:e2e` ejecuta el flujo completo con un **Telegram simulado** y un **OpenRouter
 simulado**: mensaje → aclaración → `/confirm` → **un** movimiento → `/summary`; actualización
@@ -541,3 +594,74 @@ totales. **Ninguna prueba hace llamadas externas ni usa credenciales reales.**
   de la captura y 4096 en la bandeja de entrada de Telegram; después se borra.
 - **Sin copia de seguridad automática.** La copia es un comando manual (`npm run backup`).
 - **Las fotos y los documentos no se procesan.** El bot solo entiende texto.
+- **El bloqueo por chat vive en memoria.** Si el bot se reinicia con una actualización a
+  medias, se vuelve a intentar desde el principio: no se guarda el contador de intentos.
+  Lo que hay pendiente se lee siempre de la base: el bloqueo es solo un reloj de espera.
+- **La procedencia de un borrador se busca en Telegram.** Un borrador creado por otro
+  transporte (sin fila en la bandeja de entrada de Telegram) no se cancela al revocar un
+  chat: no hay evidencia de que sea de este transporte.
+- **Una corrección fallida pide reenviar la operación completa.** El borrador anterior se
+  cancela a propósito, para que un `/confirm` no pueda registrar algo que el usuario ya
+  había corregido.
+- **La revocación se aplica al arrancar.** La lista de autorizados se lee al construir el
+  bot y no cambia durante la ejecución: el trabajo pendiente de un chat revocado se limpia
+  en el primer ciclo, no en caliente.
+- **El requisito de Node 24 sigue en pie.** `package.json` exige Node >= 24; la última
+  verificación de la suite se hizo en Node 22.22.3 (la versión disponible en el entorno de
+  desarrollo), así que la compatibilidad con Node 24 **no está verificada**.
+
+## Plan técnico de cierre (Etapa A)
+
+Cerrar la Etapa A es una lista corta y verificable. Lo que ya está hecho, revisado
+localmente y comprobado con pruebas automáticas:
+
+1. **Ciclo durable en tres pasos** (aceptar, procesar, entregar): todo el procesamiento sale
+   de la lectura ordenada de lo pendiente, así que un `/confirm` nunca se aplica a un
+   borrador anterior a una corrección pendiente; si no se puede leer lo pendiente o no se
+   puede limpiar lo revocado, no se procesa nada; una actualización que no se puede
+   procesar se conserva y bloquea a las siguientes de su chat sin dejar de sondear ni de
+   entregar; las respuestas de un chat salen en orden; lo revocado se limpia en una sola
+   transacción sin tocar lo ya registrado.
+2. **Captura conservadora**: una interpretación fallida cancela el borrador vivo y pide
+   reenviar la operación completa; `/confirm` sigue siendo obligatorio y nunca duplica un
+   movimiento.
+3. **`/usage` determinista**: solo lee la reserva local del día, nunca llama al proveedor
+   ni reserva nada.
+4. **Llamadas HTTP acotadas**: una cancelación colgada no puede romper el plazo ni el
+   apagado, y una lectura cancelada no devuelve un resultado parcial.
+5. **Cerrojo de una sola instancia**: la exclusión entre procesos está comprobada con un
+   proceso limpio; la recuperación de un cerrojo obsoleto sigue siendo manual.
+
+Lo que falta para cerrar la Etapa A (tareas del operador, no automatizables en el código y
+**no bloquean** el cierre del código):
+
+- **Validar el modelo con frases reales** contra el proveedor y elegirlo de forma
+  definitiva.
+- **Probar contra la API real de Telegram** con un bot de pruebas y sin datos financieros
+  reales.
+- **Revisión de preparación para producción**: leer el código con criterio de seguridad y
+  decidir si la entrega puede usarse con datos reales. Una revisión no equivale a
+  producción.
+- **Ejecutar la suite en Node 24**, que es la versión que exige `package.json`.
+
+### Evidencia de la aceptación técnica local (2026-11-10)
+
+Revisión final del código sin hallazgos y comprobación local en Node 22.22.3:
+
+| Comprobación | Resultado |
+| --- | --- |
+| `npm run typecheck` | Sin errores de tipos |
+| `npm run build` | Compilación correcta |
+| `npm test -- --runInBand` | 15 suites y 184 pruebas, todas en verde |
+| `npm run test:e2e -- --runInBand` | 7 pruebas, todas en verde |
+| `git diff --check` | Limpio |
+
+Esto acredita el **código** de la Etapa A en local; **no habilita el uso operativo**: los
+avisos de arriba siguen vigentes (datos reales, proveedores reales, Node 24 y revisión de
+preparación para producción).
+
+Lo que **no** se decide aquí: el alcance de la Etapa B (presupuestos, cuentas, saldos
+iniciales, transferencias, categorías y objetivos) sigue abierto y no se ha tocado.
+
+La Etapa B no se inició en este incremento porque la auditoría inicial encontró
+correcciones de la Etapa A pendientes de implementar.

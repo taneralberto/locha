@@ -80,7 +80,14 @@ describe('Copia de seguridad y restauracion', () => {
     const invalid = join(directory, 'no-es-una-base.sqlite');
     writeFileSync(invalid, 'esto no es una base de datos');
 
-    await expect(backupDatabase(invalid, join(directory, 'copia.sqlite'))).rejects.toThrow();
+    // El fallo lo produce el modulo nativo de SQLite, que puede vivir en otro
+    // realm: se comprueba la forma del error, no su clase.
+    await expect(
+      backupDatabase(invalid, join(directory, 'copia.sqlite')),
+    ).rejects.toMatchObject({
+      message: expect.any(String),
+      code: 'SQLITE_NOTADB',
+    });
     expect(() => validateDatabase(invalid)).toThrow();
   });
 

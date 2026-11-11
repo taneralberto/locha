@@ -1,11 +1,15 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
+import { AccountService } from '../accounts/account.service';
 import { AccountsModule } from '../accounts/account.module';
+import { CaptureService } from '../capture/capture.service';
 import { CaptureModule } from '../capture/capture.module';
-import { TelegramSettings } from '../config/configuration';
+import { InferenceBudgetService } from '../capture/inference-budget.service';
+import { AiLimits, TelegramSettings } from '../config/configuration';
 import { DataModule } from '../data/data.module';
 import { TransactionRunner } from '../data/transaction.runner';
+import { FinancialService } from '../financial/financial.service';
 import { FinancialModule } from '../financial/financial.module';
 import { TelegramApiClient, TelegramClient } from './telegram-client';
 import { TelegramCommands } from './telegram-commands';
@@ -24,7 +28,30 @@ import { TelegramService } from './telegram.service';
       useFactory: (config: ConfigService): TelegramClient =>
         new TelegramApiClient(config.getOrThrow<TelegramSettings>('telegram')),
     },
-    TelegramCommands,
+    {
+      provide: TelegramCommands,
+      inject: [
+        CaptureService,
+        FinancialService,
+        AccountService,
+        InferenceBudgetService,
+        ConfigService,
+      ],
+      useFactory: (
+        capture: CaptureService,
+        financial: FinancialService,
+        accounts: AccountService,
+        budget: InferenceBudgetService,
+        config: ConfigService,
+      ): TelegramCommands =>
+        new TelegramCommands(
+          capture,
+          financial,
+          accounts,
+          budget,
+          config.getOrThrow<AiLimits>('ai.limits'),
+        ),
+    },
     {
       provide: TelegramService,
       inject: [DataSource, TransactionRunner, TelegramCommands, TelegramClient, ConfigService],

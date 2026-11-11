@@ -1,6 +1,5 @@
-import { createHash } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, In } from 'typeorm';
 import { Account } from '../accounts/account.entity';
 import { isUniqueViolation } from '../data/unique-violation';
 import { TransactionRunner } from '../data/transaction.runner';
@@ -16,6 +15,7 @@ import {
 } from '../interpreter/interpreter';
 import { Operation } from '../interpreter/operation.schema';
 import { Capture, CaptureKind, CaptureState } from './capture.entity';
+import { sourceKeyFor } from './source-key';
 import { CaptureEvent } from './capture-event.entity';
 import { BudgetExhaustedError, DEFAULT_TIME_ZONE, InferenceBudgetService } from './inference-budget.service';
 import { mentionsConversion, mentionsMultipleAmounts } from './text-signals';
@@ -47,8 +47,14 @@ const BUDGET_EXHAUSTED_REPLY =
   'Se alcanzo el limite diario de inferencia configurado. No se llamo al proveedor y no se registro nada.';
 const TOO_LONG_REPLY =
   'El mensaje es demasiado largo para interpretarlo. Envia uno mas corto.';
-const RETRY_REPLY =
-  'No pude interpretar el mensaje y no lo reintento automaticamente. Envia el mensaje de nuevo o usa /cancel.';
+const RETRY_REPLY = 'No pude interpretar el mensaje y no lo reintento automaticamente.';
+/**
+ * El borrador vivo se cancela cuando la interpretacion falla: un `/confirm` no puede
+ * confirmar un borrador anterior a una correccion que no se pudo interpretar. El
+ * usuario tiene que volver a enviar la operacion **completa**.
+ */
+const RESEND_REPLY =
+  'Vuelve a enviar el mensaje completo (importe, moneda y cuenta) para preparar la operacion de nuevo.';
 
 /**
  * Cola de la captura. El `handle` completo se serializa por conexion: asi no se
@@ -453,23 +459,35 @@ export class CaptureService {
     };
   }
 
-  /** Marca el evento como incierto: no se reintenta solo. */
+  /**
+   * Marca el evento como incierto: no se reintenta solo.
+   *
+   * El borrador vivo de la conversacion se cancela en la misma transaccion: si la
+   * correccion fallo, un `/confirm` posterior no puede confirmar el borrador
+   * anterior (razon de seguridad financiera). El usuario tiene que volver a enviar
+   * la operacion completa.
+   */
   private async markUncertain(
     event: CaptureEvent,
     input: NormalizedRequest,
     reply: string,
   ): Promise<CaptureOutcome> {
+    const message = `${reply}\n\n${RESEND_REPLY}`;
     await this.transactions.run(async (manager) => {
+      await manager.getRepository(Capture).update(
+        { chatId: input.chatId, state: In(['awaiting_details', 'awaiting_confirmation']) },
+        { state: 'cancelled', sourceText: null },
+      );
       await manager.getRepository(CaptureEvent).update(
         { id: event.id },
-        { state: 'uncertain', reply },
+        { state: 'uncertain', reply: message },
       );
     });
     return {
       eventId: input.eventId,
       chatId: input.chatId,
       captureState: null,
-      reply,
+      reply: message,
       replayed: false,
       movementId: null,
     };
@@ -562,16 +580,6 @@ function detectCommand(text: string): 'confirm' | 'cancel' | null {
     return 'cancel';
   }
   return null;
-}
-
-/**
- * Clave idempotente del movimiento: la misma conversacion y evento dan la misma clave.
- * El separador se escribe como escape de texto (`\0`) para que el archivo fuente no
- * contenga un byte de control literal; en tiempo de ejecucion es el mismo separador.
- */
-function sourceKeyFor(chatId: string, eventId: string): string {
-  const hash = createHash('sha256').update(`${chatId}\0${eventId}`).digest('hex');
-  return `capture:${hash}`;
 }
 
 function emptyDraft(): Draft {

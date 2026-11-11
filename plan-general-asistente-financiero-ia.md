@@ -175,6 +175,55 @@ El éxito final del producto se medirá además por su **uso real**: registrar u
 - Elección definitiva del modelo tras pruebas con frases reales.
 - Alcance y método de OCR de facturas.
 
+## 12. Estado de verificación (Etapa A)
+
+Este registro **no cambia el alcance** del plan: solo deja por escrito qué está verificado
+hoy y qué queda pendiente. La Etapa A tiene **aceptación técnica local del código** —el
+código y las pruebas automáticas están hechos, revisados y en verde—, con **verificación
+operativa pendiente**: siguen abiertas la validación del modelo, la prueba contra los
+servicios reales, la ejecución en Node 24 y la revisión de preparación para producción.
+**Una revisión local no equivale a producción.**
+
+| Punto de la Etapa A | Estado | Cómo se comprobó |
+| --- | --- | --- |
+| Contexto ejecutable, cuentas, movimientos y migraciones | Verificado | Pruebas de migración, de importes exactos y de reapertura de la base |
+| Interpretación estructurada (OpenRouter) | Verificado contra un `fetch` simulado | Pruebas del interpretador: esquema estricto, JSON inválido, estado de error, tiempo agotado, respuesta desmedida, fallo de lectura |
+| Captura durable y `/confirm` obligatorio | Verificado | Pruebas de la captura: nada se registra antes de confirmar, evento repetido que no vuelve a interpretar, movimiento único |
+| Ciclo del bot en tres pasos (aceptar, procesar, entregar) | **Corregido y verificado** | Pruebas del servicio de sondeo: actualización que no se procesa se conserva, bloquea a las siguientes de su chat y el bot sigue sondeando y entregando |
+| Orden durable del pendiente | **Corregido y verificado** | Todo el procesamiento sale de la lectura ordenada de lo pendiente: un `/confirm` nuevo no se procesa si no se puede leer lo pendiente, y al recuperarse se registra la corrección y no el borrador viejo; con la lectura o la limpieza de lo revocado fallando no se procesa nada |
+| Orden de entrega por chat | **Corregido y verificado** | Pruebas de la bandeja de salida: una entrega retrasada o transitoriamente fallida no se adelanta; al recuperar se entrega en orden |
+| Espera de reintento de procesamiento separada de la del sondeo | **Corregido y verificado** | Prueba que mide el intervalo entre reintentos con el sondeo funcionando |
+| Error persistente de entrega o de persistencia | **Corregido y verificado** | Pruebas de un fallo puntual de la bandeja de salida (el ciclo sigue) y de un fallo al crearla (la respuesta se reproduce sin repetir la inferencia) |
+| Revocación: limpieza transaccional de lo no autorizado | **Corregido y verificado** | Pruebas de revocación: se descarta lo pendiente, no se toca lo registrado y un chat reautorizado no puede confirmar |
+| Procedencia del borrador (mismo chat, otro usuario) | **Corregido y verificado** | El borrador se cancela por su origen en Telegram (clave estable ligada a la actualización que lo creó), no solo por su chat: un `/confirm` del usuario nuevo no registra el borrador del anterior, y las filas históricas de otro usuario no cancelan el borrador nuevo del usuario vigente |
+| `/usage` determinista | **Añadido y verificado** | Pruebas del comando: día de Caracas vacío, con consumo, con el límite alcanzado y con el cambio de día sin modificar el estado |
+| Privacidad: texto borrado, sin secretos ni mensajes en los registros | Verificado | Pruebas de la bandeja de entrada y de salida, y de los mensajes de error |
+| Cerrojo de una sola instancia | Exclusión entre procesos verificada | Pruebas del cerrojo, incluida una con un proceso limpio; la recuperación de un cerrojo obsoleto sigue siendo manual |
+| Llamadas HTTP acotadas | **Corregido y verificado** | Pruebas de la llamada acotada: cancelación normal, rechazada y colgada, tiempo agotado y cancelación externa sin éxito parcial |
+| Modelo con frases reales | **Pendiente del operador** | Tarea manual: elegir el modelo y comprobarlo con el proveedor |
+| Telegram real y OpenRouter real | **No verificado** | Ninguna prueba hace llamadas externas ni usa credenciales reales |
+| Node 24 (lo exige `package.json`) | **No verificado** | La suite se ejecutó en Node 22.22.3, la única versión disponible en el entorno |
+| Revisión de preparación para producción | **No hecha** | Requiere una revisión del código con criterio de seguridad |
+
+### Evidencia de la aceptación técnica local (2026-11-10)
+
+| Comprobación | Resultado |
+| --- | --- |
+| Revisión final del código | Sin hallazgos: «No issues found, OK» |
+| `npm run typecheck` | Sin errores de tipos |
+| `npm run build` | Compilación correcta |
+| `npm test -- --runInBand` | 15 suites y 184 pruebas, todas en verde |
+| `npm run test:e2e -- --runInBand` | 7 pruebas, todas en verde |
+| `git diff --check` | Limpio |
+
+Entorno de la comprobación: Node 22.22.3 (2026-11-10). Esto acredita el **código** de la
+Etapa A en local, **no la habilitación operativa**: los puntos «Modelo con frases reales»,
+«Telegram real y OpenRouter real», «Node 24» y «Revisión de preparación para producción»
+de la tabla anterior siguen abiertos.
+
+La Etapa B no se inició en este incremento porque la auditoría inicial encontró
+correcciones de la Etapa A pendientes de implementar.
+
 ## Referencias técnicas oficiales
 
 - [Telegram Bot API](https://core.telegram.org/bots/api)

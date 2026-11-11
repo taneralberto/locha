@@ -46,6 +46,15 @@ export interface TelegramUpdate {
 }
 
 /**
+ * Identidad del evento en Telegram: el `update_id` con su prefijo. Es la clave que
+ * usa la captura para ligar un evento a su borrador, y la que permite saber de que
+ * actualizacion salio un borrador.
+ */
+export function telegramEventId(updateId: number): string {
+  return `telegram:${updateId}`;
+}
+
+/**
  * Traduce una actualizacion cruda de Telegram. Devuelve `null` si la actualizacion no
  * tiene forma reconocible: en ese caso se ignora con seguridad, sin guardar nada.
  */

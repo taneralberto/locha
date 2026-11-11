@@ -77,8 +77,9 @@ export async function boundedFetch(options: BoundedFetchOptions): Promise<Bounde
     const response = await Promise.race([fetch(options.url, init), deadline]);
     if (!response.ok) {
       // El cuerpo de una respuesta de error no se lee: se cancela para no dejar el
-      // socket abierto.
-      await cancelBody(response);
+      // socket abierto. La cancelacion **no se espera**: una cancelacion colgada no
+      // puede romper el plazo ni el apagado (la llamada se aborta igual).
+      cancelBody(response);
       throw new BoundedFetchError(
         'http',
         `El servidor respondio con estado ${response.status}.`,
@@ -112,14 +113,18 @@ export async function boundedFetch(options: BoundedFetchOptions): Promise<Bounde
   }
 }
 
-/** Cancela el cuerpo de una respuesta que no se va a leer. */
-async function cancelBody(response: Response): Promise<void> {
+/**
+ * Cancela el cuerpo de una respuesta que no se va a leer. No se espera: una
+ * cancelacion colgada no puede romper el plazo ni impedir terminar. El transporte se
+ * aborta igual, asi que el socket no queda abierto.
+ */
+function cancelBody(response: Response): void {
   const body = response.body;
   if (!body) {
     return;
   }
   try {
-    await body.cancel();
+    void body.cancel().catch(() => undefined);
   } catch {
     // El cuerpo ya estaba cerrado o en error: no hay nada que hacer.
   }
@@ -140,21 +145,27 @@ async function readBoundedText(
   }
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  const onAbort = (): void => {
+  // La cancelacion del lector no se espera: una cancelacion colgada no puede
+  // impedir terminar la lectura.
+  const cancel = (): void => {
     void reader.cancel().catch(() => undefined);
   };
+  const onAbort = (): void => cancel();
   signal.addEventListener('abort', onAbort, { once: true });
   let received = 0;
   let text = '';
   try {
     for (;;) {
+      if (signal.aborted) {
+        throw new Error('La llamada fue cancelada.');
+      }
       const chunk = await reader.read();
       if (chunk.done) {
         break;
       }
       received += chunk.value.byteLength;
       if (received > limit) {
-        await reader.cancel().catch(() => undefined);
+        cancel();
         throw new BoundedFetchError('too_large', 'La respuesta excede el limite permitido.');
       }
       text += decoder.decode(chunk.value, { stream: true });
@@ -162,11 +173,16 @@ async function readBoundedText(
     text += decoder.decode();
   } catch (error) {
     // Una lectura fallida deja el cuerpo a medias: se cancela para no dejarlo abierto.
-    await reader.cancel().catch(() => undefined);
+    cancel();
     throw error;
   } finally {
     signal.removeEventListener('abort', onAbort);
     reader.releaseLock();
+  }
+  if (signal.aborted) {
+    // Una lectura que termino despues de la cancelacion no es una respuesta: no se
+    // devuelve un resultado parcial.
+    throw new Error('La llamada fue cancelada.');
   }
   return text;
 }

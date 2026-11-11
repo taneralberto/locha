@@ -1,7 +1,9 @@
 import { AccountService } from '../src/accounts/account.service';
+import { AiUsageDay } from '../src/capture/ai-usage.entity';
 import { CaptureService } from '../src/capture/capture.service';
-import { InferenceBudgetService } from '../src/capture/inference-budget.service';
+import { DEFAULT_TIME_ZONE, InferenceBudgetService } from '../src/capture/inference-budget.service';
 import { TransactionRunner } from '../src/data/transaction.runner';
+import { dateInTimeZone } from '../src/domain/date';
 import { FinancialService } from '../src/financial/financial.service';
 import { TelegramCommands } from '../src/telegram/telegram-commands';
 import { FakeInterpreter } from './helpers/fake-interpreter';
@@ -33,9 +35,15 @@ describe('TelegramCommands', () => {
       transactions,
       financial,
       interpreter,
-      new InferenceBudgetService(database.dataSource, transactions, LIMITS),
+      new InferenceBudgetService(transactions, LIMITS),
     );
-    commands = new TelegramCommands(capture, financial, accounts);
+    commands = new TelegramCommands(
+      capture,
+      financial,
+      accounts,
+      new InferenceBudgetService(transactions, LIMITS),
+      LIMITS,
+    );
   });
 
   afterEach(async () => {
@@ -178,5 +186,82 @@ describe('TelegramCommands', () => {
 
     expect(reply).toContain('/confirm');
     expect(interpreter.requests).toHaveLength(1);
+  });
+
+  describe('/usage', () => {
+    async function usageDay(day: string): Promise<void> {
+      const usage = database.dataSource.getRepository(AiUsageDay);
+      await usage.save(
+        usage.create({
+          day,
+          requests: 3,
+          inputTokens: 6000,
+          outputTokens: 1500,
+          costMicroUsd: 15000,
+        }),
+      );
+    }
+
+    it('muestra el dia de Caracas con ceros cuando todavia no hay consumo', async () => {
+      const reply = await answer('/usage');
+
+      expect(reply).toContain(dateInTimeZone(new Date(), DEFAULT_TIME_ZONE));
+      expect(reply).toContain(`llamadas reservadas: 0 de ${LIMITS.maxRequestsPerDay}`);
+      expect(reply).toContain('costo reservado: 0 microUSD');
+      expect(reply).toContain('Reserva local conservadora; no es la factura real del proveedor');
+      expect(interpreter.requests).toHaveLength(0);
+    });
+
+    it('muestra el consumo reservado del dia', async () => {
+      const day = dateInTimeZone(new Date(), DEFAULT_TIME_ZONE);
+      await usageDay(day);
+
+      const reply = await answer('/usage');
+
+      expect(reply).toContain(day);
+      expect(reply).toContain(`llamadas reservadas: 3 de ${LIMITS.maxRequestsPerDay}`);
+      expect(reply).toContain('tokens de entrada reservados: 6000');
+      expect(reply).toContain('tokens de salida reservados: 1500');
+      expect(reply).toContain(`costo reservado: 15000 microUSD de ${LIMITS.dailyBudgetMicroUsd} microUSD`);
+      expect(reply).toContain(`reserva maxima por llamada: ${LIMITS.maxCostMicroUsdPerCall} microUSD`);
+      expect(interpreter.requests).toHaveLength(0);
+    });
+
+    it('muestra el limite alcanzado sin llamar al modelo', async () => {
+      const day = dateInTimeZone(new Date(), DEFAULT_TIME_ZONE);
+      const usage = database.dataSource.getRepository(AiUsageDay);
+      await usage.save(
+        usage.create({
+          day,
+          requests: LIMITS.maxRequestsPerDay,
+          inputTokens: LIMITS.maxInputTokensPerCall * LIMITS.maxRequestsPerDay,
+          outputTokens: LIMITS.maxOutputTokensPerCall * LIMITS.maxRequestsPerDay,
+          costMicroUsd: LIMITS.dailyBudgetMicroUsd,
+        }),
+      );
+
+      const reply = await answer('/usage');
+
+      expect(reply).toContain(`llamadas reservadas: ${LIMITS.maxRequestsPerDay} de ${LIMITS.maxRequestsPerDay}`);
+      expect(reply).toContain(
+        `costo reservado: ${LIMITS.dailyBudgetMicroUsd} microUSD de ${LIMITS.dailyBudgetMicroUsd} microUSD`,
+      );
+      expect(interpreter.requests).toHaveLength(0);
+    });
+
+    it('empieza el dia nuevo en Caracas sin tocar el dia anterior', async () => {
+      await usageDay('2026-01-01');
+
+      const reply = await answer('/usage');
+
+      expect(reply).not.toContain('2026-01-01');
+      expect(reply).toContain('llamadas reservadas: 0 de');
+      // El dia anterior queda como estaba: /usage no modifica nada.
+      const previous = await database.dataSource.getRepository(AiUsageDay).findOneBy({
+        day: '2026-01-01',
+      });
+      expect(previous?.requests).toBe(3);
+      expect(previous?.costMicroUsd).toBe(15000);
+    });
   });
 });
