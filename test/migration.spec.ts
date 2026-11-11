@@ -96,8 +96,9 @@ describe('Migracion inicial', () => {
   it('la migracion se puede revertir', async () => {
     const database = await createTempDatabase();
 
-    await database.dataSource.undoLastMigration();
-    await database.dataSource.undoLastMigration();
+    for (const _migration of database.dataSource.migrations) {
+      await database.dataSource.undoLastMigration();
+    }
 
     const tables = await database.dataSource.query<{ name: string }[]>(
       `SELECT name FROM sqlite_master WHERE type = 'table'`,

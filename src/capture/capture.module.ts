@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { AiLimits } from '../config/configuration';
 import { DataModule } from '../data/data.module';
 import { TransactionRunner } from '../data/transaction.runner';
+import { DebtsModule } from '../debts/debt.module';
 import { FinancialModule } from '../financial/financial.module';
 import { InterpreterModule } from '../interpreter/interpreter.module';
 import { CaptureService } from './capture.service';
@@ -13,7 +14,7 @@ import { InferenceBudgetService } from './inference-budget.service';
  * identidad, conversacion, texto y marca de tiempo, y devuelve la respuesta al usuario.
  */
 @Module({
-  imports: [DataModule, FinancialModule, InterpreterModule],
+  imports: [DataModule, FinancialModule, DebtsModule, InterpreterModule],
   providers: [
     {
       provide: InferenceBudgetService,

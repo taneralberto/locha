@@ -3,6 +3,12 @@ import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { AccountService } from '../accounts/account.service';
 import { AccountsModule } from '../accounts/account.module';
+import { BudgetModule } from '../budgets/budget.module';
+import { BudgetService } from '../budgets/budget.service';
+import { DebtsModule } from '../debts/debt.module';
+import { DebtService } from '../debts/debt.service';
+import { SavingsModule } from '../savings/savings.module';
+import { SavingsService } from '../savings/savings.service';
 import { CaptureService } from '../capture/capture.service';
 import { CaptureModule } from '../capture/capture.module';
 import { InferenceBudgetService } from '../capture/inference-budget.service';
@@ -20,7 +26,7 @@ import { TelegramService } from './telegram.service';
  * configuracion decide si el bot queda activo (token, usuario y chat autorizados).
  */
 @Module({
-  imports: [DataModule, AccountsModule, CaptureModule, FinancialModule],
+  imports: [DataModule, AccountsModule, CaptureModule, FinancialModule, BudgetModule, SavingsModule, DebtsModule],
   providers: [
     {
       provide: TelegramClient,
@@ -36,6 +42,9 @@ import { TelegramService } from './telegram.service';
         AccountService,
         InferenceBudgetService,
         ConfigService,
+        BudgetService,
+        SavingsService,
+        DebtService,
       ],
       useFactory: (
         capture: CaptureService,
@@ -43,6 +52,9 @@ import { TelegramService } from './telegram.service';
         accounts: AccountService,
         budget: InferenceBudgetService,
         config: ConfigService,
+        budgets: BudgetService,
+        savings: SavingsService,
+        debts: DebtService,
       ): TelegramCommands =>
         new TelegramCommands(
           capture,
@@ -50,6 +62,9 @@ import { TelegramService } from './telegram.service';
           accounts,
           budget,
           config.getOrThrow<AiLimits>('ai.limits'),
+          budgets,
+          savings,
+          debts,
         ),
     },
     {

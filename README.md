@@ -1,6 +1,16 @@
 # Locha — Asistente financiero personal con IA
 
-Backend NestJS + TypeORM + SQLite. Estado actual: **Etapa A — aceptación técnica local
+Backend NestJS + TypeORM + SQLite. **B1, B2, B3 y B4 aceptados técnicamente en local**:
+saldos, aperturas, transferencias/conversiones, correcciones auditadas, categorías,
+conciliación, presupuestos, metas y reservas virtuales por cuenta/moneda con advertencias
+de déficit. Las cuatro unidades pasaron su revisión obligatoria de solo lectura sin
+hallazgos y la validación integrada independiente del orquestador en Node 24.
+**Etapa B completada en el alcance documentado:** mutadores manuales por CLI local,
+con el bot detenido y bajo el cerrojo de instancia única; Telegram aporta consultas
+deterministas y advertencias al confirmar ingresos/gastos de la captura existente.
+No implica flujos B completos en lenguaje natural, pruebas con proveedores reales,
+preparación para producción ni interfaz Angular. La **Etapa A mantiene su aceptación**; su evidencia
+histórica se conserva abajo: **Etapa A — aceptación técnica local
 completa, habilitación operativa pendiente**. Las **unidades 1 y 2 están aceptadas**; la
 **unidad 3 está aceptada técnicamente para el alcance A** (implementada, corregida y
 verificada con pruebas automáticas), con **verificación operativa pendiente**: falta la
@@ -30,9 +40,8 @@ Las tres unidades son parte del [plan general](plan-general-asistente-financiero
 > - **El cerrojo obsoleto no se recupera solo.** Si el proceso muere de golpe, el
 >   directorio del cerrojo hay que borrarlo a mano (decisión del operador, por
 >   prudencia). La exclusión entre procesos sí está comprobada.
-> - **La suite no se ha ejecutado en Node 24.** `package.json` exige Node >= 24 y la
->   última verificación se hizo en Node 22.22.3: la compatibilidad con Node 24 **no está
->   verificada**.
+> - **La evidencia histórica completa de A usó Node 22.22.3.** La validación integrada
+>   de B1–B4 se completó en Node 24; esto no es una nueva auditoría de A.
 >
 > Hasta que haya una revisión y una prueba con el proveedor real, **no introduzcas
 > datos financieros reales** en esta instalación: usa solo datos de prueba.
@@ -159,6 +168,11 @@ usuario, un mensaje editado o un mensaje que no sea de texto se ignoran **sin gu
 | ---------------------- | -------------------------------------------------------------- |
 | `/help`, `/start`      | Lista los comandos disponibles                                   |
 | `/accounts`            | Lista tus cuentas (id, nombre, moneda, si están activas)         |
+| `/balances [YYYY-MM-DD]` | Saldos por cuenta a una fecha inclusiva (hoy en Caracas por defecto) |
+| `/budgets [YYYY-MM-DD]` | Presupuestos activos: límite, gastado y restante por alcance/moneda |
+| `/goals [id]`          | Progreso nominal actual de todas las metas o una meta |
+| `/savings`             | Saldo real, reservado virtual, disponible y déficit actuales |
+| `/debts [id]`          | Deudas registradas y su pendiente, por dirección y moneda (solo lectura) |
 | `/recent`              | Lista los últimos movimientos, con su **id de movimiento**      |
 | `/summary`             | Totales del mes actual                                           |
 | `/summary 2026-11`     | Totales de un mes concreto (`YYYY-MM`)                           |
@@ -167,11 +181,14 @@ usuario, un mensaje editado o un mensaje que no sea de texto se ignoran **sin gu
 | `/cancel`              | Descarta la operación pendiente                                  |
 
 Cualquier otro comando con `/` muestra la ayuda. **Las consultas nunca llaman al modelo**:
-`/accounts`, `/recent`, `/summary` y `/usage` se calculan con los datos guardados.
+`/accounts`, `/balances`, `/budgets`, `/goals`, `/savings`, `/debts`, `/recent`, `/summary` y `/usage` se calculan con los datos guardados.
 
 `/summary` muestra los **totales de la actividad registrada** en el mes (ingresos, gastos y
-neto por moneda) con importes exactos. **No son el saldo de tus cuentas**: no hay saldos
-iniciales ni transferencias todavía.
+neto por moneda) con importes exactos. **No son el saldo de tus cuentas**: excluyen
+aperturas y principales transferidos; las comisiones sí son gastos. Para saldos usa
+`/balances`. No hay comandos de escritura de aperturas/transferencias en Telegram y
+la captura con IA admite ingresos/gastos y, desde la unidad 2, deudas (crear, pagar y
+consultar).
 
 `/usage` muestra el día de Caracas, las llamadas reservadas frente al límite, los tokens
 reservados, el costo reservado frente al presupuesto (en microUSD) y la reserva máxima por
@@ -188,11 +205,20 @@ El esquema solo cambia por migraciones: `synchronize` está desactivado en
 
 Migraciones: `InitialSchema1767225600000` (cuentas y movimientos),
 `CaptureAndInference1769904000000` (capturas, bandeja de eventos y consumo diario) y
-`TelegramDelivery1772582400000` (bandejas de Telegram y cursor del polling).
+`TelegramDelivery1772582400000` (bandejas de Telegram y cursor del polling) y
+`LedgerOperations1775260800000` (aperturas/transferencias B1) y
+`MovementCorrections1777939200000` (revisiones y conciliaciones B2) y
+`Budgets1780617600000` (presupuestos B3) y
+`GoalsAndSavings1783209600000` (metas y reservas virtuales B4) y
+`Debts1785888000000` (deudas: `debt` y `debt_payment`) y
+`DebtCapture1788566400000` (borrador de deuda: columna `debtPayload` de `capture`).
 
-> La migración de Telegram todavía no se ha publicado: si ya tenías una base creada con una
-> versión anterior de esta entrega, **borra el archivo `data/locha.sqlite` y vuelve a aplicar
-> las migraciones** (la base es local y se puede regenerar; haz una copia antes si te importa).
+Para actualizar una base ficticia A, B1, B2, B3, B4 o B5 completa: detén el backend, haz una copia de seguridad,
+actualiza/compila el código y ejecuta `npm run migration:run` antes de reiniciar.
+**No borres ni recrees la base**: B4 añade solo `goal` y `savings_entry`, la migración de deudas
+añade solo `debt` y `debt_payment` y la del borrador de deuda añade **una sola columna**,
+sin cambiar filas, IDs, claves ni esquemas previos.
+La aplicación no aplica migraciones automáticamente.
 
 ## CLI
 
@@ -208,6 +234,15 @@ por su cuenta).
 | `migration:run`    | `npm run migration:run` | Aplica las migraciones pendientes                 |
 | `account:add`      | `npm run account:add`   | Crea una cuenta (`--name`, `--currency`)          |
 | `account:list`     | `npm run account:list`  | Lista las cuentas                                 |
+| `balance:list`     | `npm run balance:list`  | Saldos (`--on YYYY-MM-DD` opcional)               |
+| `opening:add`      | `npm run opening:add`   | Una apertura fechada por cuenta                  |
+| `transfer:add`     | `npm run transfer:add`  | Transferencia/conversión y comisión opcional     |
+| `budget:add`       | `npm run budget:add`    | Definición inmutable de presupuesto              |
+| `budget:list`      | `npm run budget:list`   | Todas las definiciones, JSON con unidades menores |
+| `budget:status`    | `npm run budget:status` | Límite/gastado/restante a una fecha                |
+| `goal:add/list/status` | `npm run goal:add` / `goal:list` / `goal:status` | Metas inmutables y progreso nominal |
+| `savings:reserve/release` | `npm run savings:reserve` / `savings:release` | Reservar/liberar virtualmente |
+| `savings:status/history` | `npm run savings:status` / `savings:history` | Estado actual e historial virtual |
 | `backup`           | `npm run backup`       | Copia de seguridad (`--to <ruta>`)                |
 | `restore`          | `npm run restore`      | Restaura una copia (`--from <ruta> --to <ruta>`)  |
 
@@ -222,6 +257,458 @@ Los alias (`npm run migration:run`, etc.) compilan el proyecto antes de ejecutar
 errores de validación y los conflictos terminan con código de salida `1`.
 
 Monedas admitidas: `VES`, `USD`, `USDT`.
+
+### B1: aperturas, conversiones y saldos
+
+Usa los **IDs explícitos** de `account:list` (sustituye `ID_USD` y `ID_VES`):
+
+```bash
+npm run opening:add -- --source-key inicio-usd-2026 --account ID_USD --currency USD --amount 100.00 --on 2026-11-01 --description "Apertura"
+npm run transfer:add -- --source-key cambio-2026-11-02 --from ID_USD --from-currency USD --sent 50.00 --to ID_VES --to-currency VES --received 20000.00 --on 2026-11-02 --description "Cambio real" --fee-account ID_USD --fee-currency USD --fee 0.50
+npm run balance:list -- --on 2026-11-02
+```
+
+- **Apertura aditiva y fechada, no instantánea:** una por cuenta, importe firmado o cero
+  (`--amount -10.00`, `--amount 0`). Se suma a toda actividad anterior; no la reemplaza.
+  El indicador `apertura si/no` dice si ya está incluida a la fecha consultada.
+- **Importes exactos:** punto decimal, USD/VES hasta 2 decimales y USDT hasta 6; sin
+  redondeo, notación exponencial ni separadores de miles. Se permiten saldos negativos
+  porque la actividad puede estar incompleta; no se comprueba disponibilidad de fondos.
+- **Transferencias entre cuentas distintas:** `--sent` y `--received` son los principales
+  positivos reales, explícitos. No se inventa tasa ni valoración. En la misma moneda
+  deben ser iguales. La comisión es **extra**, no se resta del principal recibido.
+- **Comisión opcional:** entrega juntos `--fee-account`, `--fee-currency` y `--fee` (> 0).
+  Puede salir de otra cuenta/moneda y se registra como gasto ordinario en la misma
+  transacción. Ambos lados y comisión se guardan todos o ninguno.
+- **Idempotencia:** `--source-key` es obligatorio; repetir el payload normalizado completo
+  devuelve el mismo ID con estado `existente`; cambiarlo produce conflicto (también si
+  cambia la comisión). Un replay sigue funcionando después de desactivar una cuenta;
+  las escrituras nuevas requieren cuentas activas y moneda coincidente. Las claves de
+  operaciones tienen su propio espacio; las comisiones usan `ledger:<UUID-operacion>:fee`.
+- **Consultas:** `balance:list [--on YYYY-MM-DD]` y `/balances [YYYY-MM-DD]` incluyen
+  movimientos y operaciones con fecha <= corte; por defecto hoy en `America/Caracas`.
+  Incluyen cuentas inactivas y vacías; orden por nombre e ID, sin sumar monedas distintas.
+  Telegram limita la respuesta a filas completas y avisa de las omitidas; la CLI lista todas.
+- En el ejemplo, sin otra actividad: USD **49.50**, VES **20000.00**. `/summary` y
+  `/recent` solo ven el gasto de comisión **0.50 USD**, no la apertura ni el cambio.
+
+API (`FinancialService`, mismo `TransactionRunner` que A):
+
+```ts
+open({ sourceKey, accountId, money: { currency, minor }, occurredOn, description? }, manager?)
+transfer({ sourceKey, from: { accountId, money }, to: { accountId, money }, fee?: { accountId, money }, occurredOn, description? }, manager?)
+// Ambas devuelven { operation: LedgerOperation, created: boolean }; minor es bigint.
+balances(on?: string, manager?)
+// AccountBalance[]: accountId, name, currency, balance: bigint, hasOpening, asOf.
+```
+
+Un `EntityManager` entregado debe pertenecer a una transacción del llamador, que debe
+propagar los errores para hacer rollback. Sin él, el servicio abre la transacción serializada.
+`register()` conserva su contrato de ingresos/gastos. B1 cubre aperturas, transferencias
+y saldos; las correcciones/conciliación, presupuestos y metas/reservas se describen en B2–B4.
+
+Verificación B1 (bases temporales, sin proveedores ni datos reales):
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/ledger-operations.spec.ts test/ledger-migration.spec.ts test/ledger-cli.spec.ts test/telegram-commands.spec.ts test/financial.service.spec.ts test/migration.spec.ts test/backup.spec.ts test/app-context.spec.ts test/money.spec.ts test/capture.service.spec.ts
+```
+
+La cobertura B1 incluida en la validación integrada de B, abajo, verifica migración de A poblada sin
+cambios históricos, backup A → restaurar → migrar, backup B1 con saldos iguales,
+rollback tras comisión e inserción fallida, y CLI con procesos reales. No se aplicaron
+migraciones a la base configurada del operador ni se usaron servicios externos.
+
+### B2: correcciones auditadas, categorías y conciliación
+
+Detén el backend; usa una base ficticia separada y migra tras hacer backup. B1 y B2
+están aceptados. B2 no incluye presupuestos, objetivos ni reservas; los presupuestos
+se añaden exclusivamente en B3, abajo. No cambia la captura IA ni habilita escrituras
+financieras nuevas por Telegram.
+
+```bash
+npm run movement:add -- --source-key manual-1 --account ID_USD --currency USD --kind expense --amount 2.00 --on 2026-11-01 --description Helado
+npm run movement:show -- --movement ID_MOVIMIENTO
+npm run movement:edit -- --source-key correccion-1 --movement ID_MOVIMIENTO --expected-revision 0 --amount 2.50 --on 2026-11-02 --reason "Importe y fecha correctos" --description Helado --category Comida
+npm run movement:history -- --movement ID_MOVIMIENTO
+npm run movement:recent -- --limit 20
+npm run summary -- --month 2026-11
+npm run balance:reconcile -- --source-key conteo-1 --account ID_USD --currency USD --target -10.00 --on 2026-11-02 --reason "Conteo manual"
+npm run reconciliation:list -- --account ID_USD
+npm run movement:void -- --source-key anulacion-1 --movement ID_MOVIMIENTO --expected-revision 1 --reason Duplicado
+```
+
+- **Original inmutable:** ni editar ni anular reescriben `movement`. `register()` sigue
+  devolviendo el original al repetir su clave. `movement:show` y `movement:history`
+  muestran original, revisiones ordenadas, efectivo y operación dueña de la comisión.
+  La salida de consultas CLI es JSON; los importes `*Minor` son cadenas en unidades
+  menores (USD/VES 100 por unidad; USDT 1000000), no importes decimales.
+- **Edición de reemplazo completo:** importe positivo, fecha, descripción y categoría.
+  Si se omiten `--description` o `--category`, se borran del efectivo. La categoría es
+  una etiqueta opcional, recortada, sensible a mayúsculas, de 1 a 80 caracteres; no hay
+  catálogo ni clasificación IA. Se asigna mediante edición, no en el registro original.
+  Cuenta, moneda y tipo son fijos: para cambiarlos, anula y crea un movimiento manual
+  con `movement:add` y una clave nueva. La CLI interpreta el importe editado en la
+  moneda del original, sin permitir cambiarla.
+- **Auditoría y concurrencia:** toda edición/anulación requiere motivo (1–280 caracteres)
+  y revisión esperada (el original es 0). Una escritura nueva con revisión obsoleta
+  falla, y la anulación es terminal. Repetir una clave con el mismo payload normalizado
+  devuelve la revisión original incluso después de otras ediciones/anulación o de
+  desactivar la cuenta. Cambiar su payload produce conflicto. Las claves de revisiones
+  y conciliaciones tienen espacios propios, separados de movimientos y operaciones.
+- **Límite explícito:** no se editan ni anulan aperturas ni principales transferidos;
+  intentarlo con el ID de operación falla sin reversión parcial. La comisión sí puede
+  editarse/anularse independientemente, sin cambiar los principales. Repetir la
+  transferencia original sigue comparando su comisión **original**, no la corregida.
+- **Una sola lectura efectiva:** `recent`, `summary` y `balances` resuelven primero las
+  revisiones; después filtran mes/fecha, ordenan o limitan. Los anulados se excluyen.
+- **Conciliación:** objetivo firmado o cero, cuenta activa y moneda coincidente. Calcula
+  a la fecha inclusiva `delta = objetivo - saldo efectivo anterior`, incluyendo aperturas,
+  transferencias, comisiones y conciliaciones anteriores. Se guarda ese delta exacto,
+  incluso si es cero. Solo afecta al saldo, nunca a ingresos/gastos. Repetir la clave
+  no recalcula nada. Una actividad/corrección retroactiva posterior puede causar
+  **deriva** respecto del objetivo: no es una instantánea que sustituya el historial.
+  Las nuevas correcciones también requieren cuenta activa; las lecturas incluyen inactivas.
+- **Telegram solo lectura:** `/movement <id>`, `/history <id>` y
+  `/reconciliations [id-cuenta]`, sin IA ni cambios al borrador pendiente. `/recent`
+  muestra categoría. Las consultas nuevas están acotadas al límite de Telegram y
+  ofrecen el comando CLI para el detalle completo.
+- Todos estos comandos B2 rechazan flags desconocidos, duplicados, incompletos y
+  posicionales inesperados. Validación/conflicto termina con código 1 sin escrituras.
+
+API B2 (`FinancialService`, entradas monetarias en `bigint`, `manager?` transaccional):
+`editMovement({ sourceKey, movementId, expectedRevision, amountMinor, occurredOn, reason,
+description?, category? })`, `voidMovement({ sourceKey, movementId, expectedRevision, reason })`,
+`movementHistory(id)`, `reconcile({ sourceKey, accountId, currency, targetMinor, occurredOn,
+reason })`, `reconciliations(accountId?)`. Las escrituras devuelven `{ revision, created }`
+o `{ reconciliation, created }`. `effectiveMovements()` devuelve DTOs compatibles con
+`Movement`, con `category`, `revision` y `voided`; no son entidades para guardar.
+Todos aceptan manager opcional para componer sin transacciones/colas anidadas.
+
+Pruebas dedicadas B2: `movement-corrections.spec.ts`,
+`movement-corrections-migration.spec.ts`, `movement-corrections-cli.spec.ts` y
+`telegram-commands.spec.ts`. Usan exclusivamente bases temporales; prueban replay,
+concurrencia, rollback, históricos inmutables, fechas/límites efectivos, precisión y
+restauración A/B1 → migración B2 → backup B2 con historial y saldos iguales.
+
+La evidencia vigente de B2 forma parte de la validación integrada de B, abajo.
+No es una nueva auditoría de A ni una declaración de preparación para producción.
+
+### B3: presupuestos financieros (aceptado)
+
+Son límites **informativos**, no dinero reservado ni saldo bancario: nunca bloquean
+gastos ni alteran movimientos/saldos. No hay rollover, actualización, eliminación,
+objetivos ni reservas en B3 (B4 los añade por separado); tampoco transferencias por IA.
+
+```bash
+npm run budget:add -- --source-key noviembre-usd --name Noviembre --currency USD --limit 100.00 --month 2026-11
+npm run budget:add -- --source-key comida-q1 --name Comida --currency USD --limit 20.00 --category Comida --month 2026-11 --half first
+npm run budget:add -- --source-key comida-q2 --name Comida --currency USD --limit 0 --category Comida --from 2026-11-16 --to 2026-11-30
+npm run budget:list
+npm run budget:status -- --on 2026-11-10
+npm run budget:status -- --budget ID_PRESUPUESTO --on 2026-12-10
+```
+
+- Una definición inmutable guarda UUID, `sourceKey` (1–200), nombre (1–80), moneda,
+  `limitMinor` no negativo (cero válido), categoría opcional, fechas inclusivas y
+  `createdAt`. Nombre/categoría/clave se recortan; categoría exacta, sensible a
+  mayúsculas, de 1–80 caracteres, sin catálogo ni inferencia. Moneda independiente
+  de cuentas: no requiere cuenta, fondos ni conversión. Dinero `bigint` en servicio,
+  `TEXT` en SQLite; CLI recibe decimal exacto, sin redondeo, incluso USDT de 6 decimales.
+- Fechas reales `YYYY-MM-DD`, inicio ≤ fin. Elige **solo** `--from` + `--to` o
+  `--month YYYY-MM` con `--half first|second` opcional. Mes completo: 1..último día;
+  quincenas: 1..15 y 16..último día (incluye bisiestos). `--half` exige `--month`.
+  Flags desconocidos, duplicados, incompletos o posicionales fallan con código 1.
+- Se rechaza cualquier solapamiento inclusivo de fechas para la **misma moneda y
+  alcance**. Global (`category = null`) y cada categoría exacta son alcances diferentes;
+  pueden coexistir. **No sumar sus restantes**, ni los de monedas distintas.
+- Replay: misma clave y **todo** el payload normalizado devuelve el mismo presupuesto
+  con `created: false`, antes de comprobar solapamientos. Payload distinto: conflicto.
+  El espacio de claves es propio de presupuestos. No hay API de edición en B3.
+- `gastado` solo suma gastos **efectivos no anulados**, de esa moneda y categoría
+  (o todas para global), dentro del periodo inclusivo y hasta `--on` inclusive.
+  Incluye comisiones; excluye principales transferidos, aperturas, conciliaciones e
+  ingresos. Las correcciones de importe/fecha/categoría y anulaciones recalculan el
+  reporte; no reescriben la definición. No se guardan contadores derivados.
+- `restante = límite - gastado`, puede ser negativo; `excedido` significa restante < 0.
+  Sin `--budget`, solo presupuestos activos al corte. Con ID se puede consultar uno
+  histórico/futuro: antes de su inicio gastado es cero; después de su fin el gasto queda
+  acotado al periodo. Por defecto el corte es hoy en `America/Caracas`; se excluyen
+  gastos posteriores al corte. `budget:list` lista todas las definiciones.
+- Telegram: `/budgets [YYYY-MM-DD]`, activos al corte, límite/gastado/restante exactos,
+  categoría y periodo. Respuesta acotada por filas con alternativa CLI. No llama IA,
+  reserva allowance ni cambia el borrador pendiente. Creación exclusivamente por CLI.
+
+API (`BudgetService`, módulo propio):
+`create({ sourceKey, name, currency, limitMinor, category?, startsOn, endsOn }, manager?)`
+→ `{ budget, created }`; `list(manager?)` → `Budget[]`;
+`status({ budgetId?, on? }?, manager?)` → `{ budget, asOf, spent, remaining, overspent }[]`.
+`overspent` es booleano. Todas las lecturas/escrituras usan la cola transaccional
+compartida; `manager` permite componer sin transacción anidada. La fuente de gasto
+es únicamente `FinancialService.effectiveMovements(manager)`.
+
+Pruebas B3 (solo SQLite temporal, sin proveedores ni base real):
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/budget.service.spec.ts test/budget-migration.spec.ts test/budget-cli.spec.ts test/date.spec.ts test/money.spec.ts test/telegram-commands.spec.ts
+```
+
+Incluyen precisión grande/cero, límites/fechas inválidos, quincenas, replay concurrente,
+solapamientos, gasto efectivo, comisiones, rollback/cola, CLI real estricta, Telegram
+sin IA/pendiente intacto y restauración A/B1/B2 → migrar B3 → restaurar mismos reportes.
+Esta evidencia no reabre la auditoría de A ni declara la preparación para producción.
+
+B3 está aceptado; su evidencia vigente está en la validación integrada de B, abajo.
+
+### B4: metas y reservas virtuales (aceptado)
+
+Una reserva **no es una transferencia entre cuentas**, ni un gasto. Es una asignación
+nominal dentro de la cuenta y moneda originales. No modifica saldos reales, movimientos,
+presupuestos ni `/summary`. No hay conversión de monedas ni garantía bancaria.
+
+```bash
+npm run goal:add -- --source-key fondo-usdt --name Fondo --currency USDT --target 100.000001 --target-on 2028-02-29
+npm run goal:list
+npm run goal:status -- --goal ID_META
+npm run savings:reserve -- --source-key reserva-1 --goal ID_META --account ID_CUENTA_USDT --amount 20.000001
+npm run savings:release -- --source-key libera-1 --goal ID_META --account ID_CUENTA_USDT --amount 0.000001
+npm run savings:status -- --account ID_CUENTA_USDT
+npm run savings:history -- --account ID_CUENTA_USDT --goal ID_META
+```
+
+- Meta inmutable: UUID, `sourceKey` recortada 1–200, nombre recortado 1–80, una moneda,
+  `targetMinor` positivo `TEXT` canónico y exacto, `createdAt`; `targetOn` opcional es un
+  día real de calendario, solo informativo. Sin edición/eliminación ni vencimiento automático.
+- `savings_entry` es historial append-only por la API: UUID, clave única, `kind`
+  `reserve|release`, FK cuenta/meta, moneda, `amountMinor` positivo `TEXT`, `createdAt`.
+  No hay fechas de reserva elegibles, retroactividad ni programación futura. Las consultas
+  de reservas son **solo actuales**: hoy en `America/Caracas`, excluyendo actividad
+  financiera futura. `/balances FECHA` mantiene el saldo histórico, pero solo muestra
+  reservado/disponible/déficit si FECHA es hoy; nunca mezcla reservas actuales con otro corte.
+- Cuenta y meta deben coincidir en moneda. La CLI deriva el parser de `--amount` de la
+  moneda conocida de la meta y comprueba la cuenta: no adivina ni convierte. Objetivos e
+  importes usan `parseAmount`: cero/negativos/exceso de decimales fallan, sin redondeo.
+  Todos los flags B4 son estrictos: desconocidos/duplicados/incompletos/posicionales fallan.
+- Reservar exige cuenta activa y `importe <= disponible`. Una única transacción calcula
+  los pares meta/cuenta y el total reservado en **todas** las metas de esa cuenta.
+  `reservado = reservas - liberaciones`; `disponible = saldo real - reservado`;
+  `déficit = max(0, -disponible)`. Nada se suma entre monedas diferentes.
+- Liberar exige `importe <= reservado` de **esa meta/cuenta**, y se permite en cuentas
+  inactivas o deficitarias. Devuelve disponibilidad virtual, no dinero real. No hay autoliberación.
+- Mismos `sourceKey` y payload normalizado devuelven mismo ID y `created: false` antes
+  de verificar fondos, cuenta activa o reserva actual, incluso tras liberar o perder
+  respaldo. Otro payload, incluido el tipo reserve/release: conflicto sin escribir.
+  Metas y entradas tienen espacios de claves propios; las entradas comparten uno.
+- Se permite **sobreobjetivo** si hay disponibilidad: progreso puede superar 100%.
+  Por meta se suman reservas de sus cuentas de la misma moneda; restante es
+  `max(0, objetivo - reservado)`. Progreso es cociente bigint exacto, presentado en
+  porcentaje con dos decimales **truncados**, sin Number para importes/ratios.
+- **Registrar y advertir:** gastos, transferencias/principales/comisiones, ediciones,
+  anulaciones de ingresos y conciliaciones pueden dejar saldo por debajo de las reservas.
+  Se registran normalmente, **preservando** todas las reservas; disponible puede ser
+  negativo y nuevas reservas quedan bloqueadas. Los comandos financieros CLI imprimen
+  advertencias genéricas de las cuentas actualmente deficitarias **después del éxito**,
+  también en replay; no bloquean ni atribuyen causalidad a una operación concreta.
+  Cada meta con reserva positiva en una cuenta deficitaria muestra
+  **«reserva nominal con cuentas deficitarias»**. No se inventa reparto/prorrateo del faltante.
+- Telegram solo consulta `/goals [ID]`, `/savings`, y `/balances` actuales: deterministas,
+  acotadas por filas con alternativa CLI, sin IA ni modificar pendiente/allowance.
+  Un registro exitoso de captura (`/confirm`) añade advertencia actual al entregar;
+  no cambia el reply durable original ni duplica movimientos. El outbox fija el texto
+  diagnosticado al procesar y los reintentos de envío lo conservan. Un replay de captura
+  reprocesado puede reflejar un diagnóstico actual distinto. No se advierte por una
+  confirmación fallida/sin pendiente. Metas/reservas/liberaciones: **solo CLI manual**.
+
+API del módulo `SavingsModule` (sin dependencia inversa desde `FinancialModule`):
+
+- `GoalService.create({sourceKey, name, currency, targetMinor, targetOn?}, manager?)`
+  → `{goal, created}`; `list(manager?)` → `Goal[]`; `get(id, manager?)` → `Goal`.
+- `SavingsService.reserve/release({sourceKey, goalId, accountId, currency, amountMinor}, manager?)`
+  → `{entry, created}`; `status(accountId?, manager?)` →
+  `{accountId, name, currency, asOf, hasOpening, balance, reserved, available, deficit}[]`;
+  `goalStatus(goalId?, manager?)` → `{goal, reserved, remaining, progress, nominalWithDeficit}[]`;
+  `history({accountId?, goalId?}?, manager?)` → `SavingsEntry[]`; `warnings()` → `string[]`.
+- Lecturas y escrituras comparten `TransactionRunner`; manager opcional permite composición
+  atómica sin transacción anidada. `SavingsService` es la única aritmética de reservas.
+  Importes API son bigint; JSON CLI lista/historial los serializa como cadenas menores.
+  El historial tiene orden estable `createdAt, sourceKey` (empates no implican orden causal).
+
+Rollout **solo en rutas temporales/ficticias**, no en la base real: detener backend →
+backup del prefijo completo A/B1/B2/B3 → restaurar en ruta nueva → apuntar `DATABASE_PATH`
+allí → compilar → `migration:run` → comparar historial/saldos anteriores → probar B4 →
+backup/restaurar B4 y comparar metas/historial/disponibles. No borrar/recrear el original.
+No se reaudita A. B4 está aceptado tras su revisión obligatoria de solo lectura sin hallazgos.
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/savings.service.spec.ts test/savings-migration.spec.ts test/savings-telegram.spec.ts
+npm test -- --runInBand test/savings-cli.spec.ts
+npm run test:e2e -- --runInBand
+```
+
+### Unidad 1: dominio de deudas (en curso, sin acceso por CLI ni Telegram)
+
+**Alcance de esta unidad: solo el dominio, la migración y sus invariantes.** No hay comando
+de CLI, ni captura por lenguaje natural, ni comando de Telegram: esas superficies llegan en la
+unidad 2. Hasta entonces este dominio **no es accesible desde la aplicación**; nada de lo que
+se describe aquí está aceptado técnicamente.
+
+Es el seguimiento de una obligación con la política explícita **«Seguimiento y contabilidad»**:
+
+- **Crear es solo una obligación.** `DebtService.create` guarda la deuda (UUID, `sourceKey`
+  única e inmutable, dirección `payable|receivable`, contraparte, moneda, principal positivo
+  `TEXT` exacto, fecha, descripción) y **no crea movimientos, cuentas, saldos, presupuestos
+  ni reservas**. No hay edición ni borrado de deudas, intereses, netting ni clasificación del
+  origen: un préstamo es simplemente una deuda `payable`.
+- **Cada pago es un movimiento ordinario.** `DebtService.settle` registra un **gasto** si la
+  deuda es `payable` y un **ingreso** si es `receivable` (también en préstamos), con la cuenta
+  y la moneda del pago, y lo liga a la deuda en la **misma transacción**: o se guardan el
+  movimiento y el vínculo, o no se guarda ninguno. Cuenta activa y moneda coincidente los
+  comprueba `FinancialService.register`; la moneda del pago debe ser la de la deuda y el pago
+  no puede ser anterior a la fecha de la deuda.
+- **Concurrencia explícita.** El pago declara `expectedOutstandingMinor` (el pendiente que el
+  llamador vio): debe coincidir con el pendiente actual, y el importe debe ser `0 < importe <=
+  pendiente`. Un pago obsoleto o que excede el principal se rechaza sin escribir.
+- **Contraparte sin fusiones.** La comparación es exacta y canónica (NFD sin diacríticos,
+  minúsculas y espacios colapsados); la forma mostrada se conserva. No hay coincidencia
+  difusa ni se elige "la primera": el filtro devuelve todas las obligaciones que coinciden.
+- **Corrección: anular y pagar de nuevo.** El movimiento de un pago **no se edita** (el veto
+  vive en `FinancialService.saveRevision`); **anularlo sí** y reabre automáticamente la deuda:
+  el pendiente vuelve a subir y las cuentas y los reportes vuelven a su estado anterior. El
+  replay de la clave original devuelve siempre el pago y el movimiento **originales**, incluso
+  anulados, y nunca crea un sustituto.
+- **Estado derivado, nunca guardado.** `pagado` son los movimientos efectivos no anulados
+  ligados a la deuda (única fuente: `FinancialService.effectiveMovements`); `pendiente` es el
+  principal menos lo pagado, y el estado es `open`, `partial` o `paid`. No hay corte por
+  fecha: se cuentan todos los pagos registrados.
+
+API (módulo `DebtsModule`, importes en `bigint`, `manager?` transaccional):
+
+- `DebtService.create({ sourceKey, direction, counterparty, money: { currency, minor }, occurredOn, description? }, manager?)` → `{ debt, created }`.
+- `DebtService.settle({ sourceKey, debtId, accountId, money, occurredOn, expectedOutstandingMinor, description? }, manager?)` → `{ payment, movement, created }`.
+- `DebtService.get(id, manager?)` → `{ debt, paidMinor, outstandingMinor, status, payments }`;
+  `list({ direction?, currency?, counterparty?, status? }?, manager?)` → el mismo tipo de vista.
+
+Pruebas dedicadas (solo SQLite temporal, sin proveedores ni base real):
+`test/debt.service.spec.ts` y `test/debt-migration.spec.ts`.
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/debt.service.spec.ts test/debt-migration.spec.ts
+```
+
+### Unidad 2 (deudas): conversación, captura y bot (en curso, sin CLI y sin aceptación global)
+
+**Alcance de esta unidad: la conversación, la captura durable y el bot.** El dominio de
+deudas es el de la unidad 1 (sin cambios). Aquí las deudas **se crean, se pagan y se
+consultan escribiendo en lenguaje natural**. La CLI de deudas, la documentación final y el
+cierre (unidad 3) **no** están: nada de lo que se describe aquí está aceptado técnicamente.
+
+- **Un solo objeto `debt` en la respuesta del modelo.** El esquema estricto (Zod) gana
+  los tipos `debt_create`, `debt_settle` y `debt_query` y un único objeto `debt`
+  **anulable** con todas sus propiedades obligatorias y anulables: `direction`
+  (`payable`/`receivable`), `counterparty`, `debtId`, `settlementMode`
+  (`partial`/`full`) y `status` (`open`/`partial`/`paid`). La forma de la respuesta no
+  depende del tipo de operación: el JSON Schema que se envía al proveedor se deriva del
+  mismo esquema y sale sin `additionalProperties` y con todo en `required`.
+- **Crear una deuda no mueve dinero.** «le debo 8$ a Carmen de dos tortas» es una deuda
+  `payable` y «Carmen me debe 8$» una `receivable`: se registra la obligación con su
+  principal, su contraparte, su moneda y su fecha (la del mensaje en Caracas si el
+  modelo no da otra). **No hay cuenta, ni movimiento, ni saldo.** El `/confirm` devuelve
+  el id de la deuda en la respuesta durable.
+- **Pagar una deuda sí mueve dinero**, con las reglas del dominio: gasto si la deuda es
+  `payable`, ingreso si es `receivable`, en la moneda de la deuda, en una cuenta activa de
+  esa moneda y con la fecha **posterior o igual** a la de la deuda. El movimiento y el
+  vínculo se escriben en la **misma transacción** que el cierre del borrador, y la
+  respuesta durable lleva el id de la deuda, el del pago y el del movimiento.
+- **El pendiente se congela al preparar el pago.** Un pago parcial («le pagué 3
+  dólares») lleva un importe positivo y explícito; un importe que coincide con el
+  pendiente salda la deuda igual. Un pago **total** («ya le pagué todo», «lo pagué
+  completo», «ya saldé la deuda») lo autoriza **el texto del usuario**: sin esa frase
+  el backend pregunta el importe, **aunque el modelo diga que el pago fue total**. La
+  autorización se guarda en el borrador (`fullIntent`) y se conserva al aclarar la
+  cuenta, incluso tras reiniciar; se pierde si cambia el objetivo (otra deuda u otra
+  persona), salvo que el mensaje nuevo vuelva a pedirlo. Los borradores anteriores a
+  ese campo se leen **sin** autorización: un borrador viejo nunca paga todo por su
+  cuenta. Si entre el resumen y el `/confirm` cambia el pendiente (otro pago o una
+  anulación), el `/confirm` **se rechaza**: no se paga un total nuevo en silencio y hay
+  que volver a preparar el pago. Si el mensaje no dice la moneda del pago, se usa la de
+  la deuda (el usuario ya señaló esa deuda); si dice otra, se pregunta y no se paga.
+- **La deuda destino la resuelve el backend, no el modelo.** Los ids que el usuario
+  **escribe en el mensaje actual** mandan sobre el borrador vivo: si escribe uno, se
+  usa ese (y tiene que encajar con la contraparte, la dirección y la moneda que pide el
+  mismo mensaje); si escribe varios, se pregunta cuál y no se elige ninguno. El id del
+  borrador vivo solo sirve si el mensaje actual no trae ninguno **y** sigue siendo
+  compatible (misma contraparte, dirección y moneda): si el usuario cambia de persona,
+  se busca de nuevo entre todas las deudas. Un id propuesto por el modelo nunca resuelve
+  nada. Sin id, la deuda se busca por contraparte, dirección y moneda exactas
+  (comparación canónica del dominio); si hay varias, se pregunta con una lista acotada
+  de ids y el usuario elige; si falta la contraparte, la dirección o la moneda, se
+  pregunta y no se inventa nada.
+- **La consulta es de solo lectura.** «cuáles son mis deudas», «quién me debe» o «qué le
+  debo a Carmen» se responden con los datos guardados, **sin llamar al modelo para la
+  cuenta** y **sin tocar el borrador pendiente**: la fila del borrador queda byte por byte
+  igual. Las consultas se atienden **antes** que cualquier conversión, operación múltiple
+  o descarte. `/debts` y `/debts <id>` hacen lo mismo desde el comando, con el mismo
+  formateador (`src/debts/debt-format.ts`): separa lo que debo de lo que me deben, muestra
+  id, contraparte, original, pagado, pendiente y estado, y da totales **por dirección y
+  moneda, nunca compensados** entre direcciones ni entre monedas.
+- **Salvaguarda determinista.** Si el mensaje habla de una deuda («debo», «me debe»,
+  «adeudo», «préstamo») pero el modelo lo clasifica como gasto o ingreso, **no se registra
+  nada**: se pregunta qué quiso decir. Un gasto normal con un comercio no se confunde con
+  una deuda.
+- **El borrador vive en la misma tabla `capture`.** No hay un estado pendiente nuevo ni una
+  tabla nueva: la migración `DebtCapture1788566400000` (B6) **solo añade** la columna de
+  texto `debtPayload`, con el JSON del borrador validado por esquema antes de usarlo (un
+  JSON roto se pide de nuevo, sin mostrar nada del mensaje original). El texto original se
+  borra igual que en las operaciones ordinarias, y la revocación de Telegram sigue
+  cancelando el borrador por su origen.
+- **El contexto del modelo está acotado.** El mensaje del usuario va **entero**; lo que se
+  recorta es el contexto (cuentas, deudas candidatas y borrador), siempre por líneas
+  enteras y **avisando**: si la lista de deudas se corta, el modelo no debe elegir ninguna
+  y el backend sigue viendo la lista completa. El tope de contexto es propio y fijo; no se
+  toca el límite de entrada ni el de salida.
+
+Pruebas dedicadas (solo SQLite temporal, sin proveedores ni base real):
+`test/debt-capture.spec.ts`, `test/debt-telegram.spec.ts` y las pruebas de esquema y
+prompt en `test/openrouter.interpreter.spec.ts`.
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/debt-capture.spec.ts test/debt-telegram.spec.ts test/debt-migration.spec.ts test/openrouter.interpreter.spec.ts
+```
+
+### Aceptación técnica local de B y validación integrada (2026-11-11)
+
+**B1, B2, B3 y B4 aceptados:** cada unidad pasó la revisión obligatoria de solo lectura
+sin hallazgos. El orquestador validó independientemente el conjunto en **Node 24**:
+
+```bash
+npm run typecheck && npm run build && npm test -- --runInBand && npm run test:e2e -- --runInBand && git diff --check
+```
+
+| Comprobación | Resultado integrado |
+| --- | --- |
+| `npm run typecheck` | Sin errores de tipos |
+| `npm run build` | Compilación correcta |
+| `npm test -- --runInBand` | **29 suites y 318 pruebas aprobadas** |
+| `npm run test:e2e -- --runInBand` | **1 suite y 8 pruebas aprobadas** |
+| `git diff --check` | Sin errores de espacios; solo avisos LF/CRLF de Windows |
+
+Esta evidencia sustituye los recuentos parciales previos de B. Los avisos de
+red/cancelación proceden de fallos simulados; no hubo llamadas a proveedores reales
+ni migración de la base real. No se hicieron commits/push ni una nueva auditoría de A.
+**B está completada técnicamente en local solo en el alcance documentado:** escrituras
+B manuales por CLI con el bot detenido y cerrojo, consultas Telegram deterministas y
+advertencias de reservas al confirmar la captura existente. No acredita flujos B
+completos en lenguaje natural, pruebas de proveedores reales ni preparación para producción;
+Angular sigue fuera de esta entrega.
 
 ## Copias de seguridad y restauración
 
@@ -240,7 +727,33 @@ Monedas admitidas: `VES`, `USD`, `USDT`.
 - El backend debe estar **detenido**: el cerrojo de una sola instancia lo impide. Si el
   backend está corriendo, la copia falla.
 
-Para volver a trabajar con una base restaurada, apunta `DATABASE_PATH` a la ruta nueva.
+Se aceptan copias completas de A y de B1. Si figura la migración B1, debe existir
+`ledger_operation`, y viceversa. Una copia A sigue siendo válida sin esa tabla.
+Para volver a trabajar con una base restaurada, apunta `DATABASE_PATH` a la ruta nueva y
+aplica las migraciones pendientes antes de iniciar el backend. Un backup B1 conserva
+operaciones, comisiones, IDs y saldos.
+
+También se aceptan copias B2: el marcador de migración y **ambas** tablas
+`movement_revision`/`balance_reconciliation` deben estar presentes juntos y requieren B1.
+Las copias B2 conservan originales, revisiones, anulaciones y deltas de conciliación.
+
+Las copias B3 requieren juntos `budget` y `Budgets1780617600000`, además de B2/B1
+completos. Conservan las definiciones y los mismos reportes efectivos al mismo corte.
+Los prefijos completos A/B1/B2 siguen siendo restaurables y se migran después.
+
+Las copias B4 requieren juntos `goal`, `savings_entry` y `GoalsAndSavings1783209600000`,
+además de B3/B2/B1 completos. Se rechazan marcadores/tablas parciales; los prefijos
+completos A/B1/B2/B3 siguen siendo restaurables. B4 conserva metas, historial virtual,
+IDs, replay y disponibles al mismo día/actividad financiera (no es un corte histórico).
+
+Las copias B5 requieren juntos `debt`, `debt_payment` y `Debts1785888000000`, además de
+B4/B3/B2/B1 completos.
+
+Las copias B6 requieren la columna `debtPayload` de `capture` **junto** a su migración
+`DebtCapture1788566400000`, que a su vez exige B5. Se rechaza el marcador o la columna
+sueltos. Los prefijos completos A/B1/B2/B3/B4/B5 siguen siendo restaurables y se migran
+después: la migración es aditiva y no reescribe los borradores anteriores (la columna
+nueva queda en `null`).
 
 ## Cerrojo de una sola instancia
 
@@ -347,6 +860,10 @@ ambigüedad, no una preferencia personal:
   de un gasto normal y no se rechaza.
 - **Un mensaje, una operación.** Si el mensaje describe varias operaciones se pide reescribirlo;
   nunca se guarda solo la primera.
+- **Las deudas también se registran por aquí** (unidad 2): «le debo 8$ a Carmen» crea la
+  obligación **sin mover dinero** y «le pagué 3 dólares a Carmen» la paga con un movimiento
+  ordinario. Una consulta de deudas es de solo lectura y no toca el borrador pendiente.
+  El detalle está en la sección «Unidad 2».
 - **`/confirm` y `/cancel` son deterministas**: no llaman al modelo.
 - **Los fallos internos no se muestran.** Si el registro falla por un error inesperado, la
   respuesta al usuario es genérica; solo se muestran los errores de dominio conocidos (cuenta
@@ -575,13 +1092,15 @@ totales. **Ninguna prueba hace llamadas externas ni usa credenciales reales.**
 
 ## Límites conocidos de esta entrega
 
-- **Solo ingresos y gastos.** Una conversión o transferencia entre cuentas o monedas no se
-  registra; solo se avisa. Las transferencias llegan en la Etapa B.
-- **No hay correcciones.** No se puede editar ni anular un movimiento: el flujo es
-  “registrar y, si te equivocaste, avisar por otro canal”. La corrección y la anulación
-  llegan en la Etapa B.
-- **`/summary` no es un saldo.** Son los totales de la actividad registrada en el mes, sin
-  saldos iniciales, sin transferencias y sin valor de mercado. No hay conversión de moneda.
+- **Captura IA solo de ingresos y gastos.** Las transferencias/conversiones se registran
+  únicamente por CLI B1; Telegram no las registra ni por texto ni por comandos.
+- **Correcciones solo por CLI B2.** Telegram consulta el historial; no edita ni anula.
+  Aperturas y principales transferidos no admiten corrección/anulación en B2.
+- **Mutadores B manuales por CLI.** Presupuestos, metas, reservas y liberaciones no
+  admiten captura natural ni escritura Telegram. Reservas nominales pueden perder
+  respaldo; se registra y advierte, no se bloquean gastos ni se liberan automáticamente.
+- **`/summary` no es un saldo.** Son los totales de actividad del mes; no incluye
+  aperturas ni principales transferidos. `/balances` conserva cada moneda sin valorarla.
 - **Las fechas son días, no instantes.** Se guarda `YYYY-MM-DD`; el día por defecto es el del
   mensaje en America/Caracas.
 - **Un usuario, una instancia.** El bot está pensado para un usuario personal y una sola
@@ -606,11 +1125,10 @@ totales. **Ninguna prueba hace llamadas externas ni usa credenciales reales.**
 - **La revocación se aplica al arrancar.** La lista de autorizados se lee al construir el
   bot y no cambia durante la ejecución: el trabajo pendiente de un chat revocado se limpia
   en el primer ciclo, no en caliente.
-- **El requisito de Node 24 sigue en pie.** `package.json` exige Node >= 24; la última
-  verificación de la suite se hizo en Node 22.22.3 (la versión disponible en el entorno de
-  desarrollo), así que la compatibilidad con Node 24 **no está verificada**.
+- **El requisito de Node 24 sigue en pie.** La validación integrada de B1–B4 se
+  completó en Node 24; la evidencia completa histórica de A se conserva abajo.
 
-## Plan técnico de cierre (Etapa A)
+## Plan técnico de cierre (Etapa A, registro histórico)
 
 Cerrar la Etapa A es una lista corta y verificable. Lo que ya está hecho, revisado
 localmente y comprobado con pruebas automáticas:
@@ -660,8 +1178,6 @@ Esto acredita el **código** de la Etapa A en local; **no habilita el uso operat
 avisos de arriba siguen vigentes (datos reales, proveedores reales, Node 24 y revisión de
 preparación para producción).
 
-Lo que **no** se decide aquí: el alcance de la Etapa B (presupuestos, cuentas, saldos
-iniciales, transferencias, categorías y objetivos) sigue abierto y no se ha tocado.
-
-La Etapa B no se inició en este incremento porque la auditoría inicial encontró
-correcciones de la Etapa A pendientes de implementar.
+El registro anterior corresponde al cierre histórico de A y no reabre su aceptación.
+B1/B2/B3/B4 están aceptados técnicamente en local; B está completada en el alcance
+manual CLI y consultas/advertencias Telegram documentado, no como habilitación operativa.

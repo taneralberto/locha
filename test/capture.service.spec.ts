@@ -10,6 +10,7 @@ import { CaptureService } from '../src/capture/capture.service';
 import { InferenceBudgetService } from '../src/capture/inference-budget.service';
 import { AiLimits } from '../src/config/configuration';
 import { TransactionRunner } from '../src/data/transaction.runner';
+import { DebtService } from '../src/debts/debt.service';
 import { ValidationError } from '../src/domain/errors';
 import { FinancialService } from '../src/financial/financial.service';
 import { Movement } from '../src/financial/movement.entity';
@@ -38,6 +39,7 @@ function operation(overrides: Partial<Operation> = {}): Operation {
     kind: 'expense',
     occurredOn: '2026-11-10',
     description: 'Helado',
+    debt: null,
     ...overrides,
   };
 }
@@ -74,12 +76,14 @@ describe('CaptureService', () => {
     financial?: FinancialService,
   ): CaptureService {
     const transactions = new TransactionRunner(dataSource);
+    const resolvedFinancial = financial ?? new FinancialService(transactions);
     return new CaptureService(
       dataSource,
       transactions,
-      financial ?? new FinancialService(transactions),
+      resolvedFinancial,
       interpreter,
       new InferenceBudgetService(transactions, limits),
+      new DebtService(transactions, resolvedFinancial),
     );
   }
 

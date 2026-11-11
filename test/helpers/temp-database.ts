@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DataSource } from 'typeorm';
+import { DataSource, DataSourceOptions } from 'typeorm';
 import { buildDataSourceOptions } from '../../src/data/data-source';
 import { TransactionRunner } from '../../src/data/transaction.runner';
 
@@ -16,10 +16,13 @@ export interface TempDatabase {
 }
 
 /** Base de datos temporal con el esquema de las migraciones ya aplicado. */
-export async function createTempDatabase(): Promise<TempDatabase> {
+export async function createTempDatabase(migrations?: DataSourceOptions['migrations']): Promise<TempDatabase> {
   const directory = mkdtempSync(join(tmpdir(), 'locha-test-'));
   const path = join(directory, 'locha.sqlite');
-  const dataSource = new DataSource(buildDataSourceOptions(path));
+  const dataSource = new DataSource({
+    ...buildDataSourceOptions(path),
+    ...(migrations === undefined ? {} : { migrations }),
+  });
   await dataSource.initialize();
   await dataSource.runMigrations();
   return {

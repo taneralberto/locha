@@ -3,12 +3,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DataSource } from 'typeorm';
 import { AccountService } from '../../src/accounts/account.service';
+import { BudgetService } from '../../src/budgets/budget.service';
+import { GoalService } from '../../src/savings/goal.service';
+import { SavingsService } from '../../src/savings/savings.service';
 import { CaptureService } from '../../src/capture/capture.service';
 import { InferenceBudgetService } from '../../src/capture/inference-budget.service';
 import { TelegramSettings } from '../../src/config/configuration';
 import { backupDatabase, restoreDatabase } from '../../src/data/backup';
 import { buildDataSourceOptions } from '../../src/data/data-source';
 import { TransactionRunner } from '../../src/data/transaction.runner';
+import { DebtService } from '../../src/debts/debt.service';
 import { FinancialService } from '../../src/financial/financial.service';
 import { Movement } from '../../src/financial/movement.entity';
 import { TelegramCommands } from '../../src/telegram/telegram-commands';
@@ -97,6 +101,7 @@ describe('Flujo completo del bot de Telegram', () => {
       financialService,
       operationInterpreter,
       new InferenceBudgetService(transactions, LIMITS),
+      new DebtService(transactions, financialService),
     );
     const commands = new TelegramCommands(
       capture,
@@ -104,6 +109,9 @@ describe('Flujo completo del bot de Telegram', () => {
       new AccountService(source, transactions),
       new InferenceBudgetService(transactions, LIMITS),
       LIMITS,
+      new BudgetService(transactions, financialService),
+      new SavingsService(transactions, financialService, new GoalService(transactions)),
+      new DebtService(transactions, financialService),
     );
     return new TelegramService(source, transactions, commands, telegramClient, SETTINGS);
   }
@@ -131,6 +139,7 @@ describe('Flujo completo del bot de Telegram', () => {
       kind: 'expense',
       occurredOn: '2026-11-10',
       description: 'Helado',
+      debt: null,
     });
 
     await telegram.start();
@@ -156,6 +165,37 @@ describe('Flujo completo del bot de Telegram', () => {
     expect(client.lastSent?.text).toContain('no son el saldo');
   });
 
+  it('B4: confirma gasto bajo reservas, entrega advertencia durable y consultas sin duplicar ni llamar IA', async () => {
+    const transactions = new TransactionRunner(dataSource);
+    const goals = new GoalService(transactions);
+    const savings = new SavingsService(transactions, financial, goals);
+    await financial.open({ sourceKey: 'open-b4', accountId, money: { currency: 'USD', minor: 100n }, occurredOn: '2020-01-01' });
+    const goal = (await goals.create({ sourceKey: 'goal-b4', name: 'Fondo', currency: 'USD', targetMinor: 100n })).goal;
+    await savings.reserve({ sourceKey: 'reserve-b4', goalId: goal.id, accountId, currency: 'USD', amountMinor: 100n });
+    interpreter.responses.push({ amount: '2.00', currency: 'USD', accountId, kind: 'expense', occurredOn: '2026-11-10', description: null, debt: null });
+    await telegram.start();
+    client.enqueue(update(60, 'Gaste 2 dolares'));
+    await waitUntil(() => client.sent.length === 1);
+    client.enqueue(update(61, '/confirm'));
+    await waitUntil(() => client.sent.length === 2);
+    expect(client.lastSent?.text).toContain('Registrado');
+    expect(client.lastSent?.text).toContain('deficit 2.00 | disponible -2.00');
+    expect((await dataSource.getRepository(TelegramOutbox).findOneByOrFail({ updateId: 61 })).text).toContain('ADVERTENCIA');
+    client.enqueue(update(61, '/confirm'));
+    client.enqueue(update(62, '/savings'));
+    await waitUntil(() => client.sent.length === 3);
+    expect(client.lastSent?.text).toContain('saldo -1.00 | reservado 1.00 | disponible -2.00 | deficit 2.00');
+    client.enqueue(update(63, `/goals ${goal.id}`));
+    await waitUntil(() => client.sent.length === 4);
+    expect(client.lastSent?.text).toContain('reserva nominal con cuentas deficitarias');
+    client.enqueue(update(64, '/balances'));
+    await waitUntil(() => client.sent.length === 5);
+    expect(client.lastSent?.text).toContain('deficit 2.00 | ADVERTENCIA');
+    expect(await dataSource.getRepository(Movement).count()).toBe(1);
+    expect(await savings.history()).toHaveLength(1);
+    expect(interpreter.requests).toHaveLength(1);
+  });
+
   it('no duplica el movimiento cuando Telegram repite la actualizacion', async () => {
     interpreter.responses.push(
       {
@@ -165,6 +205,7 @@ describe('Flujo completo del bot de Telegram', () => {
         kind: 'expense',
         occurredOn: '2026-11-10',
         description: 'Helado',
+        debt: null,
       },
       {
         amount: '2.00',
@@ -173,6 +214,7 @@ describe('Flujo completo del bot de Telegram', () => {
         kind: 'expense',
         occurredOn: '2026-11-10',
         description: 'Helado',
+        debt: null,
       },
     );
 
@@ -253,6 +295,7 @@ describe('Flujo completo del bot de Telegram', () => {
       kind: 'expense',
       occurredOn: '2026-11-10',
       description: 'Helado',
+      debt: null,
     });
 
     // Se acepta la actualizacion pero no se procesa: el proceso se interrumpe.
@@ -296,6 +339,7 @@ describe('Flujo completo del bot de Telegram', () => {
       kind: 'expense',
       occurredOn: '2026-11-10',
       description: 'Helado',
+      debt: null,
     });
 
     await telegram.start();

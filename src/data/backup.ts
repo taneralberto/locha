@@ -6,6 +6,12 @@ import { canonicalPath } from './paths';
 import { CaptureAndInference1769904000000 } from './migrations/1769904000000-CaptureAndInference';
 import { InitialSchema1767225600000 } from './migrations/1767225600000-InitialSchema';
 import { TelegramDelivery1772582400000 } from './migrations/1772582400000-TelegramDelivery';
+import { LedgerOperations1775260800000 } from './migrations/1775260800000-LedgerOperations';
+import { MovementCorrections1777939200000 } from './migrations/1777939200000-MovementCorrections';
+import { Budgets1780617600000 } from './migrations/1780617600000-Budgets';
+import { GoalsAndSavings1783209600000 } from './migrations/1783209600000-GoalsAndSavings';
+import { Debts1785888000000 } from './migrations/1785888000000-Debts';
+import { DebtCapture1788566400000 } from './migrations/1788566400000-DebtCapture';
 
 /** Tablas que debe tener una base valida del proyecto. */
 const EXPECTED_TABLES = [
@@ -154,6 +160,36 @@ export function validateDatabase(path: string): void {
     }
     const applied = database.prepare(`SELECT name FROM migrations`).all() as { name: string }[];
     const appliedNames = applied.map((migration) => migration.name);
+    // Los prefijos completos A/B1/B2/B3 siguen siendo restaurables y se migran despues.
+    if (names.includes('ledger_operation') !== appliedNames.includes(new LedgerOperations1775260800000().name)) {
+      throw new Error(`La base "${path}" no tiene el esquema esperado de ledger_operation y su migracion.`);
+    }
+    const hasB2 = appliedNames.includes(new MovementCorrections1777939200000().name);
+    if (names.includes('movement_revision') !== hasB2 || names.includes('balance_reconciliation') !== hasB2 ||
+      (hasB2 && !appliedNames.includes(new LedgerOperations1775260800000().name))) {
+      throw new Error(`La base "${path}" no tiene el esquema esperado B2: movement_revision, balance_reconciliation y su migracion requieren B1.`);
+    }
+    const hasB3 = appliedNames.includes(new Budgets1780617600000().name);
+    if (names.includes('budget') !== hasB3 || (hasB3 && !hasB2)) {
+      throw new Error(`La base "${path}" no tiene el esquema esperado B3: budget y su migracion requieren B2 y B1.`);
+    }
+    const hasB4 = appliedNames.includes(new GoalsAndSavings1783209600000().name);
+    if (names.includes('goal') !== hasB4 || names.includes('savings_entry') !== hasB4 || (hasB4 && !hasB3)) {
+      throw new Error(`La base "${path}" no tiene el esquema esperado B4: goal, savings_entry y su migracion requieren B3, B2 y B1.`);
+    }
+    const hasB5 = appliedNames.includes(new Debts1785888000000().name);
+    if (names.includes('debt') !== hasB5 || names.includes('debt_payment') !== hasB5 || (hasB5 && !hasB4)) {
+      throw new Error(`La base "${path}" no tiene el esquema esperado B5: debt, debt_payment y su migracion requieren B4, B3, B2 y B1.`);
+    }
+    // La columna del borrador de deuda va junto a su migracion: B6 exige B5.
+    const captureColumns = database.prepare(`PRAGMA table_info("capture")`).all() as { name: string }[];
+    const hasDebtPayload = captureColumns.some((column) => column.name === 'debtPayload');
+    const hasB6 = appliedNames.includes(new DebtCapture1788566400000().name);
+    if (hasDebtPayload !== hasB6 || (hasB6 && !hasB5)) {
+      throw new Error(
+        `La base "${path}" no tiene el esquema esperado B6: la columna debtPayload del borrador y su migracion requieren B5, B4, B3, B2 y B1.`,
+      );
+    }
     const pending = EXPECTED_MIGRATIONS.filter((migration) => !appliedNames.includes(migration));
     if (pending.length > 0) {
       throw new Error(

@@ -15,6 +15,10 @@ describe('Contexto de aplicacion NestJS', () => {
       const { AppModule } = await import('../src/app.module');
       const { AccountService } = await import('../src/accounts/account.service');
       const { FinancialService } = await import('../src/financial/financial.service');
+      const { BudgetService } = await import('../src/budgets/budget.service');
+      const { DebtService } = await import('../src/debts/debt.service');
+      const { GoalService } = await import('../src/savings/goal.service');
+      const { SavingsService } = await import('../src/savings/savings.service');
       const { CaptureService } = await import('../src/capture/capture.service');
       const { OperationInterpreter } = await import('../src/interpreter/interpreter');
       const { TelegramService } = await import('../src/telegram/telegram.service');
@@ -26,17 +30,18 @@ describe('Contexto de aplicacion NestJS', () => {
       try {
         expect(app.get(AccountService)).toBeDefined();
         expect(app.get(FinancialService)).toBeDefined();
+        expect(app.get(BudgetService)).toBeDefined();
+        expect(app.get(DebtService)).toBeDefined();
+        expect(app.get(GoalService)).toBeDefined();
+        expect(app.get(SavingsService)).toBeDefined();
         expect(app.get(CaptureService)).toBeDefined();
         expect(app.get(OperationInterpreter)).toBeDefined();
         expect(app.get(TelegramService)).toBeDefined();
 
         const dataSource = app.get(DataSource);
         const applied = await dataSource.runMigrations();
-        expect(applied.map((migration) => migration.name)).toEqual([
-          'InitialSchema1767225600000',
-          'CaptureAndInference1769904000000',
-          'TelegramDelivery1772582400000',
-        ]);
+        expect(applied.map((migration) => migration.name)).toEqual(dataSource.migrations.map((migration) => migration.name));
+        expect(applied.map((migration) => migration.name)).toContain('Budgets1780617600000');
 
         const tables = await dataSource.query<{ name: string }[]>(
           `SELECT name FROM sqlite_master WHERE type = 'table'`,
@@ -44,7 +49,15 @@ describe('Contexto de aplicacion NestJS', () => {
         expect(tables.map((table) => table.name)).toEqual(
           expect.arrayContaining([
             'account',
+            'budget',
+            'goal',
+            'savings_entry',
+            'debt',
+            'debt_payment',
             'movement',
+            'ledger_operation',
+            'movement_revision',
+            'balance_reconciliation',
             'capture',
             'capture_event',
             'ai_usage_day',

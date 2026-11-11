@@ -1,12 +1,16 @@
 import { DataSource, ObjectLiteral, Repository } from 'typeorm';
 import { Account } from '../src/accounts/account.entity';
 import { AccountService } from '../src/accounts/account.service';
+import { BudgetService } from '../src/budgets/budget.service';
+import { GoalService } from '../src/savings/goal.service';
+import { SavingsService } from '../src/savings/savings.service';
 import { Capture } from '../src/capture/capture.entity';
 import { CaptureEvent } from '../src/capture/capture-event.entity';
 import { CaptureService } from '../src/capture/capture.service';
 import { InferenceBudgetService } from '../src/capture/inference-budget.service';
 import { TelegramSettings } from '../src/config/configuration';
 import { TransactionRunner } from '../src/data/transaction.runner';
+import { DebtService } from '../src/debts/debt.service';
 import { FinancialService } from '../src/financial/financial.service';
 import { Movement } from '../src/financial/movement.entity';
 import { TelegramCommands } from '../src/telegram/telegram-commands';
@@ -71,6 +75,7 @@ function operation(accountId: string) {
     kind: 'expense' as const,
     occurredOn: '2026-11-10',
     description: 'Helado',
+    debt: null,
   };
 }
 
@@ -144,6 +149,7 @@ describe('TelegramService', () => {
       financial,
       new FakeInterpreter(Array.from({ length: responses }, () => operation(account.id))),
       new InferenceBudgetService(transactions, LIMITS),
+      new DebtService(transactions, financial),
     );
   }
 
@@ -192,6 +198,7 @@ describe('TelegramService', () => {
       financial,
       interpreter,
       new InferenceBudgetService(transactions, LIMITS),
+      new DebtService(transactions, financial),
     );
     return new TelegramCommands(
       capture,
@@ -199,6 +206,9 @@ describe('TelegramService', () => {
       new AccountService(target.dataSource, transactions),
       new InferenceBudgetService(transactions, LIMITS),
       LIMITS,
+      new BudgetService(transactions, financial),
+      new SavingsService(transactions, financial, new GoalService(transactions)),
+      new DebtService(transactions, financial),
     );
   }
 

@@ -8,7 +8,8 @@ export type CaptureState =
   | 'cancelled'
   | 'unsupported';
 
-export type CaptureKind = 'income' | 'expense';
+/** Tipo de operacion del borrador: ademas de gasto e ingreso, las deudas. */
+export type CaptureKind = 'income' | 'expense' | 'debt_create' | 'debt_settle';
 
 /**
  * Borrador durable de una operacion por conversacion. Solo hay un borrador vivo
@@ -50,6 +51,13 @@ export class Capture {
 
   @Column({ type: 'varchar', length: '280', nullable: true })
   description!: string | null;
+
+  /**
+   * Datos de deuda del borrador, en JSON. Solo se usa cuando `kind` es `debt_create` o
+   * `debt_settle`; en los demas borradores queda en `null`.
+   */
+  @Column({ type: 'text', nullable: true })
+  debtPayload!: string | null;
 
   /** Texto original del mensaje: solo se conserva mientras el borrador esta vivo. */
   @Column({ type: 'text', nullable: true })

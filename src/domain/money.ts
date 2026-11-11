@@ -52,6 +52,30 @@ export function parseAmount(input: string, currency: Currency): bigint {
   return minor;
 }
 
+/** Importe firmado de apertura (incluye cero), sin redondeo ni cambios al parser de gastos. */
+export function parseOpeningAmount(input: string, currency: Currency): bigint {
+  const raw = input.trim();
+  const negative = raw.startsWith('-');
+  const magnitude = negative ? raw.slice(1) : raw;
+  // Validar incluso el cero con la escala de la moneda; no relajar parseAmount.
+  const match = AMOUNT_PATTERN.exec(magnitude);
+  if (!match || (match[2]?.length ?? 0) > scaleOf(currency)) {
+    throw new ValidationError(`Importe de apertura invalido "${input}" para ${currency}; no se redondea.`);
+  }
+  if (/^0+(?:\.0+)?$/.test(magnitude)) {
+    return 0n;
+  }
+  const minor = parseAmount(magnitude, currency);
+  return negative ? -minor : minor;
+}
+
+/** Limite de presupuesto no negativo; cero es valido, nunca se redondea. */
+export function parseBudgetLimit(input: string, currency: Currency): bigint {
+  const raw = input.trim();
+  if (raw.startsWith('-')) throw new ValidationError('El limite debe ser no negativo.');
+  return parseOpeningAmount(raw, currency);
+}
+
 /** Formatea unidades menores como decimal exacto de la moneda (123456n USD -> "1234.56"). */
 export function formatAmount(minor: bigint, currency: Currency): string {
   const scale = scaleOf(currency);

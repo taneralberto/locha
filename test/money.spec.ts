@@ -1,5 +1,5 @@
 import { ValidationError } from '../src/domain/errors';
-import { CURRENCIES, CURRENCY_CODES, formatAmount, isCurrency, parseAmount } from '../src/domain/money';
+import { CURRENCIES, CURRENCY_CODES, formatAmount, isCurrency, parseAmount, parseBudgetLimit } from '../src/domain/money';
 import { parseDate } from '../src/domain/date';
 
 describe('Registro de monedas', () => {
@@ -47,6 +47,18 @@ describe('parseAmount', () => {
     for (const invalid of ['', '   ', 'abc', '1e3', '1,000.00', '1.2.3', '$5', 'NaN', 'Infinity', '.5']) {
       expect(() => parseAmount(invalid, 'USD')).toThrow(ValidationError);
     }
+  });
+});
+
+describe('parseBudgetLimit', () => {
+  it('admite cero y precision grande exacta sin conversion ni redondeo', () => {
+    expect(parseBudgetLimit('9007199254740993.123456', 'USDT')).toBe(9007199254740993123456n);
+    expect(parseBudgetLimit('0.000000', 'USDT')).toBe(0n);
+    expect(parseBudgetLimit(' 000.00 ', 'USD')).toBe(0n);
+    for (const raw of ['-1', '-0', '-0.00', '0.0000001', '1e3', '+1', '', '1,5']) {
+      expect(() => parseBudgetLimit(raw, 'USDT')).toThrow(ValidationError);
+    }
+    expect(() => parseBudgetLimit('0.000', 'USD')).toThrow(ValidationError);
   });
 });
 

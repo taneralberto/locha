@@ -5,11 +5,17 @@ import { isUniqueViolation } from '../data/unique-violation';
 import { TransactionRunner } from '../data/transaction.runner';
 import { dateInTimeZone, parseDate } from '../domain/date';
 import { ConflictError, NotFoundError, ValidationError } from '../domain/errors';
-import { CURRENCY_CODES, Currency, isCurrency, parseAmount } from '../domain/money';
+import { CURRENCY_CODES, Currency, formatAmount, isCurrency, parseAmount } from '../domain/money';
+import { DebtDirection } from '../debts/debt.entity';
+import { formatDebtReport } from '../debts/debt-format';
+import { canonicalCounterparty, DebtService, DebtView } from '../debts/debt.service';
 import { FinancialService } from '../financial/financial.service';
+import { MovementKind } from '../financial/movement.entity';
 import {
   AccountOption,
+  DebtCandidate,
   InterpreterError,
+  MAX_DEBT_CANDIDATES,
   OperationInterpreter,
   PendingOperation,
 } from '../interpreter/interpreter';
@@ -17,8 +23,9 @@ import { Operation } from '../interpreter/operation.schema';
 import { Capture, CaptureKind, CaptureState } from './capture.entity';
 import { sourceKeyFor } from './source-key';
 import { CaptureEvent } from './capture-event.entity';
+import { DebtDraft, directionLabel, parseDebtDraft, serializeDebtDraft } from './debt-draft';
 import { BudgetExhaustedError, DEFAULT_TIME_ZONE, InferenceBudgetService } from './inference-budget.service';
-import { mentionsConversion, mentionsMultipleAmounts } from './text-signals';
+import { mentionsConversion, mentionsDebt, fullPaymentIntent, mentionsMultipleAmounts } from './text-signals';
 
 /** Longitud maxima del texto original que se guarda mientras el borrador esta vivo. */
 const MAX_SOURCE_TEXT_LENGTH = 1000;
@@ -26,6 +33,8 @@ const MAX_SOURCE_TEXT_LENGTH = 1000;
 const MAX_DESCRIPTION_LENGTH = 280;
 /** Longitud maxima del importe guardado: un importe mas largo no es un importe. */
 const MAX_AMOUNT_LENGTH = 40;
+/** Longitud maxima de la contraparte de una deuda (limite de `Debt`). */
+const MAX_COUNTERPARTY_LENGTH = 120;
 
 const EMPTY_MESSAGE_REPLY = 'El mensaje esta vacio: no hay nada que registrar.';
 const NOTHING_TO_CONFIRM_REPLY = 'No hay ninguna operacion pendiente por confirmar.';
@@ -55,6 +64,23 @@ const RETRY_REPLY = 'No pude interpretar el mensaje y no lo reintento automatica
  */
 const RESEND_REPLY =
   'Vuelve a enviar el mensaje completo (importe, moneda y cuenta) para preparar la operacion de nuevo.';
+
+/**
+ * Salvaguarda determinista: el mensaje habla de una deuda pero el modelo lo clasifico
+ * como gasto o ingreso. No se registra nada: se pregunta que quiso decir.
+ */
+const DEBT_CLARIFY_REPLY = [
+  'Ese mensaje parece hablar de una deuda (lo que debes o lo que te deben), no de un gasto ni de un ingreso.',
+  'Dime cual es:',
+  '  - una deuda nueva: "le debo 8$ a Carmen" o "Carmen me debe 8$"',
+  '  - un pago de una deuda que ya existe: "le pagué 3 dólares a Carmen" o "ya le pagué todo"',
+  '  - una consulta: "cuáles son mis deudas"',
+  'No se registro nada.',
+].join('\n');
+
+/** El borrador de deuda guardado no se pudo leer: se pide de nuevo, sin mostrar nada. */
+const BROKEN_DEBT_DRAFT_REPLY =
+  'No se pudo leer el borrador pendiente de deuda. Vuelve a enviar el mensaje completo (importe, moneda, contraparte y cuenta si es un pago). No se registro nada.';
 
 /**
  * Cola de la captura. El `handle` completo se serializa por conexion: asi no se
@@ -101,12 +127,28 @@ interface Draft {
   accountId: string | null;
   occurredOn: string | null;
   description: string | null;
+  /** Datos de deuda: `null` en los borradores que no son de deuda. */
+  debt: DebtDraft | null;
 }
 
 interface DraftProblem {
-  field: 'kind' | 'amount' | 'currency' | 'account' | 'date';
+  field:
+    | 'kind'
+    | 'amount'
+    | 'currency'
+    | 'account'
+    | 'date'
+    | 'direction'
+    | 'counterparty'
+    | 'debtId'
+    | 'mode';
   message: string;
 }
+
+/** Resultado de buscar la deuda que el usuario quiere pagar. */
+type TargetResolution =
+  | { kind: 'resolved'; debt: DebtView }
+  | { kind: 'ask'; problems: DraftProblem[]; detail?: string };
 
 @Injectable()
 export class CaptureService {
@@ -116,6 +158,7 @@ export class CaptureService {
     private readonly financial: FinancialService,
     private readonly interpreter: OperationInterpreter,
     private readonly budget: InferenceBudgetService,
+    private readonly debts: DebtService,
   ) {}
 
   /**
@@ -183,6 +226,7 @@ export class CaptureService {
     const pending = await this.findPendingCapture(input.chatId);
     const accounts = await this.activeAccounts();
     const defaultDate = dateInTimeZone(input.receivedAt, DEFAULT_TIME_ZONE);
+    const candidates = await this.debtCandidates();
 
     let operation: Operation;
     try {
@@ -192,6 +236,8 @@ export class CaptureService {
         accounts,
         defaultDate,
         pending: pending ? toPendingOperation(pending) : null,
+        debts: candidates.debts,
+        debtsTruncated: candidates.truncated,
       });
     } catch (error) {
       if (error instanceof BudgetExhaustedError) {
@@ -201,6 +247,12 @@ export class CaptureService {
         return this.markUncertain(event, input, TOO_LONG_REPLY);
       }
       return this.markUncertain(event, input, RETRY_REPLY);
+    }
+
+    // Una consulta de deudas es de solo lectura: va antes de cualquier conversion,
+    // operacion multiple o descarte, y no toca el borrador pendiente.
+    if (operation.kind === 'debt_query') {
+      return this.debtQueryReply(event, input, pending, operation);
     }
 
     if (operation.kind === 'transfer' || mentionsConversion(input.text)) {
@@ -214,7 +266,8 @@ export class CaptureService {
     }
     if (operation.kind === 'unclear') {
       const draft = pending ? draftOf(pending) : emptyDraft();
-      const problems = validateDraft(draft, accounts);
+      const isDebt = draft.kind === 'debt_create' || draft.kind === 'debt_settle';
+      const problems = isDebt ? validateDebtDraft(draft, accounts) : validateDraft(draft, accounts);
       return this.saveDraft(
         event,
         input,
@@ -222,6 +275,25 @@ export class CaptureService {
         draft,
         'awaiting_details',
         unclearReply(problems, accounts),
+      );
+    }
+    if (operation.kind === 'debt_create') {
+      return this.debtCreateDraft(event, input, pending, operation, accounts, defaultDate);
+    }
+    if (operation.kind === 'debt_settle') {
+      return this.debtSettleDraft(event, input, pending, operation, accounts, defaultDate);
+    }
+
+    // Salvaguarda: el mensaje habla de una deuda y el modelo lo clasifico como gasto o
+    // ingreso. No se registra nada: se pregunta que quiso decir.
+    if (mentionsDebt(input.text)) {
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        emptyDraft(),
+        'awaiting_details',
+        DEBT_CLARIFY_REPLY,
       );
     }
 
@@ -232,6 +304,7 @@ export class CaptureService {
       accountId: operation.accountId === null ? null : operation.accountId.trim(),
       occurredOn: resolveDate(operation.occurredOn, defaultDate),
       description: normalizeDescription(operation.description),
+      debt: null,
     };
     const problems = validateDraft(draft, accounts);
     if (problems.length > 0) {
@@ -247,6 +320,423 @@ export class CaptureService {
     );
   }
 
+  /**
+   * Prepara el borrador de una deuda nueva. Crear una deuda **no** mueve dinero: no
+   * hay cuenta, no hay movimiento y no hay saldo.
+   */
+  private async debtCreateDraft(
+    event: CaptureEvent,
+    input: NormalizedRequest,
+    pending: Capture | null,
+    operation: Operation,
+    accounts: AccountOption[],
+    defaultDate: string,
+  ): Promise<CaptureOutcome> {
+    const model = operation.debt;
+    const debt: DebtDraft = {
+      version: 1,
+      kind: 'debt_create',
+      direction: model?.direction ?? null,
+      counterparty: normalizeCounterparty(model?.counterparty ?? null),
+      debtId: null,
+      settlementMode: null,
+      amount: normalizeAmount(operation.amount),
+      currency: operation.currency === null ? null : operation.currency.trim(),
+      accountId: null,
+      occurredOn: resolveDate(operation.occurredOn, defaultDate),
+      description: normalizeDescription(operation.description),
+      expectedOutstandingMinor: null,
+      fullIntent: false,
+    };
+    const draft: Draft = {
+      kind: 'debt_create',
+      amount: debt.amount,
+      currency: debt.currency,
+      accountId: null,
+      occurredOn: debt.occurredOn,
+      description: debt.description,
+      debt,
+    };
+    const problems = validateDebtCreate(draft);
+    if (problems.length > 0) {
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        draft,
+        'awaiting_details',
+        detailsReply(problems, accounts, 'Faltan datos para registrar la deuda:'),
+      );
+    }
+    return this.saveDraft(
+      event,
+      input,
+      pending,
+      draft,
+      'awaiting_confirmation',
+      debtCreateReply(draft),
+    );
+  }
+
+  /**
+   * Prepara el borrador de un pago de deuda. El pendiente se **congela** al preparar el
+   * pago: si despues cambia (otro pago o una anulacion), el `/confirm` se rechaza y hay
+   * que volver a preparar el pago.
+   */
+  private async debtSettleDraft(
+    event: CaptureEvent,
+    input: NormalizedRequest,
+    pending: Capture | null,
+    operation: Operation,
+    accounts: AccountOption[],
+    defaultDate: string,
+  ): Promise<CaptureOutcome> {
+    const model = operation.debt;
+    const direction = model?.direction ?? null;
+    const counterparty = normalizeCounterparty(model?.counterparty ?? null);
+    const rawCurrency = operation.currency === null ? null : operation.currency.trim();
+    const modelAmount = normalizeAmount(operation.amount);
+    const accountId = operation.accountId === null ? null : operation.accountId.trim();
+    const pendingDraft = pending === null ? null : draftOf(pending);
+    const pendingDebtId = pendingDraft?.debt?.debtId ?? null;
+
+    const resolution = await this.resolveDebtTarget({
+      direction,
+      counterparty,
+      currency: rawCurrency,
+      userText: input.text,
+      pendingDebtId,
+    });
+
+    // El pago total lo autoriza el **texto del usuario**, no el modelo. Se conserva la
+    // autorizacion del borrador solo si el objetivo sigue siendo el mismo: cambiar de
+    // deuda o de persona la borra. Una frase que niega el pago completo la revoca.
+    const intent = fullPaymentIntent(input.text);
+    const sameTarget =
+      resolution.kind === 'resolved' &&
+      pendingDebtId !== null &&
+      resolution.debt.debt.id === pendingDebtId;
+    const pendingFull = pendingDraft?.debt?.fullIntent === true && sameTarget;
+    const groundedFull = intent === 'yes' || (intent === 'none' && pendingFull);
+
+    const debt: DebtDraft = {
+      version: 1,
+      kind: 'debt_settle',
+      direction,
+      counterparty,
+      debtId: resolution.kind === 'resolved' ? resolution.debt.debt.id : null,
+      settlementMode: null,
+      amount: modelAmount,
+      currency: rawCurrency,
+      accountId,
+      occurredOn: resolveDate(operation.occurredOn, defaultDate),
+      description: normalizeDescription(operation.description),
+      expectedOutstandingMinor: null,
+      fullIntent: resolution.kind === 'resolved' ? groundedFull : intent === 'yes',
+    };
+    const draft: Draft = {
+      kind: 'debt_settle',
+      amount: debt.amount,
+      currency: debt.currency,
+      accountId,
+      occurredOn: debt.occurredOn,
+      description: debt.description,
+      debt,
+    };
+
+    if (resolution.kind === 'ask') {
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        draft,
+        'awaiting_details',
+        detailsReply(resolution.problems, accounts, 'Faltan datos para registrar el pago:', resolution.detail),
+      );
+    }
+
+    const target = resolution.debt;
+    const debtCurrency = target.debt.currency;
+    const problems: DraftProblem[] = [];
+
+    // La moneda del pago es la de la deuda: si el mensaje no la dice, se usa la de la
+    // deuda que el usuario acaba de señalar.
+    const paymentCurrency: Currency =
+      rawCurrency !== null && isCurrency(rawCurrency) ? rawCurrency : debtCurrency;
+    if (rawCurrency !== null && !isCurrency(rawCurrency)) {
+      problems.push({ field: 'currency', message: `la moneda "${rawCurrency}" no esta soportada` });
+    } else if (rawCurrency !== null && rawCurrency !== debtCurrency) {
+      problems.push({
+        field: 'currency',
+        message: `la deuda esta en ${debtCurrency} y el pago es en ${rawCurrency}`,
+      });
+    }
+    debt.currency = rawCurrency ?? debtCurrency;
+    draft.currency = debt.currency;
+
+    // Modo e importe. El `settlementMode` del modelo es una lectura, no una
+    // autorizacion: sin importe y sin que el usuario diga que paga todo, se pregunta.
+    // Un importe explicito es un pago parcial; si coincide con el pendiente, salda la
+    // deuda igual.
+    const outstanding = formatAmount(target.outstandingMinor, debtCurrency);
+    let mode: 'full' | 'partial' | null = null;
+    let paymentAmount: string | null = modelAmount;
+    if (modelAmount === null) {
+      if (groundedFull) {
+        mode = 'full';
+        paymentAmount = outstanding;
+      } else {
+        problems.push({
+          field: 'amount',
+          message:
+            'falta el importe del pago: di cuanto pagaste o di explicitamente que pagaste todo (por ejemplo, "ya le pagué todo")',
+        });
+      }
+    } else {
+      const minor = tryParseAmount(modelAmount, paymentCurrency);
+      if (minor === null) {
+        problems.push({ field: 'amount', message: `el importe "${modelAmount}" no es valido` });
+        mode = 'partial';
+      } else if (minor > target.outstandingMinor) {
+        problems.push({
+          field: 'amount',
+          message: `el importe "${modelAmount}" supera el pendiente de la deuda (${outstanding})`,
+        });
+        mode = 'partial';
+      } else if (groundedFull && minor !== target.outstandingMinor) {
+        problems.push({
+          field: 'amount',
+          message: `dijiste que se pago todo, pero el importe "${modelAmount}" no coincide con el pendiente de la deuda (${outstanding})`,
+        });
+        mode = 'partial';
+      } else if (groundedFull) {
+        mode = 'full';
+        paymentAmount = outstanding;
+      } else {
+        mode = 'partial';
+      }
+    }
+
+    const account = accountId ? accounts.find((candidate) => candidate.id === accountId) : undefined;
+    if (!account) {
+      problems.push({ field: 'account', message: 'falta la cuenta' });
+    } else if (account.currency !== paymentCurrency) {
+      problems.push({
+        field: 'currency',
+        message: `la cuenta "${account.name}" opera en ${account.currency}, no en ${paymentCurrency}`,
+      });
+    }
+    problems.push(...dateProblems(draft));
+    if (draft.occurredOn !== null && isValidDate(draft.occurredOn) && draft.occurredOn < target.debt.occurredOn) {
+      problems.push({
+        field: 'date',
+        message: `el pago no puede ser anterior a la fecha de la deuda (${target.debt.occurredOn})`,
+      });
+    }
+
+    debt.direction = target.debt.direction;
+    debt.counterparty = target.debt.counterparty;
+    debt.debtId = target.debt.id;
+    debt.settlementMode = mode;
+    debt.amount = paymentAmount;
+    debt.expectedOutstandingMinor = target.outstandingMinor.toString();
+    debt.fullIntent = groundedFull;
+    draft.amount = debt.amount;
+
+    if (problems.length > 0) {
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        draft,
+        'awaiting_details',
+        detailsReply(problems, accounts, 'Faltan datos para registrar el pago:'),
+      );
+    }
+    return this.saveDraft(
+      event,
+      input,
+      pending,
+      draft,
+      'awaiting_confirmation',
+      debtSettleReply(draft, target, account),
+    );
+  }
+
+  /**
+   * Busca la deuda que el usuario quiere pagar.
+   *
+   * El id cuenta solo si el usuario **lo escribió en este mensaje**: manda sobre el
+   * borrador vivo. Sin id escrito ahora, el del borrador vivo es una pista (tiene que
+   * seguir siendo compatible) y, si no lo es, se busca por contraparte, direccion y
+   * moneda exactas. Un id propuesto por el modelo nunca resuelve nada.
+   */
+  private async resolveDebtTarget(input: {
+    direction: DebtDirection | null;
+    counterparty: string | null;
+    currency: string | null;
+    userText: string;
+    pendingDebtId: string | null;
+  }): Promise<TargetResolution> {
+    const written = idsInText(input.userText);
+    if (written.length > 1) {
+      // Varias deudas escritas en este mensaje: la ambiguedad se conserva, no se elige.
+      return {
+        kind: 'ask',
+        problems: [{ field: 'debtId', message: 'el mensaje menciona varias deudas; indica cual es' }],
+        detail: `  deudas mencionadas: ${written.join(', ')}`,
+      };
+    }
+    if (written.length === 1) {
+      return this.resolveWrittenDebt(written[0]!, input);
+    }
+
+    // Sin id escrito ahora: el del borrador vivo sirve solo si sigue encajando.
+    if (input.pendingDebtId !== null) {
+      const view = await this.debts.get(input.pendingDebtId).catch(() => null);
+      if (view !== null && view.status !== 'paid' && !contradicts(view, input)) {
+        return { kind: 'resolved', debt: view };
+      }
+    }
+
+    const problems: DraftProblem[] = [];
+    if (input.direction === null) {
+      problems.push({ field: 'direction', message: 'falta indicar si la deuda es a pagar o a cobrar' });
+    }
+    if (input.counterparty === null) {
+      problems.push({ field: 'counterparty', message: 'falta la contraparte' });
+    }
+    if (input.currency === null) {
+      problems.push({ field: 'currency', message: `falta la moneda (${CURRENCY_CODES.join(', ')})` });
+    } else if (!isCurrency(input.currency)) {
+      problems.push({ field: 'currency', message: `la moneda "${input.currency}" no esta soportada` });
+    }
+    if (problems.length > 0) {
+      return { kind: 'ask', problems };
+    }
+
+    const rows = await this.debts.list({
+      direction: input.direction as DebtDirection,
+      currency: input.currency as Currency,
+      counterparty: input.counterparty as string,
+    });
+    const candidates = rows.filter((row) => row.status !== 'paid');
+    if (candidates.length === 0) {
+      return {
+        kind: 'ask',
+        problems: [
+          {
+            field: 'counterparty',
+            message: `no hay ninguna deuda pendiente con "${input.counterparty}" en ${input.currency}`,
+          },
+        ],
+      };
+    }
+    if (candidates.length > 1) {
+      return {
+        kind: 'ask',
+        problems: [
+          { field: 'debtId', message: 'hay varias deudas con esa contraparte; indica el id de la que quieres pagar' },
+        ],
+        detail: candidates
+          .map(
+            (row) =>
+              `  ${row.debt.id} | ${row.debt.counterparty} | ${row.debt.currency} | pendiente ${formatAmount(row.outstandingMinor, row.debt.currency)} | ${row.status}`,
+          )
+          .join('\n'),
+      };
+    }
+    return { kind: 'resolved', debt: candidates[0]! };
+  }
+
+  /**
+   * Deuda que el usuario escribio en este mensaje. El id es del usuario, pero tiene que
+   * encajar con lo que el mismo mensaje pide (contraparte, direccion y moneda): si no,
+   * se pregunta y no se muta nada.
+   */
+  private async resolveWrittenDebt(
+    id: string,
+    input: { direction: DebtDirection | null; counterparty: string | null; currency: string | null },
+  ): Promise<TargetResolution> {
+    const view = await this.debts.get(id).catch(() => null);
+    if (!view) {
+      return {
+        kind: 'ask',
+        problems: [{ field: 'debtId', message: `no existe ninguna deuda con el id "${id}"` }],
+      };
+    }
+    if (view.status === 'paid') {
+      return {
+        kind: 'ask',
+        problems: [{ field: 'debtId', message: `la deuda "${id}" ya esta pagada` }],
+      };
+    }
+    if (contradicts(view, input)) {
+      return {
+        kind: 'ask',
+        problems: [
+          {
+            field: 'debtId',
+            message:
+              'la deuda indicada no coincide con la contraparte, la direccion o la moneda del pago',
+          },
+        ],
+      };
+    }
+    return { kind: 'resolved', debt: view };
+  }
+
+  /**
+   * Responde a una consulta de deudas. Es de solo lectura: no toca el borrador
+   * pendiente y no registra nada.
+   */
+  private async debtQueryReply(
+    event: CaptureEvent,
+    input: NormalizedRequest,
+    pending: Capture | null,
+    operation: Operation,
+  ): Promise<CaptureOutcome> {
+    const model = operation.debt;
+    const direction = model?.direction ?? null;
+    const counterparty = normalizeCounterparty(model?.counterparty ?? null);
+    const status = model?.status ?? null;
+    const currency = operation.currency === null ? null : operation.currency.trim();
+    const rows = await this.debts.list();
+
+    const written = idsInText(input.text);
+    const selected = written.length > 0
+      ? rows.filter((row) => written.includes(row.debt.id))
+      : rows.filter(
+          (row) =>
+            (direction === null || row.debt.direction === direction) &&
+            (counterparty === null ||
+              canonicalCounterparty(row.debt.counterparty) === canonicalCounterparty(counterparty)) &&
+            (currency === null || row.debt.currency === currency) &&
+            (status === null ? row.status !== 'paid' : row.status === status),
+        );
+
+    const reply = formatDebtReport(
+      selected.map((row) => ({
+        id: row.debt.id,
+        direction: row.debt.direction,
+        counterparty: row.debt.counterparty,
+        currency: row.debt.currency,
+        principalMinor: row.debt.principalMinor,
+        paidMinor: row.paidMinor,
+        outstandingMinor: row.outstandingMinor,
+        status: row.status,
+      })),
+      {
+        title: 'Deudas:',
+        empty:
+          status === null
+            ? 'No hay deudas pendientes que coincidan con la consulta.'
+            : 'No hay deudas que coincidan con la consulta.',
+      },
+    );
+    return this.complete(event, input, pending?.state ?? null, reply);
+  }
+
   /** Confirma el borrador vivo y registra el movimiento. */
   private async confirm(event: CaptureEvent, input: NormalizedRequest): Promise<CaptureOutcome> {
     const pending = await this.findPendingCapture(input.chatId);
@@ -256,6 +746,9 @@ export class CaptureService {
     if (pending.state !== 'awaiting_confirmation') {
       // El borrador no tiene un resumen vigente: hay que volver a enviarlo para verlo.
       return this.complete(event, input, 'awaiting_details', NOT_READY_REPLY);
+    }
+    if (pending.kind === 'debt_create' || pending.kind === 'debt_settle') {
+      return this.confirmDebt(event, input, pending);
     }
     const accounts = await this.activeAccounts();
     const draft = draftOf(pending);
@@ -279,7 +772,7 @@ export class CaptureService {
           {
             sourceKey: pending.sourceKey,
             accountId: pending.accountId as string,
-            kind: pending.kind as CaptureKind,
+            kind: pending.kind as MovementKind,
             money: {
               currency: pending.currency as Currency,
               minor: parseAmount(pending.amount as string, pending.currency as Currency),
@@ -325,6 +818,125 @@ export class CaptureService {
     }
   }
 
+  /**
+   * Confirma un borrador de deuda. La escritura del dominio y el cierre del borrador
+   * ocurren en la **misma transaccion**: o se guardan los dos, o no se guarda ninguno.
+   */
+  private async confirmDebt(
+    event: CaptureEvent,
+    input: NormalizedRequest,
+    pending: Capture,
+  ): Promise<CaptureOutcome> {
+    const accounts = await this.activeAccounts();
+    const draft = draftOf(pending);
+    const debt = draft.debt;
+    if (debt === null) {
+      // El borrador guardado no se pudo leer: no se adivina nada.
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        emptyDraft(),
+        'awaiting_details',
+        BROKEN_DEBT_DRAFT_REPLY,
+      );
+    }
+    const problems = validateDebtDraft(draft, accounts);
+    if (problems.length > 0) {
+      const title =
+        draft.kind === 'debt_create'
+          ? 'Faltan datos para registrar la deuda:'
+          : 'Faltan datos para registrar el pago:';
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        draft,
+        'awaiting_details',
+        detailsReply(problems, accounts, title),
+      );
+    }
+
+    try {
+      const result = await this.transactions.run(async (manager) => {
+        if (draft.kind === 'debt_create') {
+          const created = await this.debts.create(
+            {
+              sourceKey: pending.sourceKey,
+              direction: debt.direction as DebtDirection,
+              counterparty: debt.counterparty as string,
+              money: {
+                currency: debt.currency as Currency,
+                minor: parseAmount(debt.amount as string, debt.currency as Currency),
+              },
+              occurredOn: debt.occurredOn as string,
+              description: debt.description ?? undefined,
+            },
+            manager,
+          );
+          await manager.getRepository(Capture).update(
+            { id: pending.id },
+            { state: 'registered', sourceText: null, debtPayload: null },
+          );
+          const message = debtCreatedReply(draft, created.debt.id);
+          await manager.getRepository(CaptureEvent).update(
+            { id: event.id },
+            { state: 'completed', reply: message, captureState: 'registered', movementId: null },
+          );
+          return { message, movementId: null };
+        }
+        const settled = await this.debts.settle(
+          {
+            sourceKey: pending.sourceKey,
+            debtId: debt.debtId as string,
+            accountId: debt.accountId as string,
+            money: {
+              currency: debt.currency as Currency,
+              minor: parseAmount(debt.amount as string, debt.currency as Currency),
+            },
+            occurredOn: debt.occurredOn as string,
+            expectedOutstandingMinor: BigInt(debt.expectedOutstandingMinor as string),
+            description: debt.description ?? undefined,
+          },
+          manager,
+        );
+        await manager.getRepository(Capture).update(
+          { id: pending.id },
+          { state: 'registered', sourceText: null, debtPayload: null },
+        );
+        const message = debtSettledReply(draft, settled.payment.id, settled.movement.id);
+        await manager.getRepository(CaptureEvent).update(
+          { id: event.id },
+          {
+            state: 'completed',
+            reply: message,
+            captureState: 'registered',
+            movementId: settled.movement.id,
+          },
+        );
+        return { message, movementId: settled.movement.id };
+      });
+      return {
+        eventId: input.eventId,
+        chatId: input.chatId,
+        captureState: 'registered',
+        reply: result.message,
+        replayed: false,
+        movementId: result.movementId,
+      };
+    } catch (error) {
+      const message = await this.debtErrorMessage(error, draft);
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        draft,
+        'awaiting_details',
+        `No se pudo registrar la operacion: ${message}`,
+      );
+    }
+  }
+
   /** Descarta el borrador vivo sin registrar nada. */
   private async cancel(event: CaptureEvent, input: NormalizedRequest): Promise<CaptureOutcome> {
     const pending = await this.findPendingCapture(input.chatId);
@@ -334,7 +946,7 @@ export class CaptureService {
     await this.transactions.run(async (manager) => {
       await manager.getRepository(Capture).update(
         { id: pending.id },
-        { state: 'cancelled', sourceText: null },
+        { state: 'cancelled', sourceText: null, debtPayload: null },
       );
       await manager.getRepository(CaptureEvent).update(
         { id: event.id },
@@ -362,32 +974,27 @@ export class CaptureService {
   ): Promise<CaptureOutcome> {
     await this.transactions.run(async (manager) => {
       const repository = manager.getRepository(Capture);
+      // Lo que no aplica al borrador se limpia: al cambiar de una operacion ordinaria a
+      // una deuda (o al reves) no queda nada del borrador anterior.
+      const values = {
+        state,
+        kind: draft.kind,
+        amount: draft.amount,
+        // Solo se persisten monedas soportadas: el resto se vuelve a pedir.
+        currency: isCurrency(draft.currency) ? draft.currency : null,
+        accountId: draft.accountId,
+        occurredOn: draft.occurredOn,
+        description: draft.description,
+        debtPayload: draft.debt === null ? null : serializeDebtDraft(draft.debt),
+      };
       if (pending) {
-        await repository.update(
-          { id: pending.id },
-          {
-            state,
-            kind: draft.kind,
-            amount: draft.amount,
-            // Solo se persisten monedas soportadas: el resto se vuelve a pedir.
-            currency: isCurrency(draft.currency) ? draft.currency : null,
-            accountId: draft.accountId,
-            occurredOn: draft.occurredOn,
-            description: draft.description,
-          },
-        );
+        await repository.update({ id: pending.id }, values);
       } else {
         await repository.save(
           repository.create({
             chatId: input.chatId,
             sourceKey: sourceKeyFor(input.chatId, event.eventId),
-            state,
-            kind: draft.kind,
-            amount: draft.amount,
-            currency: isCurrency(draft.currency) ? draft.currency : null,
-            accountId: draft.accountId,
-            occurredOn: draft.occurredOn,
-            description: draft.description,
+            ...values,
             sourceText: input.text.slice(0, MAX_SOURCE_TEXT_LENGTH),
           }),
         );
@@ -418,7 +1025,7 @@ export class CaptureService {
       if (pending) {
         await manager.getRepository(Capture).update(
           { id: pending.id },
-          { state: 'unsupported', sourceText: null },
+          { state: 'unsupported', sourceText: null, debtPayload: null },
         );
       }
       await manager.getRepository(CaptureEvent).update(
@@ -476,7 +1083,7 @@ export class CaptureService {
     await this.transactions.run(async (manager) => {
       await manager.getRepository(Capture).update(
         { chatId: input.chatId, state: In(['awaiting_details', 'awaiting_confirmation']) },
-        { state: 'cancelled', sourceText: null },
+        { state: 'cancelled', sourceText: null, debtPayload: null },
       );
       await manager.getRepository(CaptureEvent).update(
         { id: event.id },
@@ -532,6 +1139,47 @@ export class CaptureService {
       name: account.name,
       currency: account.currency,
     }));
+  }
+
+  /**
+   * Resumenes acotados de las deudas que se pueden pagar. La lista es la que ve el
+   * modelo; la fuente de verdad sigue siendo la base de datos del backend.
+   */
+  private async debtCandidates(): Promise<{ debts: DebtCandidate[]; truncated: boolean }> {
+    const rows = await this.debts.list();
+    const pending = rows.filter((row) => row.status !== 'paid');
+    const debts = pending.slice(0, MAX_DEBT_CANDIDATES).map((row) => ({
+      id: row.debt.id,
+      direction: row.debt.direction,
+      counterparty: row.debt.counterparty,
+      currency: row.debt.currency,
+      outstanding: formatAmount(row.outstandingMinor, row.debt.currency),
+      status: row.status as 'open' | 'partial',
+      occurredOn: row.debt.occurredOn,
+      description: row.debt.description,
+    }));
+    return { debts, truncated: pending.length > MAX_DEBT_CANDIDATES };
+  }
+
+  /**
+   * Mensaje de error de un pago de deuda. Si el pendiente cambio, se dice con todas las
+   * letras: no se paga un total nuevo en silencio.
+   */
+  private async debtErrorMessage(error: unknown, draft: Draft): Promise<string> {
+    if (error instanceof ConflictError && draft.debt?.expectedOutstandingMinor) {
+      const currency = (draft.debt.currency ?? 'USD') as Currency;
+      const expected = formatAmount(BigInt(draft.debt.expectedOutstandingMinor), currency);
+      const current = await this.debts
+        .get(draft.debt.debtId as string)
+        .then((view) => formatAmount(view.outstandingMinor, view.debt.currency))
+        .catch(() => null);
+      return (
+        `el pendiente de la deuda cambio: se preparo con ${expected}` +
+        (current === null ? '' : ` y ahora es ${current}`) +
+        '. Vuelve a enviar el mensaje para preparar el pago de nuevo; no se registro nada'
+      );
+    }
+    return safeErrorMessage(error);
   }
 }
 
@@ -590,24 +1238,43 @@ function emptyDraft(): Draft {
     accountId: null,
     occurredOn: null,
     description: null,
+    debt: null,
   };
 }
 
+/**
+ * Lee el borrador guardado. Para un borrador de deuda manda el JSON validado: si el
+ * JSON esta roto, el borrador se considera ilegible y no se adivina nada.
+ */
 function draftOf(capture: Capture): Draft {
+  const isDebt = capture.kind === 'debt_create' || capture.kind === 'debt_settle';
+  const debt = isDebt ? parseDebtDraft(capture.debtPayload) : null;
+  if (debt !== null) {
+    return {
+      kind: capture.kind,
+      amount: debt.amount,
+      currency: debt.currency,
+      accountId: debt.accountId,
+      occurredOn: debt.occurredOn,
+      description: debt.description,
+      debt,
+    };
+  }
   return {
-    kind: capture.kind,
+    kind: isDebt ? null : capture.kind,
     amount: capture.amount,
     currency: capture.currency,
     accountId: capture.accountId,
     occurredOn: capture.occurredOn,
     description: capture.description,
+    debt: null,
   };
 }
 
 function toPendingOperation(capture: Capture): PendingOperation {
   const draft = draftOf(capture);
-  return {
-    kind: draft.kind,
+  const pending: PendingOperation = {
+    kind: draft.kind === 'income' || draft.kind === 'expense' ? draft.kind : null,
     amount: draft.amount,
     currency: draft.currency,
     accountId: draft.accountId,
@@ -615,6 +1282,51 @@ function toPendingOperation(capture: Capture): PendingOperation {
     description: draft.description,
     sourceText: capture.sourceText ?? '',
   };
+  if (draft.debt !== null) {
+    pending.debt = {
+      kind: draft.debt.kind,
+      direction: draft.debt.direction,
+      counterparty: draft.debt.counterparty,
+      debtId: draft.debt.debtId,
+      settlementMode: draft.debt.settlementMode,
+      amount: draft.debt.amount,
+      currency: draft.debt.currency,
+      accountId: draft.debt.accountId,
+      occurredOn: draft.debt.occurredOn,
+      description: draft.debt.description,
+    };
+  }
+  return pending;
+}
+
+/** Ids de deuda que el usuario **escribio** en su mensaje. */
+function idsInText(text: string): string[] {
+  const matches = text.match(/[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/gi) ?? [];
+  return [...new Set(matches.map((value) => value.toLowerCase()))];
+}
+
+/**
+ * `true` si la contraparte, la direccion o la moneda del pago contradicen la deuda
+ * indicada. La contraparte se compara de forma canonica (como en el dominio): solo
+ * encaja si es la misma persona.
+ */
+function contradicts(
+  debt: DebtView,
+  input: { direction: DebtDirection | null; counterparty: string | null; currency: string | null },
+): boolean {
+  if (input.direction !== null && input.direction !== debt.debt.direction) {
+    return true;
+  }
+  if (input.currency !== null && isCurrency(input.currency) && input.currency !== debt.debt.currency) {
+    return true;
+  }
+  if (
+    input.counterparty !== null &&
+    canonicalCounterparty(input.counterparty) !== canonicalCounterparty(debt.debt.counterparty)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -655,6 +1367,18 @@ function normalizeAmount(value: string | null): string | null {
   return trimmed;
 }
 
+/** La contraparte se guarda como texto corto y con espacios colapsados. */
+function normalizeCounterparty(value: string | null): string | null {
+  if (value === null) {
+    return null;
+  }
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length === 0) {
+    return null;
+  }
+  return normalized.slice(0, MAX_COUNTERPARTY_LENGTH);
+}
+
 /**
  * Mensaje seguro para el usuario. Solo los errores de dominio del backend (reglas de
  * negocio) se muestran tal cual; cualquier otro fallo se resume sin detalle.
@@ -671,8 +1395,8 @@ function safeErrorMessage(error: unknown): string {
 }
 
 /**
- * La descripcion se guarda en una sola linea: se colapsan los espacios y se recortan
- * los saltos de linea del modelo. Se conserva un maximo de caracteres porque la columna
+ * La descripcion se guarda en una sola linea: se colapsan los espacios y se recortan los
+ * saltos de linea del modelo. Se conserva un maximo de caracteres porque la columna
  * del movimiento es corta.
  */
 function normalizeDescription(value: string | null): string | null {
@@ -700,6 +1424,20 @@ function validateDraft(draft: Draft, accounts: AccountOption[]): DraftProblem[] 
   if (draft.kind === null) {
     problems.push({ field: 'kind', message: 'falta indicar si es un gasto o un ingreso' });
   }
+  problems.push(...amountProblems(draft));
+  problems.push(...currencyProblems(draft, account));
+
+  if (!account) {
+    problems.push({ field: 'account', message: 'falta la cuenta' });
+  }
+  problems.push(...dateProblems(draft));
+
+  return problems;
+}
+
+/** Importe: presente, positivo y con la escala exacta de la moneda. */
+function amountProblems(draft: Draft): DraftProblem[] {
+  const problems: DraftProblem[] = [];
   if (draft.amount === null) {
     problems.push({ field: 'amount', message: 'falta el importe' });
   } else if (!isPositiveDecimal(draft.amount)) {
@@ -714,7 +1452,12 @@ function validateDraft(draft: Draft, accounts: AccountOption[]): DraftProblem[] 
       });
     }
   }
+  return problems;
+}
 
+/** Moneda: presente, soportada y coherente con la cuenta elegida. */
+function currencyProblems(draft: Draft, account: AccountOption | undefined): DraftProblem[] {
+  const problems: DraftProblem[] = [];
   if (draft.currency === null) {
     problems.push({ field: 'currency', message: `falta la moneda (${CURRENCY_CODES.join(', ')})` });
   } else if (!isCurrency(draft.currency)) {
@@ -728,21 +1471,74 @@ function validateDraft(draft: Draft, accounts: AccountOption[]): DraftProblem[] 
       message: `la cuenta "${account.name}" opera en ${account.currency}, no en ${draft.currency}`,
     });
   }
+  return problems;
+}
 
-  if (!account) {
-    problems.push({ field: 'account', message: 'falta la cuenta' });
+/** Fecha: presente y existente en el calendario. */
+function dateProblems(draft: Draft): DraftProblem[] {
+  if (draft.occurredOn === null || isValidDate(draft.occurredOn)) {
+    return [];
   }
-
-  if (draft.occurredOn !== null && !isValidDate(draft.occurredOn)) {
-    problems.push({
+  return [
+    {
       field: 'date',
       message:
         draft.occurredOn.length === 0
           ? 'falta la fecha (se espera YYYY-MM-DD)'
           : `la fecha "${draft.occurredOn}" no es valida (se espera YYYY-MM-DD)`,
+    },
+  ];
+}
+
+/** Deuda nueva: direccion, contraparte, importe, moneda y fecha. */
+function validateDebtCreate(draft: Draft): DraftProblem[] {
+  const problems: DraftProblem[] = [];
+  const debt = draft.debt;
+  if (debt === null || debt.direction === null) {
+    problems.push({ field: 'direction', message: 'falta indicar si la deuda es a pagar o a cobrar' });
+  }
+  if (debt === null || debt.counterparty === null) {
+    problems.push({ field: 'counterparty', message: 'falta la contraparte' });
+  }
+  problems.push(...amountProblems(draft));
+  problems.push(...currencyProblems(draft, undefined));
+  problems.push(...dateProblems(draft));
+  return problems;
+}
+
+/** Pago de deuda: cuenta activa, importe, moneda y fecha. */
+function validateDebtDraft(draft: Draft, accounts: AccountOption[]): DraftProblem[] {
+  const debt = draft.debt;
+  if (debt === null) {
+    return [{ field: 'kind', message: 'falta el borrador de la deuda' }];
+  }
+  if (debt.kind === 'debt_create') {
+    return validateDebtCreate(draft);
+  }
+  const problems: DraftProblem[] = [];
+  if (debt.debtId === null) {
+    problems.push({ field: 'debtId', message: 'falta la deuda que se quiere pagar' });
+  }
+  if (debt.settlementMode === 'full' && debt.fullIntent !== true) {
+    // Un pago total solo es valido si el usuario dijo que pago todo. Los borradores
+    // escritos antes de existir la autorizacion no la tienen: se piden de nuevo.
+    problems.push({
+      field: 'mode',
+      message:
+        'el pago total no tiene la autorizacion del usuario: pide de nuevo el pago para que confirme que pago todo',
     });
   }
-
+  if (debt.amount === null) {
+    problems.push({ field: 'amount', message: 'falta el importe del pago' });
+  }
+  const account = debt.accountId
+    ? accounts.find((candidate) => candidate.id === debt.accountId)
+    : undefined;
+  if (!account) {
+    problems.push({ field: 'account', message: 'falta la cuenta' });
+  }
+  problems.push(...currencyProblems(draft, account));
+  problems.push(...dateProblems(draft));
   return problems;
 }
 
@@ -755,17 +1551,31 @@ function isPositiveDecimal(value: string): boolean {
   return BigInt(whole) > 0n || BigInt(fraction) > 0n;
 }
 
-function detailsReply(problems: DraftProblem[], accounts: AccountOption[]): string {
+/** Importe en unidades menores, o `null` si no es un importe valido para la moneda. */
+function tryParseAmount(value: string, currency: Currency): bigint | null {
+  try {
+    return parseAmount(value, currency);
+  } catch {
+    return null;
+  }
+}
+
+function detailsReply(
+  problems: DraftProblem[],
+  accounts: AccountOption[],
+  title = 'Faltan datos para registrar la operacion:',
+  detail?: string,
+): string {
   const lines = problems.map((problem) => `  - ${problem.message}`);
   if (problems.some((problem) => problem.field === 'account') && accounts.length > 0) {
     lines.push(`  cuentas: ${accounts.map((account) => `${account.name} (${account.currency})`).join(', ')}`);
   }
-  return [
-    'Faltan datos para registrar la operacion:',
-    ...lines,
-    '',
-    'Escribe los datos que faltan.',
-  ].join('\n');
+  const body = [title, ...lines];
+  if (detail !== undefined) {
+    body.push(detail);
+  }
+  body.push('', 'Escribe los datos que faltan.');
+  return body.join('\n');
 }
 
 /**
@@ -802,9 +1612,55 @@ function confirmationReply(draft: Draft, accounts: AccountOption[]): string {
   ].join('\n');
 }
 
+/** Resumen de una deuda nueva: no hay cuenta porque todavia no se movio dinero. */
+function debtCreateReply(draft: Draft): string {
+  const debt = draft.debt;
+  return [
+    'Entendi esta deuda:',
+    `  - tipo: ${directionLabel(debt?.direction ?? null)}`,
+    `  - contraparte: ${debt?.counterparty ?? '(sin dato)'}`,
+    `  - importe: ${draft.amount} ${draft.currency}`,
+    `  - fecha: ${draft.occurredOn}`,
+    `  - descripcion: ${draft.description ?? '(sin descripcion)'}`,
+    '',
+    'Crear la deuda no mueve dinero: no hay cuenta ni movimiento.',
+    'Responde /confirm para registrarla o /cancel para descartarla.',
+  ].join('\n');
+}
+
+/** Resumen de un pago de deuda: muestra el pendiente congelado del momento. */
+function debtSettleReply(draft: Draft, debt: DebtView, account: AccountOption | undefined): string {
+  const payload = draft.debt;
+  const outstanding = formatAmount(debt.outstandingMinor, debt.debt.currency);
+  return [
+    'Entendi este pago de deuda:',
+    `  - deuda: ${debt.debt.id} | ${debt.debt.counterparty} | ${directionLabel(payload?.direction ?? null)} | ${debt.debt.currency}`,
+    `  - modo: ${payload?.settlementMode === 'full' ? 'pago total' : 'pago parcial'}`,
+    `  - importe: ${payload?.amount} ${payload?.currency}`,
+    `  - pendiente al preparar: ${outstanding} ${debt.debt.currency}`,
+    `  - cuenta: ${account ? `${account.name} (${account.currency})` : payload?.accountId}`,
+    `  - fecha: ${payload?.occurredOn}`,
+    `  - descripcion: ${payload?.description ?? '(sin descripcion)'}`,
+    '',
+    'Responde /confirm para registrarlo o /cancel para descartarlo.',
+  ].join('\n');
+}
+
 function registeredReply(draft: Draft, account: AccountOption | undefined): string {
   const where = account ? ` en la cuenta ${account.name}` : '';
   return `Registrado: ${draft.kind === 'income' ? 'ingreso' : 'gasto'} de ${draft.amount} ${draft.currency}${where} (${draft.occurredOn}).`;
+}
+
+/** Confirmacion de una deuda nueva: no hay movimiento, solo la obligacion. */
+function debtCreatedReply(draft: Draft, debtId: string): string {
+  const debt = draft.debt;
+  return `Registrado: deuda de ${debt?.amount} ${debt?.currency} con ${debt?.counterparty} (${directionLabel(debt?.direction ?? null)}). Deuda: ${debtId}`;
+}
+
+/** Confirmacion de un pago de deuda: ids de la deuda, del pago y del movimiento. */
+function debtSettledReply(draft: Draft, paymentId: string, movementId: string): string {
+  const debt = draft.debt;
+  return `Registrado: pago de ${debt?.amount} ${debt?.currency} de la deuda ${debt?.debtId} (${debt?.counterparty}). Pago: ${paymentId}. Movimiento: ${movementId}`;
 }
 
 function replay(event: CaptureEvent): CaptureOutcome {
