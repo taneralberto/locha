@@ -130,7 +130,7 @@ describe('Captura de deudas (unidad 2)', () => {
   }
 
   describe('creacion de una deuda', () => {
-    it('registra lo que debo sin mover dinero y devuelve el id de la deuda', async () => {
+    it('registra lo que debo sin mover dinero y sin mostrar identificadores', async () => {
       const interpreter = new FakeInterpreter([
         operation({
           amount: '8.00',
@@ -153,7 +153,7 @@ describe('Captura de deudas (unidad 2)', () => {
       const confirmed = await handle(service, { eventId: 'e2', text: '/confirm' });
 
       expect(confirmed.captureState).toBe('registered');
-      expect(confirmed.reply).toContain('Deuda:');
+      expect(confirmed.reply).toContain('Registrado: deuda de 8.00 USD con Carmen');
       expect(confirmed.movementId).toBeNull();
       expect(await movementCount()).toBe(0);
       expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
@@ -165,7 +165,7 @@ describe('Captura de deudas (unidad 2)', () => {
       expect(debt.currency).toBe('USD');
       expect(debt.occurredOn).toBe(TODAY);
       expect(debt.description).toBe('dos tortas');
-      expect(confirmed.reply).toContain(debt.id);
+      expect(confirmed.reply).not.toContain(debt.id);
     });
 
     it('registra lo que me deben con la direccion contraria y sin cuenta', async () => {
@@ -260,18 +260,19 @@ describe('Captura de deudas (unidad 2)', () => {
       const preview = await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
 
       expect(preview.captureState).toBe('awaiting_confirmation');
-      expect(preview.reply).toContain(debt.id);
+      expect(preview.reply).toContain('Carmen');
       expect(preview.reply).toContain('pago parcial');
       expect(preview.reply).toContain('3.00 USD');
       expect(preview.reply).toContain('10.00 USD');
+      expect(preview.reply).not.toContain(debt.id);
       expect(await movementCount()).toBe(0);
 
       const confirmed = await handle(service, { eventId: 'e2', text: '/confirm' });
 
       expect(confirmed.captureState).toBe('registered');
-      expect(confirmed.reply).toContain('Pago:');
+      expect(confirmed.reply).toContain('Registrado: pago de 3.00 USD de la deuda con Carmen');
       expect(confirmed.movementId).not.toBeNull();
-      expect(confirmed.reply).toContain(confirmed.movementId as string);
+      expect(confirmed.reply).not.toContain(confirmed.movementId as string);
 
       const movement = await onlyRow(await db.dataSource.getRepository(Movement).find());
       expect(movement.kind).toBe('expense');
@@ -1566,21 +1567,10 @@ describe('Captura de deudas (unidad 2)', () => {
   });
 
   describe('ambiguedad al elegir la deuda', () => {
-    it('pregunta con los ids cuando hay varias deudas de la misma contraparte', async () => {
+    it('pregunta con una lista numerada, sin ids, cuando hay varias deudas de la misma contraparte', async () => {
       const first = await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
       const second = await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
       const interpreter = new FakeInterpreter([
-        operation({
-          kind: 'debt_settle',
-          amount: '3.00',
-          currency: 'USD',
-          accountId: usd,
-          debt: debtData({
-            direction: 'payable',
-            counterparty: 'Carmen',
-            settlementMode: 'partial',
-          }),
-        }),
         operation({
           kind: 'debt_settle',
           amount: '3.00',
@@ -1599,16 +1589,264 @@ describe('Captura de deudas (unidad 2)', () => {
 
       expect(ambiguous.captureState).toBe('awaiting_details');
       expect(ambiguous.reply).toContain('varias deudas');
-      expect(ambiguous.reply).toContain(first.id);
-      expect(ambiguous.reply).toContain(second.id);
+      expect(ambiguous.reply).toContain('1. 2026-11-01 | pendiente 10.00 USD');
+      expect(ambiguous.reply).toContain('2. 2026-11-01 | pendiente 25.00 USD');
+      expect(ambiguous.reply).not.toContain(first.id);
+      expect(ambiguous.reply).not.toContain(second.id);
       expect(await movementCount()).toBe(0);
 
-      // El usuario elige una de las dos escribiendo su id.
-      const chosen = await handle(service, { eventId: 'e2', text: `le pagué 3 dólares a la deuda ${second.id}` });
+      // El usuario elige con el numero: no hace falta escribir ningun id.
+      const chosen = await handle(service, { eventId: 'e2', text: '2' });
 
       expect(chosen.captureState).toBe('awaiting_confirmation');
-      expect(chosen.reply).toContain(second.id);
+      expect(chosen.reply).toContain('pendiente: 25.00 USD');
+      expect(chosen.reply).not.toContain('pendiente: 10.00 USD');
       expect(chosen.reply).not.toContain(first.id);
+      expect(chosen.reply).not.toContain(second.id);
+      // La eleccion se resuelve sin llamar al modelo.
+      expect(interpreter.requests).toHaveLength(1);
+    });
+
+    it('la eleccion sobrevive a un reinicio y sigue apuntando a la misma deuda', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      const second = await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+
+      // El proceso se reinicia: el borrador (y su lista) viven en la base.
+      await db.close();
+      const reopened = await openDatabase(db.path);
+      const restarted = buildService(interpreter, reopened);
+      // Otra deuda de la misma persona aparece despues: la lista guardada manda.
+      const debtsAfter = new DebtService(new TransactionRunner(reopened), new FinancialService(new TransactionRunner(reopened)));
+      await debtsAfter.create({
+        sourceKey: 'deuda-3',
+        direction: 'payable',
+        counterparty: 'Carmen',
+        money: { currency: 'USD', minor: 4000n },
+        occurredOn: '2026-11-02',
+      });
+      const chosen = await handle(restarted, { eventId: 'e2', text: 'la 2' });
+
+      expect(chosen.captureState).toBe('awaiting_confirmation');
+      expect(chosen.reply).toContain('pendiente: 25.00 USD');
+      expect(chosen.reply).not.toContain(second.id);
+      expect(chosen.reply).not.toContain('pendiente: 40.00 USD');
+
+      await reopened.destroy();
+    });
+
+    it('una eleccion que ya no vale se vuelve a preguntar sin elegir en silencio', async () => {
+      const first = await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      const second = await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+      // La segunda deuda se paga por otra via: la opcion 2 ya no vale.
+      await debts.settle({
+        sourceKey: 'pago-otro',
+        debtId: second.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 2500n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 2500n,
+      });
+
+      const stale = await handle(service, { eventId: 'e2', text: '2' });
+
+      expect(stale.captureState).toBe('awaiting_details');
+      expect(stale.reply).toContain('ya no esta pendiente');
+      expect(stale.reply).toContain('1. 2026-11-01 | pendiente 10.00 USD');
+      expect(stale.reply).not.toContain(second.id);
+      expect(stale.reply).not.toContain(first.id);
+      // No se registro ningun pago nuevo: solo el que se hizo por otra via.
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(1);
+    });
+
+    it('un numero fuera de la lista se vuelve a preguntar con la lista guardada', async () => {
+      const first = await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+
+      const out = await handle(service, { eventId: 'e2', text: 'opcion 7' });
+
+      expect(out.captureState).toBe('awaiting_details');
+      expect(out.reply).toContain('no esta en la lista');
+      expect(out.reply).toContain('1. 2026-11-01 | pendiente 10.00 USD');
+      expect(out.reply).not.toContain(first.id);
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('la eleccion se combina con los datos que faltaban', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const ambiguous = await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+      expect(ambiguous.reply).toContain('2. 2026-11-01 | pendiente 25.00 USD');
+
+      // La eleccion no inventa la cuenta que falta.
+      const chosen = await handle(service, { eventId: 'e2', text: '2' });
+      expect(chosen.captureState).toBe('awaiting_details');
+      expect(chosen.reply).toContain('falta la cuenta');
+
+      // Con la cuenta, el pago se prepara sobre la deuda elegida.
+      const ready = await handle(service, { eventId: 'e3', text: 'Efectivo USD' });
+      expect(ready.captureState).toBe('awaiting_confirmation');
+      expect(ready.reply).toContain('pendiente: 25.00 USD');
+      expect(ready.reply).toContain('cuenta: Efectivo USD (USD)');
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('un pago parcial hecho por fuera invalida la eleccion y la lista se refresca', async () => {
+      const first = await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      const second = await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+
+      // Un pago parcial por fuera cambia el pendiente que se mostro.
+      await debts.settle({
+        sourceKey: 'pago-fuera',
+        debtId: second.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 500n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 2500n,
+      });
+
+      const stale = await handle(service, { eventId: 'e2', text: '2' });
+
+      expect(stale.captureState).toBe('awaiting_details');
+      expect(stale.reply).toContain('Elige de nuevo');
+      // La lista se refresca con el pendiente actual y **sin cambiar el orden**.
+      expect(stale.reply).toContain('1. 2026-11-01 | pendiente 10.00 USD');
+      expect(stale.reply).toContain('2. 2026-11-01 | pendiente 20.00 USD');
+      expect(stale.reply).not.toContain('25.00');
+      expect(stale.reply).not.toContain(first.id);
+      expect(stale.reply).not.toContain(second.id);
+      // No se eligio ninguna deuda: solo esta el pago de fuera.
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(parseDebtDraft(after.debtPayload)?.debtId).toBeNull();
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(1);
+    });
+
+    it('una lista de deudas sin foto se refresca antes de elegir', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      const second = await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+
+      // Una lista escrita antes de existir la foto: no se puede comprobar.
+      const capture = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      const payload = JSON.parse(capture.debtPayload as string) as {
+        choices: { id: string; label: string }[];
+      };
+      payload.choices = payload.choices.map((choice) => ({ id: choice.id, label: choice.label }));
+      await db.dataSource.getRepository(Capture).update(
+        { id: capture.id },
+        { debtPayload: JSON.stringify(payload) },
+      );
+
+      const refreshed = await handle(service, { eventId: 'e2', text: '2' });
+
+      expect(refreshed.captureState).toBe('awaiting_details');
+      expect(refreshed.reply).toContain('Elige de nuevo');
+      expect(refreshed.reply).toContain('2. 2026-11-01 | pendiente 25.00 USD');
+      expect(refreshed.reply).not.toContain(second.id);
+
+      // Con la lista al dia, la eleccion si aplica.
+      const chosen = await handle(service, { eventId: 'e3', text: '2' });
+      expect(chosen.captureState).toBe('awaiting_confirmation');
+      expect(chosen.reply).toContain('pendiente: 25.00 USD');
     });
 
     it('un id propuesto por el modelo no evita la ambiguedad si el usuario no lo escribio', async () => {
@@ -1634,15 +1872,16 @@ describe('Captura de deudas (unidad 2)', () => {
 
       expect(outcome.captureState).toBe('awaiting_details');
       expect(outcome.reply).toContain('varias deudas');
-      expect(outcome.reply).toContain(first.id);
-      expect(outcome.reply).toContain(second.id);
+      expect(outcome.reply).toContain('1. 2026-11-01 | pendiente 10.00 USD');
+      expect(outcome.reply).not.toContain(first.id);
+      expect(outcome.reply).not.toContain(second.id);
       expect(await movementCount()).toBe(0);
     });
 
     it('distingue direccion, contraparte y moneda entre varias deudas de la misma persona', async () => {
-      const payableUsd = await seedDebt({ sourceKey: 'p-usd', direction: 'payable', currency: 'USD', minor: 1000n });
+      await seedDebt({ sourceKey: 'p-usd', direction: 'payable', currency: 'USD', minor: 1000n });
       const payableVes = await seedDebt({ sourceKey: 'p-ves', direction: 'payable', currency: 'VES', minor: 2000n });
-      const receivableUsd = await seedDebt({ sourceKey: 'r-usd', direction: 'receivable', currency: 'USD', minor: 3000n });
+      await seedDebt({ sourceKey: 'r-usd', direction: 'receivable', currency: 'USD', minor: 3000n });
       const interpreter = new FakeInterpreter([
         operation({
           kind: 'debt_settle',
@@ -1671,12 +1910,12 @@ describe('Captura de deudas (unidad 2)', () => {
 
       const payable = await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
       expect(payable.captureState).toBe('awaiting_confirmation');
-      expect(payable.reply).toContain(payableUsd.id);
+      expect(payable.reply).toContain('pendiente: 10.00 USD');
 
       const receivable = await handle(service, { eventId: 'e2', text: 'Carmen me pagó 3 dólares' });
       expect(receivable.captureState).toBe('awaiting_confirmation');
-      expect(receivable.reply).toContain(receivableUsd.id);
-      expect(receivable.reply).not.toContain(payableUsd.id);
+      expect(receivable.reply).toContain('pendiente: 30.00 USD');
+      expect(receivable.reply).not.toContain('pendiente: 10.00 USD');
       expect(payableVes.currency).toBe('VES');
     });
 
@@ -1724,8 +1963,10 @@ describe('Captura de deudas (unidad 2)', () => {
       });
 
       expect(chosen.captureState).toBe('awaiting_confirmation');
-      expect(chosen.reply).toContain(second.id);
+      expect(chosen.reply).toContain('pendiente: 25.00 USD');
+      expect(chosen.reply).not.toContain('pendiente: 10.00 USD');
       expect(chosen.reply).not.toContain(first.id);
+      expect(chosen.reply).not.toContain(second.id);
     });
 
     it('varias deudas escritas en el mensaje conservan la ambiguedad aunque haya un borrador previo', async () => {
@@ -1768,10 +2009,15 @@ describe('Captura de deudas (unidad 2)', () => {
 
       expect(ambiguous.captureState).toBe('awaiting_details');
       expect(ambiguous.reply).toContain('varias deudas');
+      expect(ambiguous.reply).toContain('1. 2026-11-01 | pendiente 10.00 USD');
+      expect(ambiguous.reply).not.toContain(first.id);
+      expect(ambiguous.reply).not.toContain(second.id);
       expect(await movementCount()).toBe(0);
-      // No queda ningun objetivo elegido: la ambiguedad se conserva.
+      // No queda ningun objetivo elegido: la ambiguedad se conserva. Los ids de la
+      // lista si se guardan (el usuario elige con el numero), pero no se muestran.
       const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
-      expect(after.debtPayload).not.toContain(first.id);
+      expect(parseDebtDraft(after.debtPayload)?.debtId).toBeNull();
+      expect(parseDebtDraft(after.debtPayload)?.choices).toHaveLength(2);
     });
 
     it('cambiar de persona resuelve la deuda de la persona nueva', async () => {
@@ -1810,7 +2056,9 @@ describe('Captura de deudas (unidad 2)', () => {
       const changed = await handle(service, { eventId: 'e2', text: 'le pagué 3 dólares a María' });
 
       expect(changed.captureState).toBe('awaiting_confirmation');
-      expect(changed.reply).toContain(maria.id);
+      expect(changed.reply).toContain('pendiente: 40.00 USD');
+      expect(changed.reply).not.toContain('pendiente: 10.00 USD');
+      expect(changed.reply).not.toContain(maria.id);
       expect(changed.reply).not.toContain(carmen.id);
     });
 
@@ -1840,6 +2088,98 @@ describe('Captura de deudas (unidad 2)', () => {
   });
 
   describe('consultas y estado pendiente', () => {
+    it('una consulta no toca la lista de deudas pendiente', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+        operation({ kind: 'debt_query', debt: debtData({ direction: 'payable', counterparty: 'Carmen' }) }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+      const before = await onlyRow(await db.dataSource.getRepository(Capture).find());
+
+      const query = await handle(service, { eventId: 'e2', text: 'qué le debo a Carmen' });
+
+      expect(query.reply).toContain('Lo que debo');
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(after).toEqual(before);
+      expect(parseDebtDraft(after.debtPayload)?.choices).toHaveLength(2);
+    });
+
+    it('/cancel borra la lista de deudas pendiente', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+
+      const cancelled = await handle(service, { eventId: 'e2', text: '/cancel' });
+
+      expect(cancelled.captureState).toBe('cancelled');
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(after.debtPayload).toBeNull();
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('un gasto corriente borra la lista de deudas pendiente', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-2', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          amount: '3.00',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+        operation({
+          kind: 'expense',
+          amount: '2.00',
+          currency: 'USD',
+          accountId: usd,
+          occurredOn: '2026-11-10',
+          description: 'Helado',
+          debt: null,
+        }),
+      ]);
+      const service = buildService(interpreter);
+      await handle(service, { eventId: 'e1', text: 'le pagué 3 dólares a Carmen' });
+
+      const expense = await handle(service, { eventId: 'e2', text: 'Helado 2 dolares' });
+
+      expect(expense.captureState).toBe('awaiting_confirmation');
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(after.debtPayload).toBeNull();
+      expect(after.kind).toBe('expense');
+    });
+
     it('responde la consulta sin tocar el borrador pendiente', async () => {
       const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
       const interpreter = new FakeInterpreter([
@@ -1853,10 +2193,10 @@ describe('Captura de deudas (unidad 2)', () => {
 
       const query = await handle(service, { eventId: 'e2', text: 'qué le debo a Carmen' });
 
-      expect(query.reply).toContain(debt.id);
       expect(query.reply).toContain('Carmen');
       expect(query.reply).toContain('Lo que debo');
       expect(query.reply).toContain('pendiente 10.00');
+      expect(query.reply).not.toContain(debt.id);
       expect(await movementCount()).toBe(0);
 
       const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
@@ -1912,7 +2252,7 @@ describe('Captura de deudas (unidad 2)', () => {
       const confirmed = await handle(restarted, { eventId: 'e2', text: '/confirm' });
 
       expect(confirmed.captureState).toBe('registered');
-      expect(confirmed.reply).toContain('Deuda:');
+      expect(confirmed.reply).toContain('Registrado: deuda de 8.00 USD con Carmen');
       expect(await reopened.getRepository(Debt).count()).toBe(1);
       expect(await reopened.getRepository(Movement).count()).toBe(0);
 

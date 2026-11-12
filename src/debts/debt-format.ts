@@ -15,6 +15,21 @@ export const MAX_DEBT_REPORT_CHARS = 4_096;
  */
 export const DEBT_DETAIL_FALLBACK = 'Detalle completo: CLI debt:list y debt:show --debt <id>.';
 
+/**
+ * La misma pista **sin ids**: es la que ve el usuario del bot, que no conoce (ni
+ * necesita) el identificador de la deuda.
+ */
+export const DEBT_CLI_FALLBACK = 'Detalle completo: CLI debt:list y debt:show.';
+
+/**
+ * Como se muestran las filas. La CLI deja el id: sus ids son la forma de seleccionar
+ * una deuda. El bot los quita: al usuario le bastan la persona, la direccion, la
+ * moneda y los importes.
+ */
+export interface DebtFormatOptions {
+  showIds?: boolean;
+}
+
 /** Fila de deuda que el reporte necesita. No incluye el historial de pagos. */
 export interface DebtReportRow {
   id: string;
@@ -46,10 +61,11 @@ function directionText(direction: DebtDirection): string {
   return direction === 'payable' ? 'lo que debo' : 'lo que me deben';
 }
 
-/** Una fila: id, contraparte, importe original, pagado, pendiente y estado. */
-export function formatDebtRow(row: DebtReportRow): string {
+/** Una fila: contraparte, importe original, pagado, pendiente y estado. */
+export function formatDebtRow(row: DebtReportRow, options: DebtFormatOptions = {}): string {
   const amount = (value: bigint) => formatAmount(value, row.currency);
-  return `${row.id} | ${row.counterparty} | ${row.currency} | original ${amount(row.principalMinor)} | pagado ${amount(row.paidMinor)} | pendiente ${amount(row.outstandingMinor)} | ${row.status}`;
+  const id = options.showIds === false ? '' : `${row.id} | `;
+  return `${id}${row.counterparty} | ${row.currency} | original ${amount(row.principalMinor)} | pagado ${amount(row.paidMinor)} | pendiente ${amount(row.outstandingMinor)} | ${row.status}`;
 }
 
 /**
@@ -86,17 +102,17 @@ export function formatDebtTotals(rows: DebtReportRow[]): string[] {
  * fila completa y cierra con los totales por direccion y moneda. **No se acota**: la
  * CLI lista todas las filas, sin el tope de caracteres de un mensaje de Telegram.
  */
-export function formatDebtList(rows: DebtReportRow[]): string[] {
+export function formatDebtList(rows: DebtReportRow[], options: DebtFormatOptions = {}): string[] {
   const payable = rows.filter((row) => row.direction === 'payable');
   const receivable = rows.filter((row) => row.direction === 'receivable');
   const lines: string[] = [];
   if (payable.length > 0) {
     lines.push('Lo que debo:');
-    lines.push(...payable.map((row) => `  ${formatDebtRow(row)}`));
+    lines.push(...payable.map((row) => `  ${formatDebtRow(row, options)}`));
   }
   if (receivable.length > 0) {
     lines.push('Lo que me deben:');
-    lines.push(...receivable.map((row) => `  ${formatDebtRow(row)}`));
+    lines.push(...receivable.map((row) => `  ${formatDebtRow(row, options)}`));
   }
   lines.push('Totales por direccion y moneda (sin compensar entre direcciones ni monedas):');
   lines.push(...formatDebtTotals(rows));
@@ -110,14 +126,14 @@ export function formatDebtList(rows: DebtReportRow[]): string[] {
  */
 export function formatDebtReport(
   rows: DebtReportRow[],
-  options: { title?: string; fallback?: string; empty?: string } = {},
+  options: DebtFormatOptions & { title?: string; fallback?: string; empty?: string } = {},
 ): string {
   const title = options.title ?? 'Deudas:';
   const fallback = options.fallback ?? DEBT_DETAIL_FALLBACK;
   if (rows.length === 0) {
     return [options.empty ?? `${title} no hay deudas registradas.`, fallback].join('\n');
   }
-  return boundedLines([title, ...formatDebtList(rows)], MAX_DEBT_REPORT_CHARS, fallback);
+  return boundedLines([title, ...formatDebtList(rows, options)], MAX_DEBT_REPORT_CHARS, fallback);
 }
 
 /**

@@ -7,7 +7,7 @@ import { dateInTimeZone, parseDate } from '../domain/date';
 import { ConflictError, NotFoundError, ValidationError } from '../domain/errors';
 import { CURRENCY_CODES, Currency, formatAmount, isCurrency, parseAmount } from '../domain/money';
 import { DebtDirection } from '../debts/debt.entity';
-import { formatDebtReport } from '../debts/debt-format';
+import { DEBT_CLI_FALLBACK, formatDebtReport } from '../debts/debt-format';
 import { canonicalName, DebtService, DebtView } from '../debts/debt.service';
 import { FinancialService } from '../financial/financial.service';
 import { MovementKind } from '../financial/movement.entity';
@@ -23,7 +23,15 @@ import { Operation } from '../interpreter/operation.schema';
 import { Capture, CaptureKind, CaptureState } from './capture.entity';
 import { sourceKeyFor } from './source-key';
 import { CaptureEvent } from './capture-event.entity';
-import { DebtDraft, directionLabel, FULL_AUTHORIZATION_VERSION, parseDebtDraft, serializeDebtDraft } from './debt-draft';
+import {
+  DebtChoice,
+  DebtDraft,
+  directionLabel,
+  FULL_AUTHORIZATION_VERSION,
+  MAX_DEBT_CHOICES,
+  parseDebtDraft,
+  serializeDebtDraft,
+} from './debt-draft';
 import { BudgetExhaustedError, DEFAULT_TIME_ZONE, InferenceBudgetService } from './inference-budget.service';
 import {
   accountPhrase,
@@ -42,6 +50,8 @@ const MAX_DESCRIPTION_LENGTH = 280;
 const MAX_AMOUNT_LENGTH = 40;
 /** Longitud maxima de la contraparte de una deuda (limite de `Debt`). */
 const MAX_COUNTERPARTY_LENGTH = 120;
+/** Longitud maxima de la etiqueta de una opcion de la lista de deudas. */
+const MAX_CHOICE_LABEL_LENGTH = 140;
 
 const EMPTY_MESSAGE_REPLY = 'El mensaje esta vacio: no hay nada que registrar.';
 const NOTHING_TO_CONFIRM_REPLY = 'No hay ninguna operacion pendiente por confirmar.';
@@ -155,7 +165,7 @@ interface DraftProblem {
 /** Resultado de buscar la deuda que el usuario quiere pagar. */
 type TargetResolution =
   | { kind: 'resolved'; debt: DebtView }
-  | { kind: 'ask'; problems: DraftProblem[]; detail?: string };
+  | { kind: 'ask'; problems: DraftProblem[]; detail?: string; choices?: DebtChoice[] };
 
 @Injectable()
 export class CaptureService {
@@ -226,11 +236,23 @@ export class CaptureService {
     if (input.text.trim().length === 0) {
       return this.complete(event, input, null, EMPTY_MESSAGE_REPLY);
     }
+
+    const pending = await this.findPendingCapture(input.chatId);
+
+    // Una eleccion de la lista de deudas se resuelve **antes** del modelo: el numero
+    // es la fuente de verdad (el id guardado es el que se paga) y asi no se gasta
+    // inferencia en un mensaje que ya esta dicho.
+    if (pending !== null) {
+      const choice = choiceIndex(input.text, pending);
+      if (choice !== null) {
+        return this.debtChoice(event, input, pending, choice);
+      }
+    }
+
     if (!this.interpreter.enabled) {
       return this.markUncertain(event, input, NOT_CONFIGURED_REPLY);
     }
 
-    const pending = await this.findPendingCapture(input.chatId);
     const accounts = await this.activeAccounts();
     const defaultDate = dateInTimeZone(input.receivedAt, DEFAULT_TIME_ZONE);
     const candidates = await this.debtCandidates();
@@ -360,6 +382,7 @@ export class CaptureService {
       expectedOutstandingMinor: null,
       fullIntent: false,
       fullAuthorizationVersion: null,
+      choices: [],
     };
     const draft: Draft = {
       kind: 'debt_create',
@@ -395,6 +418,9 @@ export class CaptureService {
    * Prepara el borrador de un pago de deuda. El pendiente se **congela** al preparar el
    * pago: si despues cambia (otro pago o una anulacion), el `/confirm` se rechaza y hay
    * que volver a preparar el pago.
+   *
+   * `resolved` es la deuda ya elegida (la lista numerada): entonces no se busca otra y
+   * el pago se prepara con los datos que ya tiene el borrador.
    */
   private async debtSettleDraft(
     event: CaptureEvent,
@@ -403,6 +429,7 @@ export class CaptureService {
     operation: Operation,
     accounts: AccountOption[],
     defaultDate: string,
+    resolved: DebtView | null = null,
   ): Promise<CaptureOutcome> {
     const model = operation.debt;
     const direction = model?.direction ?? null;
@@ -414,14 +441,17 @@ export class CaptureService {
     const pendingDebt = pendingDraft?.debt ?? null;
     const pendingDebtId = pendingDebt?.debtId ?? null;
 
-    const resolution = await this.resolveDebtTarget({
-      direction,
-      counterparty,
-      currency: rawCurrency,
-      userText: input.text,
-      pendingDebtId,
-      accounts,
-    });
+    const resolution: TargetResolution =
+      resolved !== null
+        ? { kind: 'resolved', debt: resolved }
+        : await this.resolveDebtTarget({
+            direction,
+            counterparty,
+            currency: rawCurrency,
+            userText: input.text,
+            pendingDebtId,
+            accounts,
+          });
 
     const debt: DebtDraft = {
       version: 1,
@@ -438,6 +468,7 @@ export class CaptureService {
       expectedOutstandingMinor: null,
       fullIntent: false,
       fullAuthorizationVersion: null,
+      choices: resolution.kind === 'ask' ? resolution.choices ?? [] : [],
     };
     const draft: Draft = {
       kind: 'debt_settle',
@@ -684,12 +715,139 @@ export class CaptureService {
   }
 
   /**
+   * Elige una deuda de la lista numerada que quedo pendiente. La eleccion se resuelve
+   * **sin llamar al modelo**: el numero es la fuente de verdad y el id es el que estaba
+   * guardado, no el que el modelo proponga.
+   *
+   * La opcion solo vale si la deuda **sigue igual que cuando se mostro** (mismo
+   * pendiente, misma moneda, todavia pendiente). Si no, no se elige en silencio: se
+   * refresca la lista —sin cambiar el orden, para que el numero signifique siempre la
+   * misma deuda— y se vuelve a preguntar.
+   *
+   * La eleccion **no autoriza un pago total**: el importe y la cuenta se siguen
+   * pidiendo si faltan.
+   */
+  private async debtChoice(
+    event: CaptureEvent,
+    input: NormalizedRequest,
+    pending: Capture,
+    index: number,
+  ): Promise<CaptureOutcome> {
+    const draft = draftOf(pending);
+    const debt = draft.debt;
+    const choices = debt?.choices ?? [];
+    if (index < 1 || index > choices.length) {
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        draft,
+        'awaiting_details',
+        `La opcion ${index} no esta en la lista.\n${choicePrompt(choices)}`,
+      );
+    }
+
+    const chosen = choices[index - 1]!;
+    const view = await this.debts.get(chosen.id).catch(() => null);
+    if (view === null || !this.choiceStillHolds(chosen, view, debt)) {
+      // La opcion ya no vale: se refresca la lista y se vuelve a preguntar.
+      const refreshed = await this.openChoices(choices);
+      const cleared = debt === null ? draft : { ...draft, debt: { ...debt, debtId: null, choices: refreshed } };
+      return this.saveDraft(
+        event,
+        input,
+        pending,
+        cleared,
+        'awaiting_details',
+        refreshed.every((choice) => choice.outstandingMinor === null)
+          ? 'Ninguna de las deudas que te mostre sigue pendiente. Vuelve a escribir el pago con la persona y el importe.'
+          : `La deuda que elegiste ya no esta pendiente o su importe cambio. Elige de nuevo:\n${choicePrompt(refreshed)}`,
+      );
+    }
+
+    // La deuda elegida manda: el resto del pago se prepara como siempre, con los datos
+    // que ya tenia el borrador y sin que la eleccion autorice un pago total.
+    const operation: Operation = {
+      kind: 'debt_settle',
+      amount: debt?.amount ?? null,
+      currency: debt?.currency ?? null,
+      accountId: debt?.accountId ?? null,
+      occurredOn: debt?.occurredOn ?? null,
+      description: debt?.description ?? null,
+      debt: {
+        direction: debt?.direction ?? null,
+        counterparty: debt?.counterparty ?? null,
+        debtId: null,
+        settlementMode: null,
+        status: null,
+      },
+    };
+    const accounts = await this.activeAccounts();
+    const defaultDate = dateInTimeZone(input.receivedAt, DEFAULT_TIME_ZONE);
+    return this.debtSettleDraft(event, input, pending, operation, accounts, defaultDate, view);
+  }
+
+  /**
+   * `true` si la opcion elegida sigue valiendo: la deuda sigue pendiente, con el mismo
+   * pendiente y la misma moneda que se le mostraron, y encaja con lo que pide el
+   * borrador.
+   *
+   * Una opcion **sin foto** (escrita antes de existirla) no vale: se refresca la lista
+   * y se vuelve a preguntar, nunca se elige a ciegas.
+   */
+  private choiceStillHolds(choice: DebtChoice, view: DebtView, debt: DebtDraft | null): boolean {
+    if (view.status === 'paid') {
+      return false;
+    }
+    if (choice.outstandingMinor === null || choice.currency === null) {
+      return false;
+    }
+    if (choice.outstandingMinor !== view.outstandingMinor.toString()) {
+      return false;
+    }
+    if (choice.currency !== view.debt.currency) {
+      return false;
+    }
+    return !contradicts(view, {
+      direction: debt?.direction ?? null,
+      counterparty: debt?.counterparty ?? null,
+      currency: debt?.currency ?? null,
+    });
+  }
+
+  /**
+   * Las deudas de una lista, **en el mismo orden** (el numero sigue significando la
+   * misma deuda) y con la etiqueta y la foto al dia. Las que ya no están pendientes se
+   * marcan en vez de quitarse: asi el usuario no elige por numero una deuda que no es
+   * la que tenia delante.
+   */
+  private async openChoices(choices: DebtChoice[]): Promise<DebtChoice[]> {
+    const refreshed: DebtChoice[] = [];
+    for (const choice of choices) {
+      const view = await this.debts.get(choice.id).catch(() => null);
+      if (view === null) {
+        refreshed.push({ ...choice, outstandingMinor: null, currency: null, label: `${choice.label} | ya no existe` });
+        continue;
+      }
+      if (view.status === 'paid') {
+        refreshed.push({ ...choice, outstandingMinor: null, currency: null, label: `${choice.label} | ya esta pagada` });
+        continue;
+      }
+      refreshed.push(debtChoiceOf(view));
+    }
+    return refreshed;
+  }
+
+  /**
    * Busca la deuda que el usuario quiere pagar.
    *
    * El id cuenta solo si el usuario **lo escribió en este mensaje**: manda sobre el
    * borrador vivo. Sin id escrito ahora, el del borrador vivo es una pista (tiene que
    * seguir siendo compatible) y, si no lo es, se busca por contraparte, direccion y
    * moneda exactas. Un id propuesto por el modelo nunca resuelve nada.
+   *
+   * Cuando hay mas de una deuda posible no se elige ninguna: se muestran numeradas y
+   * el usuario elige con el numero. Los ids de la lista no se muestran nunca.
    */
   private async resolveDebtTarget(input: {
     direction: DebtDirection | null;
@@ -702,10 +860,20 @@ export class CaptureService {
     const written = idsInText(input.userText, input.accounts);
     if (written.length > 1) {
       // Varias deudas escritas en este mensaje: la ambiguedad se conserva, no se elige.
+      const rows = await this.debts.list();
+      const mentioned = rows.filter((row) => row.status !== 'paid' && written.includes(row.debt.id));
+      if (mentioned.length === 0) {
+        return {
+          kind: 'ask',
+          problems: [{ field: 'debtId', message: 'no existe ninguna de las deudas que mencionas' }],
+        };
+      }
+      const choices = debtChoices(mentioned);
       return {
         kind: 'ask',
         problems: [{ field: 'debtId', message: 'el mensaje menciona varias deudas; indica cual es' }],
-        detail: `  deudas mencionadas: ${written.join(', ')}`,
+        detail: choicePrompt(choices),
+        choices,
       };
     }
     if (written.length === 1) {
@@ -754,17 +922,14 @@ export class CaptureService {
       };
     }
     if (candidates.length > 1) {
+      const choices = debtChoices(candidates);
       return {
         kind: 'ask',
         problems: [
-          { field: 'debtId', message: 'hay varias deudas con esa contraparte; indica el id de la que quieres pagar' },
+          { field: 'debtId', message: 'hay varias deudas con esa contraparte; indica cual quieres pagar' },
         ],
-        detail: candidates
-          .map(
-            (row) =>
-              `  ${row.debt.id} | ${row.debt.counterparty} | ${row.debt.currency} | pendiente ${formatAmount(row.outstandingMinor, row.debt.currency)} | ${row.status}`,
-          )
-          .join('\n'),
+        detail: choicePrompt(choices, candidates.length > choices.length),
+        choices,
       };
     }
     return { kind: 'resolved', debt: candidates[0]! };
@@ -850,6 +1015,8 @@ export class CaptureService {
       })),
       {
         title: 'Deudas:',
+        showIds: false,
+        fallback: DEBT_CLI_FALLBACK,
         empty:
           status === null
             ? 'No hay deudas pendientes que coincidan con la consulta.'
@@ -984,7 +1151,7 @@ export class CaptureService {
     try {
       const result = await this.transactions.run(async (manager) => {
         if (draft.kind === 'debt_create') {
-          const created = await this.debts.create(
+          await this.debts.create(
             {
               sourceKey: pending.sourceKey,
               direction: debt.direction as DebtDirection,
@@ -1002,7 +1169,7 @@ export class CaptureService {
             { id: pending.id },
             { state: 'registered', sourceText: null, debtPayload: null },
           );
-          const message = debtCreatedReply(draft, created.debt.id);
+          const message = debtCreatedReply(draft);
           await manager.getRepository(CaptureEvent).update(
             { id: event.id },
             { state: 'completed', reply: message, captureState: 'registered', movementId: null },
@@ -1028,7 +1195,7 @@ export class CaptureService {
           { id: pending.id },
           { state: 'registered', sourceText: null, debtPayload: null },
         );
-        const message = debtSettledReply(draft, settled.payment.id, settled.movement.id);
+        const message = debtSettledReply(draft);
         await manager.getRepository(CaptureEvent).update(
           { id: event.id },
           {
@@ -1436,6 +1603,64 @@ function idsInText(text: string, accounts: AccountOption[]): string[] {
 }
 
 /**
+ * Las deudas que el usuario puede elegir, en orden, con su etiqueta legible. El id se
+ * guarda para poder pagar esa deuda, pero no se muestra: el usuario elige con el
+ * numero. Cada opcion guarda tambien la **foto** de lo que se mostro (el pendiente y
+ * su moneda) para poder comprobar despues que la opcion sigue valiendo.
+ */
+function debtChoices(rows: DebtView[]): DebtChoice[] {
+  return rows.slice(0, MAX_DEBT_CHOICES).map(debtChoiceOf);
+}
+
+/** Una opcion de la lista: id, etiqueta y foto del pendiente. */
+function debtChoiceOf(row: DebtView): DebtChoice {
+  return {
+    id: row.debt.id,
+    label: debtChoiceLabel(row),
+    outstandingMinor: row.outstandingMinor.toString(),
+    currency: row.debt.currency,
+  };
+}
+
+/** Etiqueta de una deuda: fecha, pendiente, direccion, persona y descripcion. */
+function debtChoiceLabel(row: DebtView): string {
+  const currency = row.debt.currency;
+  const parts = [
+    row.debt.occurredOn,
+    `pendiente ${formatAmount(row.outstandingMinor, currency)} ${currency}`,
+    directionLabel(row.debt.direction),
+    row.debt.counterparty,
+  ];
+  const description = row.debt.description;
+  if (description !== null && description.length > 0) {
+    parts.push(description);
+  }
+  return parts.join(' | ').slice(0, MAX_CHOICE_LABEL_LENGTH);
+}
+
+/** La lista de deudas que ve el usuario: numerada y sin identificadores. */
+function choicePrompt(choices: DebtChoice[], more = false): string {
+  return [
+    'Elige la deuda (responde solo con el numero de la opcion):',
+    ...choices.map((choice, index) => `  ${index + 1}. ${choice.label}`),
+    ...(more ? ['Hay mas deudas con esa persona: di el importe o la fecha para saber cual es.'] : []),
+  ].join('\n');
+}
+
+/**
+ * El numero de opcion que responde el usuario, si el mensaje es solo eso. Solo cuenta
+ * si hay una lista de deudas pendiente: un numero suelto responde a esa lista.
+ */
+function choiceIndex(text: string, pending: Capture): number | null {
+  const choices = draftOf(pending).debt?.choices ?? [];
+  if (choices.length === 0) {
+    return null;
+  }
+  const match = /^(?:(?:la|el)\s+)?(?:opci[oó]n\s+)?#?(\d{1,2})$/i.exec(text.trim());
+  return match === null ? null : Number(match[1]);
+}
+
+/**
  * `true` si la contraparte, la direccion o la moneda del pago contradicen la deuda
  * indicada. La contraparte se compara de forma canonica (como en el dominio): solo
  * encaja si es la misma persona.
@@ -1823,7 +2048,7 @@ function confirmationReply(draft: Draft, accounts: AccountOption[]): string {
     'Entendi esta operacion:',
     `  - tipo: ${draft.kind === 'income' ? 'ingreso' : 'gasto'}`,
     `  - importe: ${draft.amount} ${draft.currency}`,
-    `  - cuenta: ${account ? `${account.name} (${account.currency})` : draft.accountId}`,
+    `  - cuenta: ${account ? `${account.name} (${account.currency})` : '(sin cuenta)'}`,
     `  - fecha: ${draft.occurredOn}`,
     `  - descripcion: ${draft.description ?? '(sin descripcion)'}`,
     '',
@@ -1850,14 +2075,16 @@ function debtCreateReply(draft: Draft): string {
 /** Resumen de un pago de deuda: muestra el pendiente congelado del momento. */
 function debtSettleReply(draft: Draft, debt: DebtView, account: AccountOption | undefined): string {
   const payload = draft.debt;
-  const outstanding = formatAmount(debt.outstandingMinor, debt.debt.currency);
+  const currency = debt.debt.currency;
+  const outstanding = formatAmount(debt.outstandingMinor, currency);
+  const original = formatAmount(debt.debt.principalMinor, currency);
   return [
     'Entendi este pago de deuda:',
-    `  - deuda: ${debt.debt.id} | ${debt.debt.counterparty} | ${directionLabel(payload?.direction ?? null)} | ${debt.debt.currency}`,
+    `  - deuda: ${debt.debt.counterparty} | ${directionLabel(payload?.direction ?? null)} | ${currency}`,
+    `  - original: ${original} ${currency} | pendiente: ${outstanding} ${currency} | fecha de la deuda: ${debt.debt.occurredOn}`,
     `  - modo: ${payload?.settlementMode === 'full' ? 'pago total' : 'pago parcial'}`,
     `  - importe: ${payload?.amount} ${payload?.currency}`,
-    `  - pendiente al preparar: ${outstanding} ${debt.debt.currency}`,
-    `  - cuenta: ${account ? `${account.name} (${account.currency})` : payload?.accountId}`,
+    `  - cuenta: ${account ? `${account.name} (${account.currency})` : '(sin cuenta)'}`,
     `  - fecha: ${payload?.occurredOn}`,
     `  - descripcion: ${payload?.description ?? '(sin descripcion)'}`,
     '',
@@ -1871,15 +2098,15 @@ function registeredReply(draft: Draft, account: AccountOption | undefined): stri
 }
 
 /** Confirmacion de una deuda nueva: no hay movimiento, solo la obligacion. */
-function debtCreatedReply(draft: Draft, debtId: string): string {
+function debtCreatedReply(draft: Draft): string {
   const debt = draft.debt;
-  return `Registrado: deuda de ${debt?.amount} ${debt?.currency} con ${debt?.counterparty} (${directionLabel(debt?.direction ?? null)}). Deuda: ${debtId}`;
+  return `Registrado: deuda de ${debt?.amount} ${debt?.currency} con ${debt?.counterparty} (${directionLabel(debt?.direction ?? null)}).`;
 }
 
-/** Confirmacion de un pago de deuda: ids de la deuda, del pago y del movimiento. */
-function debtSettledReply(draft: Draft, paymentId: string, movementId: string): string {
+/** Confirmacion de un pago de deuda: la persona, el importe y el pendiente. */
+function debtSettledReply(draft: Draft): string {
   const debt = draft.debt;
-  return `Registrado: pago de ${debt?.amount} ${debt?.currency} de la deuda ${debt?.debtId} (${debt?.counterparty}). Pago: ${paymentId}. Movimiento: ${movementId}`;
+  return `Registrado: pago de ${debt?.amount} ${debt?.currency} de la deuda con ${debt?.counterparty} (${directionLabel(debt?.direction ?? null)}).`;
 }
 
 function replay(event: CaptureEvent): CaptureOutcome {

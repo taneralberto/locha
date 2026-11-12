@@ -136,9 +136,14 @@ export class SavingsService {
     return manager ? read(manager) : this.transactions.run(read);
   }
 
-  async warnings(): Promise<string[]> {
+  /**
+   * Avisos de deficit actual. La CLI los muestra con el id de la cuenta (sus ids son
+   * la forma de consultarla); el bot los pide con el nombre, que es lo que el usuario
+   * conoce.
+   */
+  async warnings(options: { names?: boolean } = {}): Promise<string[]> {
     return (await this.status()).filter((row) => row.deficit > 0n).map((row) =>
-      `ADVERTENCIA: cuenta ${row.accountId} | ${row.currency} | deficit ${formatAmount(row.deficit, row.currency)} | disponible ${formatAmount(row.available, row.currency)}; reservas preservadas, no se liberan automaticamente.`);
+      `ADVERTENCIA: cuenta ${options.names === true ? row.name : row.accountId} | ${row.currency} | deficit ${formatAmount(row.deficit, row.currency)} | disponible ${formatAmount(row.available, row.currency)}; reservas preservadas, no se liberan automaticamente.`);
   }
 
   /** Unica aritmetica de reservas: pares -> agregado por cuenta, siempre bigint. */

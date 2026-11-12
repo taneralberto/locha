@@ -57,8 +57,12 @@ describe('Telegram B4 determinista', () => {
     const usage = await db.dataSource.getRepository(AiUsageDay).find();
     const events = await db.dataSource.getRepository(CaptureEvent).find();
     expect(await answer('/goals@locha_bot')).toContain('objetivo 9007199254740993.123456 | reservado nominal 9007199254740993.123456 | restante 0.000000 | progreso 100.00%');
-    expect(await answer(`/goals ${goalId}`)).toContain(goalId);
+    // La meta se busca por nombre; el id escrito sigue funcionando, pero no se muestra.
+    expect(await answer('/goals Fondo')).toContain('Fondo | USDT | objetivo');
+    expect(await answer(`/goals ${goalId}`)).toContain('Fondo | USDT | objetivo');
+    expect(await answer(`/goals ${goalId}`)).not.toContain(goalId);
     expect(await answer('/savings')).toContain('saldo 9007199254740993.123456 | reservado 9007199254740993.123456 | disponible 0.000000 | deficit 0.000000');
+    expect(await answer('/savings')).not.toContain(accountId);
     expect(await answer('/balances')).toContain('reservado 9007199254740993.123456 | disponible 0.000000 | deficit 0.000000');
     const historical = await answer('/balances 2020-01-01');
     expect(historical).toContain('Reservas/disponibles solo actuales');
@@ -81,8 +85,9 @@ describe('Telegram B4 determinista', () => {
     expect(await answer('Gaste un micro USDT')).not.toContain('ADVERTENCIA');
     const reply = await answer('/confirm', 'telegram:confirm');
     expect(reply).toContain('Registrado');
-    expect(reply).toContain('Movimiento:');
-    expect(reply).toContain(`ADVERTENCIA: cuenta ${accountId} | USDT | deficit 0.000001 | disponible -0.000001`);
+    expect(reply).toContain('en la cuenta USDT');
+    expect(reply).not.toContain('Movimiento:');
+    expect(reply).toContain(`ADVERTENCIA: cuenta USDT | USDT | deficit 0.000001 | disponible -0.000001`);
     const stored = await db.dataSource.getRepository(CaptureEvent).findOneByOrFail({ eventId: 'telegram:confirm' });
     expect(stored.reply).not.toContain('ADVERTENCIA');
     expect(await answer('/confirm', 'telegram:confirm')).toBe(reply);

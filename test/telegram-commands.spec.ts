@@ -91,7 +91,7 @@ describe('TelegramCommands', () => {
     expect(interpreter.requests).toHaveLength(0);
   });
 
-  it('lista los movimientos recientes con su identificador', async () => {
+  it('lista los movimientos recientes sin identificadores tecnicos', async () => {
     const account = await accounts.add({ name: 'Efectivo', currency: 'USD' });
     const result = await financial.register({
       sourceKey: 'telegram:1',
@@ -104,9 +104,9 @@ describe('TelegramCommands', () => {
 
     const reply = await answer('/recent');
 
-    expect(reply).toContain(result.movement.id);
     expect(reply).toContain('12.50 USD');
     expect(reply).toContain('Efectivo');
+    expect(reply).not.toContain(result.movement.id);
     expect(interpreter.requests).toHaveLength(0);
   });
 
@@ -164,7 +164,7 @@ describe('TelegramCommands', () => {
         const reply = await answer('/balances@locha_bot 2026-11-02');
         expect(reply).toContain('50.00 USD | apertura si');
         expect(reply).toContain('20000.00 VES | apertura no');
-        expect(reply).toContain(usd.id);
+        expect(reply).not.toContain(usd.id);
         expect(reply).toContain('2026-11-02');
         expect(captureSpy).not.toHaveBeenCalled();
         expect(interpreter.requests).toHaveLength(0);
@@ -279,20 +279,71 @@ describe('TelegramCommands', () => {
         expect(reply).toContain('Original:');
         expect(reply).toContain('Efectivo:');
         expect(reply).toContain('Revision 1:');
-        expect(reply).toContain(operation.id);
         expect(reply).toContain('Comisiones');
+        expect(reply).not.toContain(operation.id);
+        expect(reply).not.toContain(id);
         expect(reply.length).toBeLessThanOrEqual(MAX_REPLY_LENGTH);
       }
+      // Sin argumento se muestra el ultimo movimiento: el usuario no escribe ids.
+      const latest = await answer('/movement');
+      expect(latest).toContain('Original:');
+      expect(latest).not.toContain(id);
+      expect(await answer('/movement ultimo')).toBe(latest);
       expect(await answer('/recent')).toContain('categoria Comisiones');
       expect(await answer(`/reconciliations ${usd.id}`)).toContain('objetivo -2.00 | antes -1.05 | delta -0.95');
+      expect(await answer('/reconciliations Efectivo')).toContain('objetivo -2.00 | antes -1.05 | delta -0.95');
       expect(await answer('/reconciliations')).toContain('Conteo');
-      for (const text of ['/movement', '/history id extra', '/movement missing', '/reconciliations id extra', '/reconciliations missing']) {
+      for (const text of ['/history id extra', '/movement missing', '/reconciliations id extra', '/reconciliations missing']) {
         expect(await answer(text)).toContain('Usa /');
       }
       expect(await answer('/help')).toContain('/history');
       expect(await answer('/movement:edit')).toContain('Comandos disponibles');
       expect(interpreter.requests).toHaveLength(requestsBefore);
       expect(await database.dataSource.getRepository(Capture).find()).toEqual(pendingBefore);
+    });
+
+    it('el historial muestra cada revision con su importe, descripcion y categoria', async () => {
+      const usd = await accounts.add({ name: 'Efectivo', currency: 'USD' });
+      const id = (await financial.register({
+        sourceKey: 'original',
+        accountId: usd.id,
+        kind: 'expense',
+        money: { currency: 'USD', minor: 1250n },
+        occurredOn: '2026-11-10',
+        description: 'Helado',
+      })).movement.id;
+      await financial.editMovement({
+        sourceKey: 'edit:1',
+        movementId: id,
+        expectedRevision: 0,
+        amountMinor: 1500n,
+        occurredOn: '2026-11-11',
+        description: 'Helado grande',
+        category: 'Comidas',
+        reason: 'Primer cambio',
+      });
+      await financial.editMovement({
+        sourceKey: 'edit:2',
+        movementId: id,
+        expectedRevision: 1,
+        amountMinor: 2000n,
+        occurredOn: '2026-11-12',
+        description: 'Helado enorme',
+        category: 'Postres',
+        reason: 'Segundo cambio',
+      });
+
+      const reply = await answer('/history');
+
+      expect(reply).toContain(
+        'Revision 1: edicion | 2026-11-11 | 15.00 USD | descripcion: Helado grande | categoria: Comidas | motivo: Primer cambio',
+      );
+      expect(reply).toContain(
+        'Revision 2: edicion | 2026-11-12 | 20.00 USD | descripcion: Helado enorme | categoria: Postres | motivo: Segundo cambio',
+      );
+      expect(reply).not.toContain('{');
+      expect(reply).not.toMatch(/[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/i);
+      expect(interpreter.requests).toHaveLength(0);
     });
 
     it('acota historial y conciliaciones por entradas completas con alternativa CLI', async () => {
@@ -302,7 +353,7 @@ describe('TelegramCommands', () => {
         await financial.editMovement({ sourceKey: `edit:${revision}`, movementId: id, expectedRevision: revision, amountMinor: 1n, occurredOn: '2026-11-01', reason: 'x'.repeat(280), description: 'd'.repeat(280), category: 'c'.repeat(80) });
         await financial.reconcile({ sourceKey: `rec:${revision}`, accountId: usd.id, currency: 'USD', targetMinor: 0n, occurredOn: '2026-11-01', reason: 'x'.repeat(280) });
       }
-      for (const [command, fallback] of [[`/history ${id}`, 'CLI movement:history'], ['/reconciliations', 'CLI reconciliation:list']]) {
+      for (const [command, fallback] of [[`/history ${id}`, 'movement:history'], ['/reconciliations', 'CLI reconciliation:list']]) {
         const reply = await answer(command!);
         expect(reply).toBe(await answer(command!));
         expect(reply.length).toBeLessThanOrEqual(MAX_REPLY_LENGTH);

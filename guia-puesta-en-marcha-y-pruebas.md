@@ -209,8 +209,10 @@ No intentes editar/anular aperturas o principales transferidos: B2 lo rechaza ex
 sin reversión parcial. La comisión sí es independiente; el historial muestra su operación
 dueña. Editarla/anularla no cambia el replay de la transferencia original.
 
-Arranca el bot y prueba `/movement ID_MOVIMIENTO`, `/history ID_MOVIMIENTO`,
-`/reconciliations ID_USD` y `/recent`: sin IA y sin modificar el pendiente. Las consultas
+Arranca el bot y prueba `/movement`, `/movement ultimo`, `/history`, `/reconciliations Efectivo`
+y `/recent`: sin IA y sin modificar el pendiente. **El bot no muestra identificadores**: las
+consultas se hacen por nombre y, sin argumento, `/movement` y `/history` muestran el último
+movimiento. Las consultas
 acotadas ofrecen alternativa CLI cuando el detalle no cabe en Telegram. Las escrituras
 B2 son solo por CLI; todos sus flags son estrictos.
 
@@ -332,7 +334,7 @@ Comprueba en esa base ficticia:
    bloqueada y liberación permitida. CLI financiero avisa de déficits actuales tras éxito.
    Metas asociadas muestran «reserva nominal con cuentas deficitarias», sin inventar
    asignación/prorrateo del faltante entre metas.
-7. Telegram `/goals [ID]`, `/savings`, `/balances`: consultas deterministas acotadas con
+7. Telegram `/goals [nombre]`, `/savings`, `/balances`: consultas deterministas acotadas con
    alternativa CLI, sin IA/allowance ni modificar el pendiente. `/balances FECHA` solo
    muestra reservas/disponibles si es hoy; históricos conservan saldo real sin mezclar.
    `/confirm` que registra bajo reservas añade advertencia actual, sin cambiar el reply
@@ -374,18 +376,18 @@ Con el bot y un modelo real, escribe en el chat:
 | Mensaje | Resultado esperado |
 |---|---|
 | `le debo 8$ a Carmen de dos tortas` | Presenta el resumen de una deuda a pagar; **no** registra movimiento ni cuenta |
-| `/confirm` | Registra la obligación y devuelve su id (`Deuda: <id>`) |
+| `/confirm` | Registra la obligación y la describe (persona, importe, moneda); **no** muestra ids |
 | `Carmen me debe 8$` | Presenta el resumen de una deuda a cobrar (dirección contraria) |
 | `/confirm` | Registra la obligación a cobrar, sin movimiento |
 | `cuáles son mis deudas` | Lista las deudas pendientes, separando lo que debo de lo que me deben; no toca el borrador pendiente |
 | `le pagué 3 dólares a Carmen` | Presenta el resumen del pago, con el pendiente congelado del momento |
-| `/confirm` | Registra **un gasto** por 3 USD ligado a la deuda y devuelve id de deuda, de pago y de movimiento |
+| `/confirm` | Registra **un gasto** por 3 USD ligado a la deuda y la describe (persona, importe); no muestra ids |
 | `Carmen me pagó` | Presenta el resumen de un pago **parcial**; si no dice el importe, pregunta cuánto se pagó |
 | `/confirm` | Registra un **ingreso** por el importe indicado y deja la deuda pagada |
 | `ya le pagué todo a Carmen` | Presenta el resumen de un pago **total** (lo autoriza el texto del usuario) |
 | `/confirm` | Registra el ingreso por el pendiente completo de la deuda |
-| `/debts` | Lista las deudas con id, contraparte, original, pagado, pendiente y estado; totales por dirección y moneda, sin compensar |
-| `/debts <id>` | Muestra esa deuda |
+| `/debts` | Lista las deudas con contraparte, original, pagado, pendiente y estado; totales por dirección y moneda, sin compensar |
+| `/debts Carmen` | Muestra las deudas de esa persona (todas sus direcciones y monedas) |
 | `/cancel` | Descarta el borrador pendiente sin registrar nada |
 
 Después comprueba:
@@ -410,9 +412,17 @@ Después comprueba:
   mensaje no nombra cuenta, el bot la pide: no la inventa.
 - El id de una cuenta es una cuenta, no una deuda: escribirlo nombra la cuenta y no
   cambia el objetivo del pago.
-- Con dos deudas de la misma contraparte, el bot **pregunta con los ids** en vez de elegir
-  una; al escribir el id, resuelve esa deuda. Un id escrito en el mensaje actual manda
-  sobre el borrador anterior.
+- Con dos deudas de la misma contraparte, el bot **pregunta con una lista numerada** (fecha,
+  pendiente, dirección y persona; **sin ids**) en vez de elegir una; el usuario responde
+  con el número (`2`, `la 2`, `opción 2`) y el bot resuelve esa deuda. La lista se guarda
+  en el borrador (columna `debtPayload`, campo `choices`): sobrevive a un reinicio y
+  **no hay migración nueva**. Un id escrito en el mensaje actual manda sobre el borrador
+  anterior y sigue funcionando, pero no se muestra.
+- Una elección **no autoriza un pago total**: el importe y la cuenta se siguen pidiendo.
+  Si la deuda elegida ya no está pendiente, su pendiente cambió o la lista se escribió
+  antes de guardar la foto de lo mostrado, el bot no elige en silencio: refresca la
+  lista (sin cambiar el orden, para que el número siga significando la misma deuda) y
+  vuelve a preguntar. `/cancel` borra la lista.
 - Si entre el resumen y el `/confirm` cambia el pendiente (otro pago o una anulación), el
   `/confirm` se rechaza: no se paga un total nuevo en silencio.
 - Si falta la contraparte, la dirección, la moneda o la cuenta, se pregunta y no se inventa

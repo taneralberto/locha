@@ -6,6 +6,7 @@ import { TelegramSettings } from '../config/configuration';
 import { TransactionRunner } from '../data/transaction.runner';
 import { TelegramClient, TelegramError } from './telegram-client';
 import { TelegramCommands } from './telegram-commands';
+import { sanitizeTelegramText } from './bot-text';
 import { POLLING_CURSOR_ID, TelegramCursor } from './telegram-cursor.entity';
 import { TelegramInbox } from './telegram-inbox.entity';
 import { TelegramOutbox } from './telegram-outbox.entity';
@@ -523,7 +524,9 @@ export class TelegramService implements OnModuleDestroy {
           continue;
         }
         try {
-          await this.client.sendMessage(row.chatId, row.text, this.abort?.signal);
+          // La red de seguridad: una respuesta guardada antes (o pendiente en la bandeja
+          // de salida) no puede enviar identificadores tecnicos ni JSON crudo.
+          await this.client.sendMessage(row.chatId, sanitizeTelegramText(row.text), this.abort?.signal);
           await outbox.update({ id: row.id }, { state: 'sent', lastError: null, nextAttemptAt: 0 });
         } catch (error) {
           const attempts = Math.min(row.attempts + 1, MAX_ATTEMPTS);

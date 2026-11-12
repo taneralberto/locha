@@ -186,7 +186,9 @@ describe('Flujo completo de deudas', () => {
     const confirmed = await delivered(2);
 
     expect(confirmed).toContain('Registrado');
-    expect(confirmed).toMatch(/Deuda: [\da-f-]{36}/);
+    expect(confirmed).toContain('deuda de 8.00 USD con Carmen');
+    // El bot no muestra identificadores: el id se comprueba en la base.
+    expect(confirmed).not.toMatch(/[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/i);
     expect(await dataSource.getRepository(Debt).count()).toBe(1);
     // Crear una deuda no mueve dinero.
     expect(await dataSource.getRepository(Movement).count()).toBe(0);
@@ -266,22 +268,25 @@ describe('Flujo completo de deudas', () => {
     enqueue(1, 'le debo 8$ a Carmen');
     await delivered(1);
     enqueue(2, '/confirm');
-    const created = await delivered(2);
-    const debtId = /Deuda: ([\da-f-]{36})/.exec(created)![1]!;
+    await delivered(2);
+    // El id de la deuda se saca de la base: el bot no lo muestra.
+    const debtId = (await dataSource.getRepository(Debt).findOneByOrFail({ counterparty: 'Carmen' })).id;
 
     enqueue(3, 'le pagué 3 dólares a Carmen');
     const preview = await delivered(3);
 
     expect(preview).toContain('pago parcial');
     expect(preview).toContain('importe: 3.00 USD');
-    expect(preview).toContain('pendiente al preparar: 8.00 USD');
+    expect(preview).toContain('pendiente: 8.00 USD');
+    expect(preview).not.toContain(debtId);
     expect(await dataSource.getRepository(Movement).count()).toBe(0);
 
     enqueue(4, '/confirm');
     const confirmed = await delivered(4);
 
     expect(confirmed).toContain('Registrado: pago de 3.00 USD');
-    expect(confirmed).toContain('Movimiento: ');
+    expect(confirmed).not.toContain('Movimiento: ');
+    expect(confirmed).not.toContain(debtId);
     const movements = await dataSource.getRepository(Movement).find();
     expect(movements).toHaveLength(1);
     expect(movements[0]?.kind).toBe('expense');
@@ -359,8 +364,8 @@ describe('Flujo completo de deudas', () => {
     enqueue(1, 'le debo 8$ a Carmen');
     await delivered(1);
     enqueue(2, '/confirm');
-    const created = await delivered(2);
-    const debtId = /Deuda: ([\da-f-]{36})/.exec(created)![1]!;
+    await delivered(2);
+    const debtId = (await dataSource.getRepository(Debt).findOneByOrFail({ counterparty: 'Carmen' })).id;
 
     // El pago total sin cuenta: se pide la cuenta y no se paga nada.
     enqueue(3, 'ya le pagué todo a Carmen');
@@ -376,8 +381,9 @@ describe('Flujo completo de deudas', () => {
 
     expect(preview).toContain('pago total');
     expect(preview).toContain('importe: 8.00 USD');
-    expect(preview).toContain('pendiente al preparar: 8.00 USD');
+    expect(preview).toContain('pendiente: 8.00 USD');
     expect(preview).toContain('cuenta: Efectivo USD (USD)');
+    expect(preview).not.toContain(debtId);
 
     // El proceso se reinicia: el borrador vivo y su autorizacion siguen en la base.
     await restart();
@@ -417,8 +423,8 @@ describe('Flujo completo de deudas', () => {
     enqueue(1, 'Carmen me debe 8$');
     await delivered(1);
     enqueue(2, '/confirm');
-    const created = await delivered(2);
-    const debtId = /Deuda: ([\da-f-]{36})/.exec(created)![1]!;
+    await delivered(2);
+    const debtId = (await dataSource.getRepository(Debt).findOneByOrFail({ counterparty: 'Carmen' })).id;
 
     enqueue(3, 'Carmen me pagó 8 dólares');
     const preview = await delivered(3);
@@ -531,8 +537,8 @@ describe('Flujo completo de deudas', () => {
     enqueue(1, 'le debo 8$ a Carmen');
     await delivered(1);
     enqueue(2, '/confirm');
-    const created = await delivered(2);
-    const debtId = /Deuda: ([\da-f-]{36})/.exec(created)![1]!;
+    await delivered(2);
+    const debtId = (await dataSource.getRepository(Debt).findOneByOrFail({ counterparty: 'Carmen' })).id;
 
     enqueue(3, 'le pagué 3 dólares a Carmen');
     await delivered(3);
@@ -566,7 +572,7 @@ describe('Flujo completo de deudas', () => {
     });
     enqueue(5, 'le pagué 3 dólares a Carmen');
     const preview = await delivered(5);
-    expect(preview).toContain('pendiente al preparar: 7.00 USD');
+    expect(preview).toContain('pendiente: 7.00 USD');
 
     enqueue(6, '/confirm');
     const confirmed = await delivered(6);

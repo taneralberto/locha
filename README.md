@@ -191,13 +191,16 @@ usuario, un mensaje editado o un mensaje que no sea de texto se ignoran **sin gu
 | Comando                | Qué hace                                                       |
 | ---------------------- | -------------------------------------------------------------- |
 | `/help`, `/start`      | Lista los comandos disponibles                                   |
-| `/accounts`            | Lista tus cuentas (id, nombre, moneda, si están activas)         |
+| `/accounts`            | Lista tus cuentas (nombre, moneda, si están activas)            |
 | `/balances [YYYY-MM-DD]` | Saldos por cuenta a una fecha inclusiva (hoy en Caracas por defecto) |
 | `/budgets [YYYY-MM-DD]` | Presupuestos activos: límite, gastado y restante por alcance/moneda |
-| `/goals [id]`          | Progreso nominal actual de todas las metas o una meta |
+| `/goals [nombre]`      | Progreso nominal actual de todas las metas o de las de un nombre |
 | `/savings`             | Saldo real, reservado virtual, disponible y déficit actuales |
-| `/debts [id]`          | Deudas registradas y su pendiente, por dirección y moneda (solo lectura) |
-| `/recent`              | Lista los últimos movimientos, con su **id de movimiento**      |
+| `/debts [persona]`     | Deudas registradas y su pendiente, por dirección y moneda (solo lectura) |
+| `/recent`              | Lista los últimos movimientos                                   |
+| `/movement [ultimo]`   | Original y estado efectivo del último movimiento (o del que se nombre) |
+| `/history [ultimo]`    | Historial auditado del último movimiento (o del que se nombre)  |
+| `/reconciliations [cuenta]` | Conciliaciones de una cuenta (por nombre) o de todas (solo lectura) |
 | `/summary`             | Totales del mes actual                                           |
 | `/summary 2026-11`     | Totales de un mes concreto (`YYYY-MM`)                           |
 | `/usage`               | Consumo **reservado** de inferencia del día                      |
@@ -205,7 +208,15 @@ usuario, un mensaje editado o un mensaje que no sea de texto se ignoran **sin gu
 | `/cancel`              | Descarta la operación pendiente                                  |
 
 Cualquier otro comando con `/` muestra la ayuda. **Las consultas nunca llaman al modelo**:
-`/accounts`, `/balances`, `/budgets`, `/goals`, `/savings`, `/debts`, `/recent`, `/summary` y `/usage` se calculan con los datos guardados.
+`/accounts`, `/balances`, `/budgets`, `/goals`, `/savings`, `/debts`, `/recent`, `/movement`,
+`/history`, `/reconciliations`, `/summary` y `/usage` se calculan con los datos guardados.
+
+**El bot no muestra identificadores.** Sus respuestas hablan de personas, cuentas, fechas,
+importes, direcciones y estados; los ids, las claves y el JSON crudo son de la CLI y de la
+base de datos. `/goals` y `/debts` se consultan por **nombre** (comparación canónica y
+exacta): si hay varias metas o deudas con ese nombre se muestran todas, sin elegir ninguna.
+`/movement` y `/history` sin argumento muestran el **último** movimiento. Un id escrito
+sigue funcionando (es lo que se usaba antes), pero no se muestra en la respuesta.
 
 `/summary` muestra los **totales de la actividad registrada** en el mes (ingresos, gastos y
 neto por moneda) con importes exactos. **No son el saldo de tus cuentas**: excluyen
@@ -219,8 +230,17 @@ reservados, el costo reservado frente al presupuesto (en microUSD) y la reserva 
 llamada. Es la **reserva local conservadora**, no la factura del proveedor: la propia
 respuesta lo dice. No llama al proveedor, no reserva nada y no toca el borrador pendiente.
 
-La respuesta de un registro incluye el **id del movimiento** (`Movimiento: <id>`), que es el
-mismo que aparece en `/recent`.
+La respuesta de un registro dice **qué** se registró (tipo, importe, cuenta, fecha), no su
+identificador. Para saber el identificador de un movimiento hay que ir a la CLI
+(`movement:recent`, `movement:show`).
+
+Cuando hay **varias deudas posibles** (la misma persona, dirección y moneda), el bot no
+elige ninguna: muestra una lista numerada con la fecha, el pendiente, la dirección y la
+persona de cada una, y el usuario responde con el número (`2`, `la 2`, `opción 2`). La
+elección se resuelve en el backend con el id que estaba guardado —no con el que proponga
+el modelo— y sobrevive a un reinicio. La lista se guarda en la columna `debtPayload` del
+borrador (campo `choices`): **no hay migración nueva**. Una elección nunca autoriza un
+pago total: el importe y la cuenta se siguen pidiendo.
 
 ## Base de datos
 
@@ -398,10 +418,13 @@ npm run movement:void -- --source-key anulacion-1 --movement ID_MOVIMIENTO --exp
   no recalcula nada. Una actividad/corrección retroactiva posterior puede causar
   **deriva** respecto del objetivo: no es una instantánea que sustituya el historial.
   Las nuevas correcciones también requieren cuenta activa; las lecturas incluyen inactivas.
-- **Telegram solo lectura:** `/movement <id>`, `/history <id>` y
-  `/reconciliations [id-cuenta]`, sin IA ni cambios al borrador pendiente. `/recent`
+- **Telegram solo lectura:** `/movement [ultimo]`, `/history [ultimo]` y
+  `/reconciliations [cuenta]`, sin IA ni cambios al borrador pendiente. `/recent`
   muestra categoría. Las consultas nuevas están acotadas al límite de Telegram y
-  ofrecen el comando CLI para el detalle completo.
+  ofrecen el comando CLI para el detalle completo. El bot **no muestra identificadores**:
+  las consultas se hacen por nombre (`/goals [nombre]`, `/debts [persona]`,
+  `/reconciliations [cuenta]`) y, sin argumento, `/movement` y `/history` muestran el
+  último movimiento. Un id escrito sigue funcionando, pero no se muestra.
 - Todos estos comandos B2 rechazan flags desconocidos, duplicados, incompletos y
   posicionales inesperados. Validación/conflicto termina con código 1 sin escrituras.
 
@@ -542,7 +565,7 @@ npm run savings:history -- --account ID_CUENTA_USDT --goal ID_META
   también en replay; no bloquean ni atribuyen causalidad a una operación concreta.
   Cada meta con reserva positiva en una cuenta deficitaria muestra
   **«reserva nominal con cuentas deficitarias»**. No se inventa reparto/prorrateo del faltante.
-- Telegram solo consulta `/goals [ID]`, `/savings`, y `/balances` actuales: deterministas,
+- Telegram solo consulta `/goals [nombre]`, `/savings`, y `/balances` actuales: deterministas,
   acotadas por filas con alternativa CLI, sin IA ni modificar pendiente/allowance.
   Un registro exitoso de captura (`/confirm`) añade advertencia actual al entregar;
   no cambia el reply durable original ni duplica movimientos. El outbox fija el texto
@@ -713,18 +736,20 @@ preparación para producción.
   compatible (misma contraparte, dirección y moneda): si el usuario cambia de persona,
   se busca de nuevo entre todas las deudas. Un id propuesto por el modelo nunca resuelve
   nada. Sin id, la deuda se busca por contraparte, dirección y moneda exactas
-  (comparación canónica del dominio); si hay varias, se pregunta con una lista acotada
-  de ids y el usuario elige; si falta la contraparte, la dirección o la moneda, se
+  (comparación canónica del dominio); si hay varias, se pregunta con una lista **numerada**
+  (fecha, pendiente, dirección y persona; **sin ids**) y el usuario elige con el número;
+  si falta la contraparte, la dirección o la moneda, se
   pregunta y no se inventa nada. El id de una **cuenta** es una cuenta: escribirlo
   nombra la cuenta del pago y no cuenta como id de deuda.
 - **La consulta es de solo lectura.** «cuáles son mis deudas», «quién me debe» o «qué le
   debo a Carmen» se responden con los datos guardados, **sin llamar al modelo para la
   cuenta** y **sin tocar el borrador pendiente**: la fila del borrador queda byte por byte
   igual. Las consultas se atienden **antes** que cualquier conversión, operación múltiple
-  o descarte. `/debts` y `/debts <id>` hacen lo mismo desde el comando, con el mismo
+  o descarte. `/debts` y `/debts [persona]` hacen lo mismo desde el comando, con el mismo
   formateador (`src/debts/debt-format.ts`): separa lo que debo de lo que me deben, muestra
-  id, contraparte, original, pagado, pendiente y estado, y da totales **por dirección y
-  moneda, nunca compensados** entre direcciones ni entre monedas.
+  contraparte, original, pagado, pendiente y estado, y da totales **por dirección y
+  moneda, nunca compensados** entre direcciones ni entre monedas. La CLI añade el id de
+  cada fila; el bot no lo muestra.
 - **Salvaguarda determinista.** Si el mensaje habla de una deuda («debo», «me debe»,
   «adeudo», «préstamo») pero el modelo lo clasifica como gasto o ingreso, **no se registra
   nada**: se pregunta qué quiso decir. Un gasto normal con un comercio no se confunde con
@@ -735,6 +760,13 @@ preparación para producción.
   JSON roto se pide de nuevo, sin mostrar nada del mensaje original). El texto original se
   borra igual que en las operaciones ordinarias, y la revocación de Telegram sigue
   cancelando el borrador por su origen.
+- **La lista de deudas por elegir vive en ese mismo JSON.** El campo `choices` guarda, en
+  orden, el id de cada deuda posible, su etiqueta legible y la **foto** de lo que se le
+  mostró (el pendiente y su moneda): tope, 20. Con esa foto se comprueba que la opción
+  siga valiendo; si el pendiente cambió, la lista se refresca (sin cambiar el orden) y se
+  vuelve a preguntar. Es un campo opcional: los borradores anteriores se leen con la
+  lista vacía y con las opciones sin foto, y en ese caso la elección no se aplica: se
+  refresca la lista. **No hay migración nueva**: ni la base ni el historial se reescriben.
 - **El contexto del modelo está acotado.** El mensaje del usuario va **entero**; lo que se
   recorta es el contexto (cuentas, deudas candidatas y borrador), siempre por líneas
   enteras y **avisando**: si la lista de deudas se corta, el modelo no debe elegir ninguna
@@ -742,13 +774,13 @@ preparación para producción.
   toca el límite de entrada ni el de salida.
 
 Pruebas dedicadas (solo SQLite temporal, sin proveedores ni base real):
-`test/debt-capture.spec.ts`, `test/debt-telegram.spec.ts` y las pruebas de esquema y
-prompt en `test/openrouter.interpreter.spec.ts`.
+`test/debt-capture.spec.ts`, `test/debt-telegram.spec.ts`, `test/bot-presentation.spec.ts` y
+las pruebas de esquema y prompt en `test/openrouter.interpreter.spec.ts`.
 
 ```bash
 npm run typecheck
 npm run build
-npm test -- --runInBand test/debt-capture.spec.ts test/debt-telegram.spec.ts test/debt-migration.spec.ts test/openrouter.interpreter.spec.ts
+npm test -- --runInBand test/debt-capture.spec.ts test/debt-telegram.spec.ts test/bot-presentation.spec.ts test/debt-migration.spec.ts test/openrouter.interpreter.spec.ts
 ```
 
 ### Unidad 3 (deudas): CLI de deudas, cierre y documentación (aceptada)
@@ -815,7 +847,8 @@ La conversación por Telegram sigue siendo la vía natural, con las mismas regla
   «ya le pagué todo a Carmen» sí, «no le pagué todo», «le pagué a todos», «voy a pagar
   todo», «ya le pagué todo a Carmen. No, solo cinco» no. Si el mensaje no nombra cuenta, se
   la pide: no la inventa. Con dos cuentas activas del mismo nombre se pregunta.
-- **`/debts` y `/debts <id>`** muestran lo mismo que la CLI, con el mismo formateador, y son
+- **`/debts` y `/debts [persona]`** muestran lo mismo que la CLI, con el mismo formateador
+  (salvo el id, que el bot no muestra), y son
   de solo lectura: no llaman al modelo y no tocan el borrador pendiente. Una consulta en
   lenguaje natural («cuáles son mis deudas») tampoco lo toca.
 - **El pendiente se congela al preparar el pago.** Si entre el resumen y el `/confirm`
@@ -1165,6 +1198,20 @@ El ciclo tiene **tres pasos separados**: aceptar (durable), procesar y entregar.
   texto no se queda pendiente aunque la entrega estuviera retrasada.
 - El texto original se borra de la bandeja de entrada cuando la actualización queda
   procesada, y el texto de una respuesta descartada se vacía.
+
+### Presentación (lo que ve el usuario)
+
+- **Ninguna respuesta lleva identificadores técnicos.** Las respuestas nuevas se escriben
+  con nombres, fechas, importes, direcciones y estados; los ids, las claves y el JSON
+  crudo son de la CLI y de la base de datos.
+- **Hay una red de seguridad al final del camino** (`src/telegram/bot-text.ts`): al
+  construir la respuesta y otra vez justo antes de enviarla, se quitan los identificadores
+  y las claves que quedaran. Así, una respuesta durable guardada antes o una respuesta
+  pendiente en la bandeja de salida **no pueden** enseñar ids aunque sean anteriores a
+  este cambio. Si una respuesta vieja solo tiene contenido técnico (el JSON crudo de una
+  entidad), se sustituye por un aviso que remite a las consultas actuales: no se enseña ni
+  un id ni un campo interno. **La base no se reescribe**: el texto original sigue en el
+  historial durable.
 
 ### Red
 

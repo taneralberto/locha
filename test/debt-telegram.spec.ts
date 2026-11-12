@@ -150,7 +150,7 @@ describe('Telegram de deudas (unidad 2)', () => {
     };
   }
 
-  it('/debts y /debts [id] son deterministas, no llaman al modelo y no tocan el pendiente', async () => {
+  it('/debts y /debts [persona] son deterministas, no llaman al modelo y no tocan el pendiente', async () => {
     const debt = (
       await debts.create({
         sourceKey: 'deuda',
@@ -174,20 +174,28 @@ describe('Telegram de deudas (unidad 2)', () => {
 
     expect(list).toContain('Lo que debo');
     expect(list).toContain('Lo que me deben');
-    expect(list).toContain(debt.id);
-    expect(list).toContain(receivable.id);
+    expect(list).toContain('Carmen');
+    expect(list).not.toContain(debt.id);
+    expect(list).not.toContain(receivable.id);
     expect(list).toContain('pendiente 10.00');
     expect(list).toContain('pendiente 25.00');
     expect(list).toContain('lo que debo: 10.00 USD');
     expect(list).toContain('lo que me deben: 25.00 USD');
     expect(interpreter.requests).toHaveLength(0);
 
-    const one = await answer(`/debts ${debt.id}`);
-    expect(one).toContain(debt.id);
+    // Por persona: se muestran todas sus deudas, sin ids.
+    const one = await answer('/debts Carmen');
+    expect(one).toContain('Carmen');
     expect(one).not.toContain(receivable.id);
+    expect(one).not.toContain(debt.id);
+    // El id escrito sigue funcionando, pero no se muestra.
+    const byId = await answer(`/debts ${debt.id}`);
+    expect(byId).toContain('Carmen');
+    expect(byId).not.toContain(debt.id);
 
     const missing = await answer('/debts no-existe');
-    expect(missing).toContain('No existe la deuda');
+    expect(missing).toContain('No hay ninguna deuda');
+    expect(missing).not.toContain('no-existe');
 
     expect(await dataSource.getRepository(Capture).count()).toBe(0);
     expect(await dataSource.getRepository(Movement).count()).toBe(0);
@@ -200,7 +208,7 @@ describe('Telegram de deudas (unidad 2)', () => {
     expect(help).toContain('Las deudas se crean y se pagan escribiendo en lenguaje natural');
   });
 
-  it('crea una deuda por el bot y la respuesta durable lleva el id de la deuda', async () => {
+  it('crea una deuda por el bot y la respuesta durable no lleva identificadores', async () => {
     interpreter.responses.push({
       amount: '8.00',
       currency: 'USD',
@@ -217,7 +225,8 @@ describe('Telegram de deudas (unidad 2)', () => {
 
     const confirmed = await answer('/confirm', 'telegram:deuda:confirm');
     expect(confirmed).toContain('Registrado');
-    expect(confirmed).toContain('Deuda:');
+    expect(confirmed).toContain('deuda de 8.00 USD con Carmen');
+    expect(confirmed).not.toContain('Deuda:');
     expect(await dataSource.getRepository(Debt).count()).toBe(1);
     expect(await dataSource.getRepository(Movement).count()).toBe(0);
   });
@@ -259,12 +268,15 @@ describe('Telegram de deudas (unidad 2)', () => {
     });
 
     const preview = await answer('le pagué 2 dólares a Carmen');
-    expect(preview).toContain(debt.id);
+    expect(preview).toContain('Carmen');
+    expect(preview).not.toContain(debt.id);
 
     const confirmed = await answer('/confirm', 'telegram:deuda:pago');
     expect(confirmed).toContain('Registrado');
-    expect(confirmed).toContain('Pago:');
-    expect(confirmed).toContain('Movimiento:');
+    expect(confirmed).toContain('pago de 2.00 USD de la deuda con Carmen');
+    expect(confirmed).not.toContain('Pago:');
+    expect(confirmed).not.toContain('Movimiento:');
+    expect(confirmed).not.toContain(debt.id);
     expect(confirmed).toContain('ADVERTENCIA');
 
     // La advertencia es diagnostico de entrega: el reply durable no la lleva.

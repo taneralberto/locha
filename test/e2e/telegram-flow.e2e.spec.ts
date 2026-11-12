@@ -152,12 +152,14 @@ describe('Flujo completo del bot de Telegram', () => {
     client.enqueue(update(2, '/confirm'));
     await waitUntil(() => client.sent.length === 2);
     expect(client.lastSent?.text).toContain('Registrado');
-    expect(client.lastSent?.text).toContain('Movimiento: ');
+    expect(client.lastSent?.text).not.toContain('Movimiento: ');
 
     const movements = await dataSource.getRepository(Movement).find();
     expect(movements).toHaveLength(1);
     expect(movements[0]?.amountMinor).toBe(200n);
     expect(movements[0]?.sourceKey).toMatch(/^capture:/);
+    // El id del movimiento no sale en el chat: se comprueba en la base.
+    expect(client.lastSent?.text).not.toContain(movements[0]?.id as string);
 
     client.enqueue(update(3, '/summary 2026-11'));
     await waitUntil(() => client.sent.length === 3);
@@ -185,9 +187,10 @@ describe('Flujo completo del bot de Telegram', () => {
     client.enqueue(update(62, '/savings'));
     await waitUntil(() => client.sent.length === 3);
     expect(client.lastSent?.text).toContain('saldo -1.00 | reservado 1.00 | disponible -2.00 | deficit 2.00');
-    client.enqueue(update(63, `/goals ${goal.id}`));
+    client.enqueue(update(63, '/goals Fondo'));
     await waitUntil(() => client.sent.length === 4);
     expect(client.lastSent?.text).toContain('reserva nominal con cuentas deficitarias');
+    expect(client.lastSent?.text).not.toContain(goal.id);
     client.enqueue(update(64, '/balances'));
     await waitUntil(() => client.sent.length === 5);
     expect(client.lastSent?.text).toContain('deficit 2.00 | ADVERTENCIA');

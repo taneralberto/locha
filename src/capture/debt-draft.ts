@@ -12,6 +12,35 @@ import type { DebtDirection } from '../debts/debt.entity';
 export const FULL_AUTHORIZATION_VERSION = 2;
 
 /**
+ * Numero maximo de opciones de una lista de deudas. Es el tope de lo que se muestra y
+ * de lo que se guarda: la lista visible y la lista guardada son siempre la misma.
+ */
+export const MAX_DEBT_CHOICES = 20;
+
+/**
+ * Una opcion de la lista de deudas: el id interno (que el usuario nunca ve), la
+ * etiqueta legible que si ve y la **foto** de lo que se le mostro.
+ *
+ * La foto (el pendiente en unidades menores y su moneda) es lo que permite comprobar
+ * que la opcion sigue valiendo: si el pendiente cambio, la lista se refresca y se
+ * vuelve a preguntar. El resto de lo que muestra la etiqueta (fecha, direccion,
+ * contraparte y descripcion) **no cambia**: la deuda no se edita.
+ *
+ * Las opciones escritas antes de existir estos campos se leen con la foto vacia: en ese
+ * caso la eleccion **no** se aplica, se refresca la lista y se vuelve a preguntar.
+ */
+export const DebtChoiceSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  /** Pendiente al mostrar la opcion, en unidades menores, como texto exacto. */
+  outstandingMinor: z.string().nullable().default(null),
+  /** Moneda del pendiente que se mostro. */
+  currency: z.string().nullable().default(null),
+});
+
+export type DebtChoice = z.infer<typeof DebtChoiceSchema>;
+
+/**
  * Datos de deuda del borrador vivo, tal como se guardan en la columna `debtPayload`.
  *
  * El borrador **vive en la misma tabla `capture`**: no hay un estado pendiente nuevo ni
@@ -48,6 +77,12 @@ export const DebtDraftSchema = z
      * anteriores a este campo, con `fullIntent` en `true` o en `false`).
      */
     fullAuthorizationVersion: z.literal(FULL_AUTHORIZATION_VERSION).nullable().default(null),
+    /**
+     * Deudas que el usuario todavia no ha elegido, **en orden**. El usuario responde
+     * con el numero de la opcion; el id guardado es el que se paga. Los borradores
+     * anteriores a este campo se leen con la lista vacia.
+     */
+    choices: z.array(DebtChoiceSchema).max(MAX_DEBT_CHOICES).default([]),
   })
   .strict();
 
