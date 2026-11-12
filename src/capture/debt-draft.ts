@@ -2,6 +2,16 @@ import { z } from 'zod';
 import type { DebtDirection } from '../debts/debt.entity';
 
 /**
+ * Version de la autorizacion de un pago total.
+ *
+ * Solo la version **2** vale: la autoriza el **mensaje entero** del usuario ("ya le
+ * pagué todo a Carmen"). Los borradores escritos antes de existir esta version se leen
+ * con la version en `null`: un borrador viejo nunca autoriza un pago total por su
+ * cuenta, ni aunque su `fullIntent` diga que si.
+ */
+export const FULL_AUTHORIZATION_VERSION = 2;
+
+/**
  * Datos de deuda del borrador vivo, tal como se guardan en la columna `debtPayload`.
  *
  * El borrador **vive en la misma tabla `capture`**: no hay un estado pendiente nuevo ni
@@ -32,6 +42,12 @@ export const DebtDraftSchema = z
      * como `true`): un borrador viejo no puede autorizar un pago total por su cuenta.
      */
     fullIntent: z.boolean().default(false),
+    /**
+     * Version de la autorizacion de pago total. Es `2` solo cuando el mensaje entero
+     * del usuario la autoriza; `null` en los borradores que no la tienen (los
+     * anteriores a este campo, con `fullIntent` en `true` o en `false`).
+     */
+    fullAuthorizationVersion: z.literal(FULL_AUTHORIZATION_VERSION).nullable().default(null),
   })
   .strict();
 

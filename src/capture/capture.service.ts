@@ -8,7 +8,7 @@ import { ConflictError, NotFoundError, ValidationError } from '../domain/errors'
 import { CURRENCY_CODES, Currency, formatAmount, isCurrency, parseAmount } from '../domain/money';
 import { DebtDirection } from '../debts/debt.entity';
 import { formatDebtReport } from '../debts/debt-format';
-import { canonicalCounterparty, DebtService, DebtView } from '../debts/debt.service';
+import { canonicalName, DebtService, DebtView } from '../debts/debt.service';
 import { FinancialService } from '../financial/financial.service';
 import { MovementKind } from '../financial/movement.entity';
 import {
@@ -23,9 +23,16 @@ import { Operation } from '../interpreter/operation.schema';
 import { Capture, CaptureKind, CaptureState } from './capture.entity';
 import { sourceKeyFor } from './source-key';
 import { CaptureEvent } from './capture-event.entity';
-import { DebtDraft, directionLabel, parseDebtDraft, serializeDebtDraft } from './debt-draft';
+import { DebtDraft, directionLabel, FULL_AUTHORIZATION_VERSION, parseDebtDraft, serializeDebtDraft } from './debt-draft';
 import { BudgetExhaustedError, DEFAULT_TIME_ZONE, InferenceBudgetService } from './inference-budget.service';
-import { mentionsConversion, mentionsDebt, fullPaymentIntent, mentionsMultipleAmounts } from './text-signals';
+import {
+  accountPhrase,
+  amountsInText,
+  completePaymentForm,
+  mentionsConversion,
+  mentionsDebt,
+  mentionsMultipleAmounts,
+} from './text-signals';
 
 /** Longitud maxima del texto original que se guarda mientras el borrador esta vivo. */
 const MAX_SOURCE_TEXT_LENGTH = 1000;
@@ -252,7 +259,7 @@ export class CaptureService {
     // Una consulta de deudas es de solo lectura: va antes de cualquier conversion,
     // operacion multiple o descarte, y no toca el borrador pendiente.
     if (operation.kind === 'debt_query') {
-      return this.debtQueryReply(event, input, pending, operation);
+      return this.debtQueryReply(event, input, pending, operation, accounts);
     }
 
     if (operation.kind === 'transfer' || mentionsConversion(input.text)) {
@@ -266,13 +273,18 @@ export class CaptureService {
     }
     if (operation.kind === 'unclear') {
       const draft = pending ? draftOf(pending) : emptyDraft();
-      const isDebt = draft.kind === 'debt_create' || draft.kind === 'debt_settle';
-      const problems = isDebt ? validateDebtDraft(draft, accounts) : validateDraft(draft, accounts);
+      // Un mensaje que no se entiende no conserva ni la autorizacion de pago total ni el
+      // importe derivado de ella: se vuelve a pedir el pago.
+      const cleared = withoutFullAuthorization(draft);
+      const isDebt = cleared.kind === 'debt_create' || cleared.kind === 'debt_settle';
+      const problems = isDebt
+        ? validateDebtDraft(cleared, accounts)
+        : validateDraft(cleared, accounts);
       return this.saveDraft(
         event,
         input,
         pending,
-        draft,
+        cleared,
         'awaiting_details',
         unclearReply(problems, accounts),
       );
@@ -347,6 +359,7 @@ export class CaptureService {
       description: normalizeDescription(operation.description),
       expectedOutstandingMinor: null,
       fullIntent: false,
+      fullAuthorizationVersion: null,
     };
     const draft: Draft = {
       kind: 'debt_create',
@@ -396,9 +409,10 @@ export class CaptureService {
     const counterparty = normalizeCounterparty(model?.counterparty ?? null);
     const rawCurrency = operation.currency === null ? null : operation.currency.trim();
     const modelAmount = normalizeAmount(operation.amount);
-    const accountId = operation.accountId === null ? null : operation.accountId.trim();
+    const modelAccountId = operation.accountId === null ? null : operation.accountId.trim();
     const pendingDraft = pending === null ? null : draftOf(pending);
-    const pendingDebtId = pendingDraft?.debt?.debtId ?? null;
+    const pendingDebt = pendingDraft?.debt ?? null;
+    const pendingDebtId = pendingDebt?.debtId ?? null;
 
     const resolution = await this.resolveDebtTarget({
       direction,
@@ -406,18 +420,8 @@ export class CaptureService {
       currency: rawCurrency,
       userText: input.text,
       pendingDebtId,
+      accounts,
     });
-
-    // El pago total lo autoriza el **texto del usuario**, no el modelo. Se conserva la
-    // autorizacion del borrador solo si el objetivo sigue siendo el mismo: cambiar de
-    // deuda o de persona la borra. Una frase que niega el pago completo la revoca.
-    const intent = fullPaymentIntent(input.text);
-    const sameTarget =
-      resolution.kind === 'resolved' &&
-      pendingDebtId !== null &&
-      resolution.debt.debt.id === pendingDebtId;
-    const pendingFull = pendingDraft?.debt?.fullIntent === true && sameTarget;
-    const groundedFull = intent === 'yes' || (intent === 'none' && pendingFull);
 
     const debt: DebtDraft = {
       version: 1,
@@ -428,17 +432,18 @@ export class CaptureService {
       settlementMode: null,
       amount: modelAmount,
       currency: rawCurrency,
-      accountId,
+      accountId: modelAccountId,
       occurredOn: resolveDate(operation.occurredOn, defaultDate),
       description: normalizeDescription(operation.description),
       expectedOutstandingMinor: null,
-      fullIntent: resolution.kind === 'resolved' ? groundedFull : intent === 'yes',
+      fullIntent: false,
+      fullAuthorizationVersion: null,
     };
     const draft: Draft = {
       kind: 'debt_settle',
       amount: debt.amount,
       currency: debt.currency,
-      accountId,
+      accountId: modelAccountId,
       occurredOn: debt.occurredOn,
       description: debt.description,
       debt,
@@ -474,24 +479,130 @@ export class CaptureService {
     debt.currency = rawCurrency ?? debtCurrency;
     draft.currency = debt.currency;
 
+    // ---- La autorizacion de un pago total la da el mensaje entero ----
+    // La forma tiene que describir TODO el mensaje ("ya le pagué todo a Carmen") y la
+    // persona que nombra tiene que ser la contraparte de la deuda resuelta. Cualquier
+    // otra cosa (una negacion, una duda, otra frase, otra persona) no autoriza nada.
+    const form = completePaymentForm(input.text);
+    const sameParty =
+      form === null ||
+      form.party === null ||
+      canonicalName(form.party) === canonicalName(target.debt.counterparty);
+
+    // ---- La cuenta la nombra el usuario ----
+    // La cola de la forma ("desde la cuenta Efectivo USD"), la formula ("en la cuenta
+    // Efectivo USD") o el nombre a secas ("Efectivo USD"). Si el nombre no resuelve a
+    // una sola cuenta activa **no** se reemplaza por la que propone el modelo: se
+    // pregunta cual es.
+    const phrase = accountPhrase(input.text);
+    const formAccountName = form?.account ?? null;
+    const accountText = formAccountName ?? phrase;
+    const named = groundAccount(accountText ?? input.text.trim(), accounts);
+    const accountNamed = accountText !== null || named.ambiguous;
+    // La cuenta que nombra el usuario manda sobre la que propone el modelo. En un pago
+    // total la cuenta tiene que salir del texto: el modelo no la inventa.
+    const modelAccount =
+      form === null && !accountNamed
+        ? accounts.find((candidate) => candidate.id === modelAccountId)
+        : undefined;
+    const accountId = named.account?.id ?? modelAccount?.id ?? null;
+
+    // La aclaracion de cuenta: el mensaje entero tiene que ser el nombre de una cuenta
+    // activa (o su id) o la formula "en la cuenta X". La cola de una forma completa
+    // **no** es una aclaracion: un mensaje con forma no hereda nada.
+    const clarification = groundAccount(phrase ?? input.text.trim(), accounts);
+
+    // La forma con una cuenta nombrada solo autoriza si esa cuenta existe, es unica y
+    // opera en la moneda del pago: una cuenta que no existe o que son dos no autoriza
+    // un pago del pendiente entero.
+    const accountUsable =
+      named.account !== null && named.account.currency === paymentCurrency;
+    const authorized =
+      form !== null && sameParty && (formAccountName === null || accountUsable);
+    // Un mensaje con forma completa que no autoriza (la persona no es la contraparte o
+    // la cuenta que nombra no vale) no hereda nada ni deja ningun importe.
+    const invalidForm = form !== null && !authorized;
+
+    // ---- Del borrador anterior solo se hereda el campo que faltaba ----
+    // La autorizacion anterior sobrevive unicamente cuando el borrador estaba esperando
+    // la cuenta y este mensaje entero **es** esa cuenta: cualquier otro mensaje (una
+    // negacion, un importe, una frase de mas, una forma) la deja sin efecto.
+    const inherited =
+      !authorized &&
+      form === null &&
+      clarification.account !== null &&
+      pending?.state === 'awaiting_details' &&
+      pendingDebt?.kind === 'debt_settle' &&
+      pendingDebt.fullIntent === true &&
+      pendingDebt.fullAuthorizationVersion === FULL_AUTHORIZATION_VERSION &&
+      pendingDebt.accountId === null &&
+      pendingDebt.debtId === target.debt.id;
+    const full = authorized || inherited;
+
+    if (form !== null && !sameParty) {
+      problems.push({
+        field: 'counterparty',
+        message: `el mensaje nombra a "${form.party}" y la deuda es con "${target.debt.counterparty}"`,
+      });
+    }
+
     // Modo e importe. El `settlementMode` del modelo es una lectura, no una
-    // autorizacion: sin importe y sin que el usuario diga que paga todo, se pregunta.
-    // Un importe explicito es un pago parcial; si coincide con el pendiente, salda la
-    // deuda igual.
+    // autorizacion: el modo lo decide la autorizacion del texto y el importe lo dice el
+    // usuario. Un importe explicito es un pago parcial; si coincide con el pendiente,
+    // salda la deuda igual.
     const outstanding = formatAmount(target.outstandingMinor, debtCurrency);
     let mode: 'full' | 'partial' | null = null;
     let paymentAmount: string | null = modelAmount;
-    if (modelAmount === null) {
-      if (groundedFull) {
+    if (full) {
+      if (inherited) {
+        // La autorizacion viene del borrador: el importe sigue siendo el pendiente.
+        mode = 'full';
+        paymentAmount = outstanding;
+      } else if (modelAmount === null) {
         mode = 'full';
         paymentAmount = outstanding;
       } else {
-        problems.push({
-          field: 'amount',
-          message:
-            'falta el importe del pago: di cuanto pagaste o di explicitamente que pagaste todo (por ejemplo, "ya le pagué todo")',
-        });
+        const minor = tryParseAmount(modelAmount, paymentCurrency);
+        if (minor === null) {
+          problems.push({ field: 'amount', message: `el importe "${modelAmount}" no es valido` });
+          mode = 'partial';
+        } else if (minor > target.outstandingMinor) {
+          problems.push({
+            field: 'amount',
+            message: `el importe "${modelAmount}" supera el pendiente de la deuda (${outstanding})`,
+          });
+          mode = 'partial';
+        } else if (minor !== target.outstandingMinor) {
+          problems.push({
+            field: 'amount',
+            message: `dijiste que se pago todo, pero el importe "${modelAmount}" no coincide con el pendiente de la deuda (${outstanding})`,
+          });
+          mode = 'partial';
+        } else {
+          mode = 'full';
+          paymentAmount = outstanding;
+        }
       }
+    } else if (invalidForm) {
+      // El mensaje es un pago del pendiente entero que el backend no puede preparar:
+      // no se hereda nada y el importe que propone el modelo no se usa. Se revoca y se
+      // vuelve a pedir el pago.
+      mode = null;
+      paymentAmount = null;
+      problems.push({
+        field: 'mode',
+        message:
+          'el mensaje dice que se pago todo pero no se puede preparar el pago: envialo otra vez con la persona y la cuenta',
+      });
+    } else if (modelAmount === null) {
+      // Sin autorizacion y sin importe: se pregunta el importe.
+      problems.push({
+        field: 'amount',
+        message:
+          'falta el importe del pago: di cuanto pagaste o di explicitamente que pagaste todo (por ejemplo, "ya le pagué todo")',
+      });
+      mode = null;
+      paymentAmount = null;
     } else {
       const minor = tryParseAmount(modelAmount, paymentCurrency);
       if (minor === null) {
@@ -503,15 +614,18 @@ export class CaptureService {
           message: `el importe "${modelAmount}" supera el pendiente de la deuda (${outstanding})`,
         });
         mode = 'partial';
-      } else if (groundedFull && minor !== target.outstandingMinor) {
+      } else if (
+        minor === target.outstandingMinor &&
+        !amountWritten(input.text, modelAmount, paymentCurrency)
+      ) {
+        // El importe es el pendiente entero y el usuario no lo escribio: es el importe
+        // del borrador anterior, no un pago dicho ahora. Se pregunta cuanto se pago.
         problems.push({
           field: 'amount',
-          message: `dijiste que se pago todo, pero el importe "${modelAmount}" no coincide con el pendiente de la deuda (${outstanding})`,
+          message: `el importe "${modelAmount}" es el pendiente completo de la deuda (${outstanding}): di cuanto pagaste`,
         });
-        mode = 'partial';
-      } else if (groundedFull) {
-        mode = 'full';
-        paymentAmount = outstanding;
+        mode = null;
+        paymentAmount = null;
       } else {
         mode = 'partial';
       }
@@ -519,7 +633,10 @@ export class CaptureService {
 
     const account = accountId ? accounts.find((candidate) => candidate.id === accountId) : undefined;
     if (!account) {
-      problems.push({ field: 'account', message: 'falta la cuenta' });
+      problems.push({
+        field: 'account',
+        message: accountProblem(accountText ?? input.text.trim(), accountText, named.ambiguous),
+      });
     } else if (account.currency !== paymentCurrency) {
       problems.push({
         field: 'currency',
@@ -539,9 +656,12 @@ export class CaptureService {
     debt.debtId = target.debt.id;
     debt.settlementMode = mode;
     debt.amount = paymentAmount;
+    debt.accountId = accountId;
     debt.expectedOutstandingMinor = target.outstandingMinor.toString();
-    debt.fullIntent = groundedFull;
+    debt.fullIntent = full;
+    debt.fullAuthorizationVersion = full ? FULL_AUTHORIZATION_VERSION : null;
     draft.amount = debt.amount;
+    draft.accountId = debt.accountId;
 
     if (problems.length > 0) {
       return this.saveDraft(
@@ -577,8 +697,9 @@ export class CaptureService {
     currency: string | null;
     userText: string;
     pendingDebtId: string | null;
+    accounts: AccountOption[];
   }): Promise<TargetResolution> {
-    const written = idsInText(input.userText);
+    const written = idsInText(input.userText, input.accounts);
     if (written.length > 1) {
       // Varias deudas escritas en este mensaje: la ambiguedad se conserva, no se elige.
       return {
@@ -695,6 +816,7 @@ export class CaptureService {
     input: NormalizedRequest,
     pending: Capture | null,
     operation: Operation,
+    accounts: AccountOption[],
   ): Promise<CaptureOutcome> {
     const model = operation.debt;
     const direction = model?.direction ?? null;
@@ -703,14 +825,14 @@ export class CaptureService {
     const currency = operation.currency === null ? null : operation.currency.trim();
     const rows = await this.debts.list();
 
-    const written = idsInText(input.text);
+    const written = idsInText(input.text, accounts);
     const selected = written.length > 0
       ? rows.filter((row) => written.includes(row.debt.id))
       : rows.filter(
           (row) =>
             (direction === null || row.debt.direction === direction) &&
             (counterparty === null ||
-              canonicalCounterparty(row.debt.counterparty) === canonicalCounterparty(counterparty)) &&
+              canonicalName(row.debt.counterparty) === canonicalName(counterparty)) &&
             (currency === null || row.debt.currency === currency) &&
             (status === null ? row.status !== 'paid' : row.status === status),
         );
@@ -847,11 +969,13 @@ export class CaptureService {
         draft.kind === 'debt_create'
           ? 'Faltan datos para registrar la deuda:'
           : 'Faltan datos para registrar el pago:';
+      // Un pago total sin autorizacion vigente no se queda guardado como tal: la
+      // invalidacion se persiste para que el borrador no pueda volver a confirmar.
       return this.saveDraft(
         event,
         input,
         pending,
-        draft,
+        withoutFullAuthorization(draft),
         'awaiting_details',
         detailsReply(problems, accounts, title),
       );
@@ -1299,10 +1423,16 @@ function toPendingOperation(capture: Capture): PendingOperation {
   return pending;
 }
 
-/** Ids de deuda que el usuario **escribio** en su mensaje. */
-function idsInText(text: string): string[] {
+/**
+ * Ids de deuda que el usuario **escribio** en su mensaje. El id de una cuenta no es un
+ * id de deuda: escribirlo nombra la cuenta, no cambia el objetivo del pago.
+ */
+function idsInText(text: string, accounts: AccountOption[]): string[] {
   const matches = text.match(/[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/gi) ?? [];
-  return [...new Set(matches.map((value) => value.toLowerCase()))];
+  const accountIds = new Set(accounts.map((account) => account.id.toLowerCase()));
+  return [...new Set(matches.map((value) => value.toLowerCase()))].filter(
+    (id) => !accountIds.has(id),
+  );
 }
 
 /**
@@ -1322,7 +1452,7 @@ function contradicts(
   }
   if (
     input.counterparty !== null &&
-    canonicalCounterparty(input.counterparty) !== canonicalCounterparty(debt.debt.counterparty)
+    canonicalName(input.counterparty) !== canonicalName(debt.debt.counterparty)
   ) {
     return true;
   }
@@ -1519,9 +1649,10 @@ function validateDebtDraft(draft: Draft, accounts: AccountOption[]): DraftProble
   if (debt.debtId === null) {
     problems.push({ field: 'debtId', message: 'falta la deuda que se quiere pagar' });
   }
-  if (debt.settlementMode === 'full' && debt.fullIntent !== true) {
-    // Un pago total solo es valido si el usuario dijo que pago todo. Los borradores
-    // escritos antes de existir la autorizacion no la tienen: se piden de nuevo.
+  if (debt.settlementMode === 'full' && !hasFullAuthorization(debt)) {
+    // Un pago total solo es valido si el mensaje entero del usuario lo autorizo. Los
+    // borradores escritos antes de existir la autorizacion no la tienen: se piden de
+    // nuevo, aunque su `fullIntent` diga que si.
     problems.push({
       field: 'mode',
       message:
@@ -1558,6 +1689,94 @@ function tryParseAmount(value: string, currency: Currency): bigint | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * `true` cuando el borrador tiene una autorizacion de pago total vigente: la que da el
+ * mensaje entero del usuario. Un borrador escrito antes de existir esa autorizacion
+ * (`fullIntent` en `true` pero sin version) no la tiene.
+ */
+function hasFullAuthorization(debt: DebtDraft): boolean {
+  return debt.fullIntent === true && debt.fullAuthorizationVersion === FULL_AUTHORIZATION_VERSION;
+}
+
+/**
+ * Un pago total sin autorizacion vigente (un borrador viejo, o una autorizacion que el
+ * mensaje nuevo ha dejado sin efecto) no puede seguir guardado como un pago total: se
+ * borran el modo, el importe derivado y la autorizacion.
+ */
+function withoutFullAuthorization(draft: Draft): Draft {
+  const debt = draft.debt;
+  if (debt === null || (debt.settlementMode !== 'full' && !debt.fullIntent)) {
+    return draft;
+  }
+  const cleared: DebtDraft = {
+    ...debt,
+    settlementMode: null,
+    amount: null,
+    fullIntent: false,
+    fullAuthorizationVersion: null,
+  };
+  return { ...draft, amount: cleared.amount, debt: cleared };
+}
+
+/**
+ * Cuenta que nombra el usuario. El nombre tiene que ser **exacto** (comparacion
+ * canonica): el id de la cuenta tambien vale. Con dos cuentas activas del mismo nombre
+ * no se elige ninguna: se pregunta.
+ */
+function groundAccount(
+  name: string | null,
+  accounts: AccountOption[],
+): { account: AccountOption | null; ambiguous: boolean } {
+  if (name === null) {
+    return { account: null, ambiguous: false };
+  }
+  const trimmed = name.trim();
+  if (trimmed.length === 0) {
+    return { account: null, ambiguous: false };
+  }
+  const byId = accounts.find((account) => account.id.toLowerCase() === trimmed.toLowerCase());
+  if (byId) {
+    return { account: byId, ambiguous: false };
+  }
+  const canonical = canonicalName(trimmed);
+  const matches = accounts.filter((account) => canonicalName(account.name) === canonical);
+  if (matches.length === 1) {
+    return { account: matches[0]!, ambiguous: false };
+  }
+  return { account: null, ambiguous: matches.length > 1 };
+}
+
+/**
+ * Mensaje del problema de la cuenta: falta la cuenta, o la que nombra el usuario no
+ * existe o hay varias con ese nombre. Un nombre que no vale no se reemplaza por la
+ * cuenta que propone el modelo: se pregunta.
+ */
+function accountProblem(candidate: string, explicit: string | null, ambiguous: boolean): string {
+  if (ambiguous) {
+    return `falta la cuenta: hay varias cuentas con el nombre "${candidate}"`;
+  }
+  if (explicit !== null) {
+    return `falta la cuenta: la cuenta "${explicit}" no existe`;
+  }
+  return 'falta la cuenta';
+}
+
+/**
+ * `true` cuando el usuario escribio ese importe en el mensaje. Un importe que solo
+ * aparece en la respuesta del modelo (el pendiente del borrador anterior) no es el
+ * importe del pago: se pregunta.
+ */
+function amountWritten(text: string, amount: string, currency: Currency): boolean {
+  const minor = tryParseAmount(amount, currency);
+  if (minor === null) {
+    return false;
+  }
+  return amountsInText(text).some((written) => {
+    const value = tryParseAmount(written, currency);
+    return value !== null && value === minor;
+  });
 }
 
 function detailsReply(

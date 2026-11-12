@@ -93,7 +93,7 @@ export function mentionsConversion(text: string): boolean {
  * "préstamo". Un gasto normal con un comercio no se confunde con una deuda.
  */
 const DEBT_WORDING =
-  /\bdebo\b|\bme\s+debes?\b|\bme\s+deben\b|\badeudo\b|\badeud(?:[eo]|é)(?!\w)|\badeudado\b|\bdeudas?\b|\bpr[eé]stamos?\b|\bme\s+presta\w*|\bme\s+prest[oó]|\bme\s+preste\w*/i;
+  /\bdebo\b|\bme\s+debes?\b|\bme\s+deben\b|\badeudo\b|\badeud(?:[eo]|é)(?!\w)|\badeudado\b|\bdeudas?\b|\bpr[eé]stamos?\b|\bme\s+presta\w*|\bme\s+prest[oó]|\bme\s\preste\w*/i;
 
 /**
  * `true` cuando el mensaje menciona una deuda de forma explicita. No depende del
@@ -108,62 +108,174 @@ export function mentionsDebt(text: string): boolean {
 }
 
 /**
- * Formas **afirmativas** de un pago completo. El objeto del verbo tiene que ser "todo"
- * ("le pagué todo", "Carmen me pagó todo", "lo pagué completo"): "le pagué a todos" no
- * es un pago completo, es un pago a varias personas.
+ * La parte de la forma que nombra la cuenta: "desde la cuenta Efectivo USD".
  */
-const COMPLETE_PAYMENT_OBJECT =
-  /\b(?:pagu[eé]|pag[oó]|pagar|pagando|pagada|pagado)(?!\w)\s+(?:lo\s+|la\s+|los\s+|las\s+)?(?:todo|toda|todos|todas|completo|completa)\b/gi;
-
-/** "ya saldé la deuda", "liquidé la deuda", "cerré la deuda". */
-const COMPLETE_PAYMENT_DEBT =
-  /\b(?:sald[eé]|saldada|saldado|liquid[eé]|liquidada|liquidado|cerr[eé]|cerrada|cerrado)(?!\w)[^.!?]{0,20}\b(?:deuda|obligaci[oó]n|todo|toda|todos|todas)\b/gi;
-
-/** "ya está pagada", "ya está saldada". */
-const COMPLETE_PAYMENT_STATE = /\bya\s+est[aá]\s+(?:pagad[oa]|saldad[oa])\b/gi;
+const ACCOUNT_TAIL =
+  '(?:\\s+(?:desde|en|de)\\s+(?:la\\s+)?(?:cuenta\\s+)?(?<account>[^.,;!?]+))?';
 
 /**
- * Palabras que niegan o dudan de un pago completo. Son conservadoras: ante la duda se
- * pregunta al usuario en vez de pagar el pendiente entero.
+ * Las **formas completas** de un pago total ya realizado. Son las unicas que autorizan
+ * un pago del pendiente entero y el mensaje tiene que ser **una sola** de ellas: sin
+ * negacion, sin duda, sin otra frase y sin otra persona.
+ *
+ * Cada forma nombra como mucho dos cosas: la persona ("a Carmen") y la cuenta ("desde
+ * la cuenta Efectivo USD"). Lo que no entre en la forma deja el mensaje **sin
+ * autorizacion**: "no le pagué todo", "voy a pagar todo", "pagué todo excepto cinco" y
+ * "ya le pagué todo a Carmen. No, solo cinco" no son una forma completa.
  */
-const NEGATED_PAYMENT =
-  /\b(?:no|nunca|jam[aá]s|todav[ií]a|a[uú]n|casi|falta|faltan|pendiente|pendientes|excepto|menos|deber[ií]a|deb[ií]o|quiz[aá]s|tal\s+vez|creo\s+que|puede\s+que|se\s+ve)\b/i;
-
-/** Distancia maxima hacia atras para buscar la negacion de la frase. */
-const NEGATION_WINDOW = 30;
+const COMPLETE_PAYMENT_FORMS: RegExp[] = [
+  // "ya le pagué todo a Carmen"
+  new RegExp(
+    `^(?:ya\\s+)?le\\s+pagu[eé]\\s+(?:todo|toda)\\s+a\\s+(?<party>[^.,;!?]+?)${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+  // "ya le pagué todo"
+  new RegExp(`^(?:ya\\s+)?le\\s+pagu[eé]\\s+(?:todo|toda)${ACCOUNT_TAIL}$`, 'i'),
+  // "ya pagué todo a Carmen"
+  new RegExp(
+    `^(?:ya\\s+)?pagu[eé]\\s+(?:todo|toda)\\s+a\\s+(?<party>[^.,;!?]+?)${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+  // "ya pagué todo"
+  new RegExp(`^(?:ya\\s+)?pagu[eé]\\s+(?:todo|toda)${ACCOUNT_TAIL}$`, 'i'),
+  // "lo pagué completo"
+  new RegExp(
+    `^(?:ya\\s+)?lo\\s+pagu[eé]\\s+(?:completo|completa|todo|toda)${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+  // "la pagué completa"
+  new RegExp(`^(?:ya\\s+)?la\\s+pagu[eé]\\s+(?:completa|toda)${ACCOUNT_TAIL}$`, 'i'),
+  // "Carmen me pagó todo"
+  new RegExp(`^(?<party>[^.,;!?]+?)\\s+me\\s+pag[oó]\\s+(?:todo|toda)${ACCOUNT_TAIL}$`, 'i'),
+  // "ya saldé la deuda con Carmen"
+  new RegExp(
+    `^(?:ya\\s+)?(?:sald[eé]|liquid[eé]|cerr[eé])\\s+la\\s+deuda\\s+con\\s+(?<party>[^.,;!?]+?)${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+  // "ya liquidé la deuda"
+  new RegExp(
+    `^(?:ya\\s+)?(?:sald[eé]|liquid[eé]|cerr[eé])\\s+la\\s+deuda${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+  // "ya liquidé toda la deuda con Carmen"
+  new RegExp(
+    `^(?:ya\\s+)?(?:sald[eé]|liquid[eé])\\s+(?:todo|toda)\\s+la\\s+deuda(?:\\s+con\\s+(?<party>[^.,;!?]+?))?${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+  // "ya está pagada"
+  new RegExp(
+    `^(?:ya\\s+)?est[aá]\\s+(?:pagad[oa]|saldad[oa]|liquidad[oa])${ACCOUNT_TAIL}$`,
+    'i',
+  ),
+];
 
 /**
- * Intencion de pago completo: `yes` (el usuario lo dice de forma afirmativa), `no` (lo
- * niega o duda) o `none` (no habla de pagar todo).
+ * La estructura de un pago completo en cualquier parte del mensaje ("no le pagué todo",
+ * "le pagué a todos", "voy a pagar todo"): el mensaje habla de un pago completo aunque
+ * el mensaje entero no sea una forma afirmativa completa.
+ *
+ * El cierre del verbo es `(?!\w)` y no `\b`: en JavaScript las letras con tilde no son
+ * caracteres de palabra y el limite de palabra nunca cae despues de "pagué".
+ */
+const COMPLETE_PAYMENT_STRUCTURE =
+  /\b(?:pagu[eé]|pag[oó]|pagada|pagado|pagar|pagando|sald[eé]|saldada|saldado|liquid[eé]|liquidada|liquidado|cerr[eé]|cerrada|cerrado)(?!\w)[^.!?;]{0,40}\b(?:todo|toda|todos|todas|completo|completa|deuda)\b/i;
+
+/**
+ * Intencion de pago completo: `yes` (el mensaje entero es una forma afirmativa
+ * completa), `no` (el mensaje habla de un pago completo pero no lo afirma: lo niega, lo
+ * duda, lo aplaza o se contradice) o `none` (no habla de pagar todo).
  */
 export type FullPaymentIntent = 'yes' | 'no' | 'none';
 
 /**
+ * Lo que nombra una forma completa de pago: la persona y la cuenta. Lo que no nombra se
+ * deja en `null`: una forma sin persona no obliga a que el mensaje nombre a alguien.
+ */
+export interface CompletePaymentForm {
+  /** Persona nombrada por la forma ("a Carmen"): `null` si la forma no la nombra. */
+  party: string | null;
+  /** Cuenta nombrada por la forma ("desde la cuenta Efectivo USD"): `null` si no la nombra. */
+  account: string | null;
+}
+
+/**
+ * El mensaje se compara sin la puntuacion final: "ya le pagué todo a Carmen." es la
+ * misma frase que "ya le pagué todo a Carmen". El interrogante **no** se quita: una
+ * pregunta no autoriza un pago.
+ */
+function normalizeMessage(text: string): string {
+  return text.trim().replace(/[.,;:!]+$/, '').trim();
+}
+
+/**
+ * La forma completa de pago total que describe **todo** el mensaje, o `null` si el
+ * mensaje no es una sola forma afirmativa completa.
+ *
+ * Es la base de la autorizacion de un pago del pendiente entero: la decide el texto
+ * entero del usuario, no una frase suelta dentro de el. La persona que nombra la forma
+ * la valida despues el backend contra la contraparte de la deuda resuelta.
+ */
+export function completePaymentForm(text: string): CompletePaymentForm | null {
+  const normalized = normalizeMessage(text);
+  if (normalized.length === 0) {
+    return null;
+  }
+  for (const form of COMPLETE_PAYMENT_FORMS) {
+    const match = form.exec(normalized);
+    if (!match) {
+      continue;
+    }
+    const groups = match.groups ?? {};
+    return {
+      party: cleanGroup(groups.party),
+      account: cleanGroup(groups.account),
+    };
+  }
+  return null;
+}
+
+/**
  * Lee la intencion de pago completo del mensaje.
  *
- * Solo cuenta una forma afirmativa y **sin negacion**: "ya le pagué todo a Carmen" es
- * `yes`; "no le pagué todo a Carmen", "todavía no le pagué todo" o "casi le pagué
- * todo" son `no`; "le pagué a todos" no habla de un pago completo (`none`).
+ * `yes` solo si el **mensaje entero** es una forma afirmativa completa ("ya le pagué
+ * todo a Carmen"). `no` si el mensaje habla de un pago completo pero no lo afirma
+ * ("no le pagué todo", "le pagué a todos", "voy a pagar todo", "pagué todo, pero me
+ * falta pagar cinco") y `none` si no habla de pagar todo.
  */
 export function fullPaymentIntent(text: string): FullPaymentIntent {
   if (text.trim().length === 0) {
     return 'none';
   }
-  let negated = false;
-  for (const pattern of [COMPLETE_PAYMENT_OBJECT, COMPLETE_PAYMENT_DEBT, COMPLETE_PAYMENT_STATE]) {
-    for (const match of text.matchAll(pattern)) {
-      const start = match.index ?? 0;
-      const window = text.slice(Math.max(0, start - NEGATION_WINDOW), start);
-      // La negacion solo cuenta en la misma frase: "no pagué el almuerzo. Le pagué todo".
-      const clause = window.split(/[.!?;\n]/).pop() ?? '';
-      if (NEGATED_PAYMENT.test(clause)) {
-        negated = true;
-        continue;
-      }
-      return 'yes';
-    }
+  if (completePaymentForm(text) !== null) {
+    return 'yes';
   }
-  return negated ? 'no' : 'none';
+  return COMPLETE_PAYMENT_STRUCTURE.test(text) ? 'no' : 'none';
+}
+
+/**
+ * El nombre de la cuenta que nombra el mensaje **con la formula** ("en la cuenta
+ * Efectivo USD" -> "Efectivo USD"). `null` si el mensaje no nombra una cuenta asi: el
+ * nombre a secas ("Efectivo USD") lo resuelve el backend contra las cuentas conocidas.
+ */
+export function accountPhrase(text: string): string | null {
+  const match = /^(?:(?:desde|en|de)\s+)(?:la\s+)?(?:cuenta\s+)?(?<name>[^,;!?]+)$/.exec(
+    text.trim(),
+  );
+  return cleanGroup(match?.groups?.name);
+}
+
+/**
+ * Los numeros que escribe el usuario ("5 dolares", "$10"): los importes que el modelo
+ * propone tienen que aparecer aqui para ser los importes del pago.
+ */
+export function amountsInText(text: string): string[] {
+  return (text.match(/\d+(?:[.,]\d+)?/g) ?? []).map((value) => value.replace(',', '.'));
+}
+
+/** Un grupo de una forma que esta vacio no nombra nada. */
+function cleanGroup(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? '';
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 /**

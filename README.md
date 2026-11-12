@@ -4,7 +4,7 @@ Backend NestJS + TypeORM + SQLite. **B1, B2, B3 y B4 aceptados técnicamente en 
 saldos, aperturas, transferencias/conversiones, correcciones auditadas, categorías,
 conciliación, presupuestos, metas y reservas virtuales por cuenta/moneda con advertencias
 de déficit. Las cuatro unidades pasaron su revisión obligatoria de solo lectura sin
-hallazgos y la validación integrada independiente del orquestador en Node 24.
+hallazgos y la validación integrada independiente del orquestador en Node 24 (2026-11-12).
 **Etapa B completada en el alcance documentado:** mutadores manuales por CLI local,
 con el bot detenido y bajo el cerrojo de instancia única; Telegram aporta consultas
 deterministas y advertencias al confirmar ingresos/gastos de la captura existente.
@@ -14,7 +14,8 @@ histórica se conserva abajo: **Etapa A — aceptación técnica local
 completa, habilitación operativa pendiente**. Las **unidades 1 y 2 están aceptadas**; la
 **unidad 3 está aceptada técnicamente para el alcance A** (implementada, corregida y
 verificada con pruebas automáticas), con **verificación operativa pendiente**: falta la
-prueba con el proveedor real y con Node 24, y una revisión de preparación para producción.
+prueba con el proveedor real y una revisión de preparación para producción. La suite
+completa del proyecto se ejecutó en Node 24 el 2026-11-12; eso no es una reauditoría de A.
 Las tres unidades son parte del [plan general](plan-general-asistente-financiero-ia.md):
 
 - **Unidad 1** — contexto de aplicación ejecutable, modelo mínimo de cuentas y
@@ -26,6 +27,22 @@ Las tres unidades son parte del [plan general](plan-general-asistente-financiero
   deterministas, entrega durable de las respuestas, cerrojo de una sola instancia y
   copia de seguridad con restauración. **Aceptada técnicamente para el alcance A;
   verificación operativa pendiente.**
+
+> **Dos series de unidades.** Las tres de arriba son las del
+> [plan general](plan-general-asistente-financiero-ia.md) (Etapa A). Las secciones
+> «Unidad 1: dominio de deudas», «Unidad 2 (deudas)» y «Unidad 3 (deudas)» de más abajo son
+> **otra** serie, la del módulo de deudas: **las tres unidades de deudas están aceptadas
+> técnicamente en local** (1: dominio; 2: conversación, captura y bot; 3: CLI, cierre y
+> documentación), con la revisión final sin hallazgos y la validación integrada del
+> 2026-11-12.
+>
+> **Módulo de deudas: cierre técnico local, no operativo.** Las deudas se crean, se pagan
+> y se consultan por dos vías: por **Telegram** (conversación; exige el backend **en
+> marcha**, que es quien toma el cerrojo de instancia única) y por **CLI** (operación
+> manual; exige el backend **detenido**, porque el cerrojo de una sola instancia no deja
+> escribir a la CLI mientras el backend corre). Quedan **fuera** de esta aceptación: las
+> pruebas con proveedores reales, la revisión de preparación para producción y cualquier
+> uso de la base operativa real.
 
 > **Aviso: no uses datos financieros reales todavía.** Las correcciones de la unidad 3
 > están aplicadas, revisadas localmente y comprobadas con pruebas automáticas, pero
@@ -41,7 +58,8 @@ Las tres unidades son parte del [plan general](plan-general-asistente-financiero
 >   directorio del cerrojo hay que borrarlo a mano (decisión del operador, por
 >   prudencia). La exclusión entre procesos sí está comprobada.
 > - **La evidencia histórica completa de A usó Node 22.22.3.** La validación integrada
->   de B1–B4 se completó en Node 24; esto no es una nueva auditoría de A.
+>   de B1–B4 y la del 2026-11-12 (suite completa) se completaron en Node 24; esto no es
+>   una nueva auditoría de A.
 >
 > Hasta que haya una revisión y una prueba con el proveedor real, **no introduzcas
 > datos financieros reales** en esta instalación: usa solo datos de prueba.
@@ -135,17 +153,23 @@ por privado; el id de usuario y el id del chat privado coinciden.
 
 ## Puesta en marcha
 
+**Orden obligatorio: copia de seguridad → migraciones pendientes → arrancar.** Si ya
+existe una base, el backend debe estar **detenido** (`Ctrl+C`) para hacer la copia y para
+aplicar las migraciones: el cerrojo de una sola instancia no permite escribir mientras
+corre. La aplicación **no aplica migraciones automáticamente**.
+
 ```bash
 npm ci
 cp .env.example .env      # y rellena el token y los ids si quieres el bot
-npm run migration:run     # crea el esquema
+npm run backup -- --to data/copia-inicial.sqlite   # copia previa, solo si ya hay base
+npm run migration:run     # aplica las migraciones pendientes
 npm run account:add -- --name Efectivo --currency USD
 npm start                 # arranca el bot (long polling)
 ```
 
 Mientras el backend está corriendo, la CLI **no** puede escribir en la base (cerrojo de una
-sola instancia, ver más abajo). Para crear cuentas o copiar la base, detén el backend
-(`Ctrl+C`) primero.
+sola instancia, ver más abajo). Para crear cuentas, migrar o copiar la base, detén el
+backend (`Ctrl+C`) primero.
 
 ### Desarrollo
 
@@ -213,9 +237,9 @@ Migraciones: `InitialSchema1767225600000` (cuentas y movimientos),
 `Debts1785888000000` (deudas: `debt` y `debt_payment`) y
 `DebtCapture1788566400000` (borrador de deuda: columna `debtPayload` de `capture`).
 
-Para actualizar una base ficticia A, B1, B2, B3, B4 o B5 completa: detén el backend, haz una copia de seguridad,
-actualiza/compila el código y ejecuta `npm run migration:run` antes de reiniciar.
-**No borres ni recrees la base**: B4 añade solo `goal` y `savings_entry`, la migración de deudas
+Para actualizar una base ficticia A, B1, B2, B3, B4, B5 o B6 completa: **detén el backend**,
+haz una copia de seguridad, actualiza/compila el código y ejecuta `npm run migration:run`
+antes de reiniciar. **No borres ni recrees la base**: B4 añade solo `goal` y `savings_entry`, la migración de deudas
 añade solo `debt` y `debt_payment` y la del borrador de deuda añade **una sola columna**,
 sin cambiar filas, IDs, claves ni esquemas previos.
 La aplicación no aplica migraciones automáticamente.
@@ -243,6 +267,10 @@ por su cuenta).
 | `goal:add/list/status` | `npm run goal:add` / `goal:list` / `goal:status` | Metas inmutables y progreso nominal |
 | `savings:reserve/release` | `npm run savings:reserve` / `savings:release` | Reservar/liberar virtualmente |
 | `savings:status/history` | `npm run savings:status` / `savings:history` | Estado actual e historial virtual |
+| `debt:add`           | `npm run debt:add`      | Crea una obligación (no mueve dinero)              |
+| `debt:pay`           | `npm run debt:pay`      | Paga una obligación (gasto o ingreso ordinario)   |
+| `debt:list`          | `npm run debt:list`     | Todas las deudas y sus totales, sin compensar      |
+| `debt:show`          | `npm run debt:show`     | Una deuda con su historial de pagos                |
 | `backup`           | `npm run backup`       | Copia de seguridad (`--to <ruta>`)                |
 | `restore`          | `npm run restore`      | Restaura una copia (`--from <ruta> --to <ruta>`)  |
 
@@ -550,12 +578,12 @@ npm test -- --runInBand test/savings-cli.spec.ts
 npm run test:e2e -- --runInBand
 ```
 
-### Unidad 1: dominio de deudas (en curso, sin acceso por CLI ni Telegram)
+### Unidad 1: dominio de deudas (aceptada)
 
 **Alcance de esta unidad: solo el dominio, la migración y sus invariantes.** No hay comando
 de CLI, ni captura por lenguaje natural, ni comando de Telegram: esas superficies llegan en la
-unidad 2. Hasta entonces este dominio **no es accesible desde la aplicación**; nada de lo que
-se describe aquí está aceptado técnicamente.
+unidad 2. El dominio se describe aquí tal como se aceptó; desde la unidad 2 es accesible
+también desde Telegram y, desde la unidad 3, desde la CLI.
 
 Es el seguimiento de una obligación con la política explícita **«Seguimiento y contabilidad»**:
 
@@ -602,12 +630,16 @@ npm run build
 npm test -- --runInBand test/debt.service.spec.ts test/debt-migration.spec.ts
 ```
 
-### Unidad 2 (deudas): conversación, captura y bot (en curso, sin CLI y sin aceptación global)
+### Unidad 2 (deudas): conversación, captura y bot (aceptada)
 
 **Alcance de esta unidad: la conversación, la captura durable y el bot.** El dominio de
 deudas es el de la unidad 1 (sin cambios). Aquí las deudas **se crean, se pagan y se
-consultan escribiendo en lenguaje natural**. La CLI de deudas, la documentación final y el
-cierre (unidad 3) **no** están: nada de lo que se describe aquí está aceptado técnicamente.
+consultan escribiendo en lenguaje natural**. La CLI de deudas y el cierre documental llegan
+en la unidad 3, abajo.
+
+**Estado: aceptada** tras la remediación de raíz y la revisión final sin hallazgos. La
+aceptación es técnica y local: no hay pruebas con proveedores reales ni revisión de
+preparación para producción.
 
 - **Un solo objeto `debt` en la respuesta del modelo.** El esquema estricto (Zod) gana
   los tipos `debt_create`, `debt_settle` y `debt_query` y un único objeto `debt`
@@ -628,14 +660,48 @@ cierre (unidad 3) **no** están: nada de lo que se describe aquí está aceptado
   respuesta durable lleva el id de la deuda, el del pago y el del movimiento.
 - **El pendiente se congela al preparar el pago.** Un pago parcial («le pagué 3
   dólares») lleva un importe positivo y explícito; un importe que coincide con el
-  pendiente salda la deuda igual. Un pago **total** («ya le pagué todo», «lo pagué
-  completo», «ya saldé la deuda») lo autoriza **el texto del usuario**: sin esa frase
-  el backend pregunta el importe, **aunque el modelo diga que el pago fue total**. La
-  autorización se guarda en el borrador (`fullIntent`) y se conserva al aclarar la
-  cuenta, incluso tras reiniciar; se pierde si cambia el objetivo (otra deuda u otra
-  persona), salvo que el mensaje nuevo vuelva a pedirlo. Los borradores anteriores a
-  ese campo se leen **sin** autorización: un borrador viejo nunca paga todo por su
-  cuenta. Si entre el resumen y el `/confirm` cambia el pendiente (otro pago o una
+  pendiente salda la deuda igual. Un pago **total** («ya le pagué todo a Carmen»,
+  «Carmen me pagó todo», «lo pagué completo», «ya saldé la deuda con Carmen») lo
+  autoriza **el mensaje entero del usuario**, no una frase suelta dentro de él: el
+  mensaje tiene que ser **una sola** forma afirmativa completa, la persona que nombra
+  tiene que ser la contraparte de la deuda resuelta y, si nombra una cuenta, tiene que
+  ser una cuenta activa. Todo lo demás se pregunta, **aunque el modelo diga que el pago
+  fue total**: un pago por hacer («voy a pagar todo»), un pago a varias personas («le
+  pagué a todos»), una duda («pagué todo?»), una excepción («pagué todo excepto
+  cinco»), una negación («no le pagué todo») y una contradicción («ya le pagué todo a
+  Carmen. No, solo cinco»). No hay una lista de excepciones que crecer: la forma
+  completa es la **única** puerta.
+- **Del borrador anterior solo se hereda el campo que faltaba.** La autorización de un
+  pago total sobrevive únicamente cuando el borrador estaba **esperando la cuenta** y el
+  mensaje nuevo **es** esa cuenta: el nombre a secas («Efectivo USD»), su id o la
+  fórmula («en la cuenta Efectivo USD»). Cualquier otro mensaje —una negación, un
+  importe, una frase de más, una cuenta que no existe, o un mensaje que además habla del
+  pago («ya le pagué todo a Carmen desde la cuenta …»)— deja la autorización **sin
+  efecto**: se borran el flag, el modo y el importe derivado, y se vuelve a preguntar el
+  importe. Dos cuentas activas con el mismo nombre no se eligen: se pregunta. Un
+  mensaje que no se entiende tampoco conserva la autorización.
+- **Un mensaje que es un pago total y no se puede preparar se revoca.** Si el mensaje
+  entero es una forma de pago total pero **no autoriza** —la persona no es la
+  contraparte de la deuda, o la cuenta que nombra no existe o no es única— no hereda
+  nada, no deja importe y no se paga una parte: se borran el flag, el modo y el importe,
+  y se vuelve a pedir el pago. La deuda destino no se corrige por el texto: la resuelve
+  el backend.
+- **La cuenta de un pago total sale del texto, no del modelo.** Si el mensaje entero es
+  una forma completa («ya le pagué todo a Carmen desde la cuenta Efectivo USD»), la
+  cuenta que nombra tiene que existir, ser **única** y operar en la moneda del pago:
+  si no, el mensaje **no autoriza** el pago total y se pregunta la cuenta. Y si el
+  mensaje no nombra ninguna cuenta, el modelo **no la inventa**: se pide. Una cuenta
+  que el usuario nombra y no existe (o que son dos) nunca se reemplaza por la del
+  modelo, en ningún modo de pago.
+- **La procedencia de la autorización va en el borrador.** `fullAuthorizationVersion`
+  vale `2` solo para una autorización **nueva** del mensaje entero; los borradores
+  anteriores (con `fullIntent` en `true` o sin él) se leen **sin** autorización y nunca
+  pagan el pendiente entero por su cuenta. El campo es interno y nullable: la columna
+  sigue siendo el mismo JSON y **no hay migración**.
+- **El importe del pago lo dice el usuario.** Si el modelo propone el pendiente entero y
+  el usuario no escribió ese número, no se paga: se pregunta cuánto se pagó. Un
+  importe **nuevo** y explícito («le pagué 5 dólares») sí se prepara como pago
+  parcial. Si entre el resumen y el `/confirm` cambia el pendiente (otro pago o una
   anulación), el `/confirm` **se rechaza**: no se paga un total nuevo en silencio y hay
   que volver a preparar el pago. Si el mensaje no dice la moneda del pago, se usa la de
   la deuda (el usuario ya señaló esa deuda); si dice otra, se pregunta y no se paga.
@@ -649,7 +715,8 @@ cierre (unidad 3) **no** están: nada de lo que se describe aquí está aceptado
   nada. Sin id, la deuda se busca por contraparte, dirección y moneda exactas
   (comparación canónica del dominio); si hay varias, se pregunta con una lista acotada
   de ids y el usuario elige; si falta la contraparte, la dirección o la moneda, se
-  pregunta y no se inventa nada.
+  pregunta y no se inventa nada. El id de una **cuenta** es una cuenta: escribirlo
+  nombra la cuenta del pago y no cuenta como id de deuda.
 - **La consulta es de solo lectura.** «cuáles son mis deudas», «quién me debe» o «qué le
   debo a Carmen» se responden con los datos guardados, **sin llamar al modelo para la
   cuenta** y **sin tocar el borrador pendiente**: la fila del borrador queda byte por byte
@@ -684,10 +751,117 @@ npm run build
 npm test -- --runInBand test/debt-capture.spec.ts test/debt-telegram.spec.ts test/debt-migration.spec.ts test/openrouter.interpreter.spec.ts
 ```
 
-### Aceptación técnica local de B y validación integrada (2026-11-11)
+### Unidad 3 (deudas): CLI de deudas, cierre y documentación (aceptada)
 
-**B1, B2, B3 y B4 aceptados:** cada unidad pasó la revisión obligatoria de solo lectura
-sin hallazgos. El orquestador validó independientemente el conjunto en **Node 24**:
+**Alcance de esta unidad: la operación manual por CLI, la prueba de extremo a extremo y
+esta documentación.** El dominio es el de la unidad 1 y la conversación, el bot y la captura
+son los de la unidad 2 (sin cambios). Aquí las deudas **se crean, se pagan, se listan y se
+muestran con un comando**, con el backend detenido y bajo el cerrojo de una sola instancia.
+
+**Estado: aceptada técnicamente en local** (revisión final sin hallazgos y validación
+integrada del 2026-11-12). La aceptación es del **alcance documentado**, no operativa:
+sigue sin haber pruebas con proveedores reales ni revisión de preparación para producción,
+y la base operativa real no se ha tocado.
+
+#### Comandos
+
+```bash
+npm run debt:add  -- --source-key manual-1 --direction payable --counterparty "Carmen" --currency USD --amount 8.00 --on 2026-11-01 --description "Dos tortas"
+npm run debt:pay  -- --source-key pago-1 --debt ID_DEUDA --account ID_CUENTA --currency USD --amount 3.00 --expected-outstanding 8.00 --on 2026-11-05
+npm run debt:list -- --direction receivable --currency USD
+npm run debt:show -- --debt ID_DEUDA
+```
+
+- **`debt:add` registra la obligación y nada más.** No hay cuenta, ni movimiento, ni saldo:
+  la deuda existe solo hasta que se paga. `--direction` es `payable` (lo que se debe) o
+  `receivable` (lo que nos deben); no distingue el origen: un préstamo es simplemente una
+  deuda `payable`. `--source-key` es obligatorio e idempotente: repetirlo con el mismo
+  contenido devuelve la misma deuda (`existente`) y con otro contenido da conflicto.
+- **`debt:pay` paga y devuelve los tres identificadores**: el de la deuda, el del pago y el
+  del movimiento, con `creado`/`existente`, el importe y el pendiente que queda. El pago es
+  **un movimiento ordinario**: gasto si la deuda es `payable`, ingreso si es `receivable`.
+- **No hay un "pagar todo" automático.** `--amount` y `--expected-outstanding` son
+  obligatorios y los dos se interpretan con la misma moneda y las mismas reglas exactas que
+  el resto del proyecto (entero positivo, sin redondeo: USD/VES 2 decimales, USDT 6). El
+  pendiente esperado tiene que **coincidir exactamente** con el pendiente actual: si otro
+  pago o una anulación lo cambiaron, el pago se rechaza **sin escribir** y hay que volver a
+  mirar el pendiente. Así no se paga en silencio un total que el operador no vio.
+- **`debt:list` no se corta.** A diferencia del mensaje de Telegram (4096 caracteres), la CLI
+  lista **todas** las filas: separa lo que se debe de lo que se debe recibir, y cierra con
+  totales **por dirección y moneda, nunca compensados** entre direcciones ni entre monedas
+  (mismo formateador que el reporte del bot, `src/debts/debt-format.ts`, sin el recorte de
+  Telegram). Los filtros (`--direction`, `--currency`, `--counterparty`, `--status`) son
+  opcionales y se pueden combinar.
+- **`debt:show` da el historial completo**: la deuda con su pendiente y su estado, y cada
+  pago con el identificador de su **movimiento original** y si ese movimiento sigue vigente
+  (`vigente`/`anulado`). Un pago anulado no se borra: sigue en el historial.
+- **`debt:pay` avisa de las reservas deficitarias**, igual que los demás mutadores
+  (`movement:add`, `opening:add`, `transfer:add`…); `debt:add` **no** avisa porque no cambia
+  ningún saldo.
+- **Contabilidad: el dinero se cuenta una sola vez.** El pago de una deuda **es** el
+  movimiento: un gasto (lo que se debe) o un ingreso (lo que nos deben), también en
+  préstamos. No hay que **volver a apuntar ese mismo dinero** como un gasto o un ingreso
+  aparte: se contaría dos veces. Un préstamo no es un tipo especial de movimiento: su pago es
+  un gasto o un ingreso ordinario, y la deuda solo deja de existir cuando queda pagada.
+
+#### Lo que no cambia (unidad 2)
+
+La conversación por Telegram sigue siendo la vía natural, con las mismas reglas:
+
+- **El modelo solo propone; el backend decide y el usuario confirma.** Todo lo que el
+  modelo extrae (importe, moneda, contraparte, cuenta, fecha) pasa por el resumen y necesita
+  un `/confirm` explícito. Un `/confirm` sin resumen vigente no registra nada.
+- **El pago total lo autoriza el mensaje entero**, no una frase suelta dentro de él:
+  «ya le pagué todo a Carmen» sí, «no le pagué todo», «le pagué a todos», «voy a pagar
+  todo», «ya le pagué todo a Carmen. No, solo cinco» no. Si el mensaje no nombra cuenta, se
+  la pide: no la inventa. Con dos cuentas activas del mismo nombre se pregunta.
+- **`/debts` y `/debts <id>`** muestran lo mismo que la CLI, con el mismo formateador, y son
+  de solo lectura: no llaman al modelo y no tocan el borrador pendiente. Una consulta en
+  lenguaje natural («cuáles son mis deudas») tampoco lo toca.
+- **El pendiente se congela al preparar el pago.** Si entre el resumen y el `/confirm`
+  cambia (otro pago o una anulación), el `/confirm` se rechaza y hay que volver a preparar
+  el pago: no se paga un total nuevo en silencio.
+- **El movimiento de un pago no se edita.** El veto vive en el dominio: para corregirlo se
+  **anula** (`movement:void`, con motivo) y se vuelve a pagar. Anular un pago reabre
+  automáticamente la deuda y devuelve las cuentas a su estado anterior. El replay de la
+  clave original devuelve siempre el pago y el movimiento **originales**, incluso anulados,
+  y nunca crea un sustituto.
+
+#### Puesta en marcha (rollout)
+
+Solo en rutas temporales o ficticias: **no** en la base real, y **nunca** migrando la base
+del operador a escondidas.
+
+1. **Detén el backend** (el cerrojo de una sola instancia impide escribir a la vez).
+2. **Copia de seguridad** de la base actual: `npm run backup -- --to data/copia-antes.sqlite`.
+3. **Restaura en una ruta nueva** (la restauración nunca sobrescribe la base actual):
+   `npm run restore -- --from data/copia-antes.sqlite --to data/pruebas.sqlite`.
+4. **Apunta `DATABASE_PATH` a la ruta nueva** y aplica las migraciones pendientes:
+   `npm run migration:run`. Las de deudas (`Debts1785888000000` y `DebtCapture1788566400000`)
+   son **aditivas**: añaden tablas (`debt`, `debt_payment`) y **una sola columna**
+   (`debtPayload` de `capture`), sin reescribir filas, ids ni claves anteriores.
+5. **Comprueba** deudas, pagos y saldos contra la copia, prueba `debt:add`/`debt:pay` y
+   repite la copia y la restauración con deudas ya registradas.
+6. La aplicación **no aplica migraciones automáticamente**: el paso 4 es siempre manual.
+
+#### Pruebas dedicadas (solo SQLite temporal, sin proveedores ni base real)
+
+`test/debt-cli.spec.ts` (comandos con procesos reales) y `test/e2e/debt-flow.e2e.spec.ts`
+(flujo completo con Telegram e interpretador simulados).
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/debt-cli.spec.ts test/debt.service.spec.ts test/debt-capture.spec.ts test/debt-telegram.spec.ts test/debt-migration.spec.ts
+npm run test:e2e -- --runInBand
+```
+
+### Aceptación técnica local de B y de deudas, y validación integrada (2026-11-12)
+
+**B1, B2, B3, B4 y las tres unidades de deudas aceptados:** cada unidad pasó la revisión
+obligatoria de solo lectura sin hallazgos — la unidad 1 de deudas ya estaba aceptada; la
+unidad 2, tras la remediación de raíz, y la unidad 3 (CLI + e2e integrado) se aceptan
+ahora. El orquestador validó **independientemente** el conjunto en **Node 24**:
 
 ```bash
 npm run typecheck && npm run build && npm test -- --runInBand && npm run test:e2e -- --runInBand && git diff --check
@@ -697,18 +871,18 @@ npm run typecheck && npm run build && npm test -- --runInBand && npm run test:e2
 | --- | --- |
 | `npm run typecheck` | Sin errores de tipos |
 | `npm run build` | Compilación correcta |
-| `npm test -- --runInBand` | **29 suites y 318 pruebas aprobadas** |
-| `npm run test:e2e -- --runInBand` | **1 suite y 8 pruebas aprobadas** |
+| `npm test -- --runInBand` | **34 suites y 468 pruebas aprobadas** (≈1073 s) |
+| `npm run test:e2e -- --runInBand` | **2 suites y 18 pruebas aprobadas** (≈32 s) |
 | `git diff --check` | Sin errores de espacios; solo avisos LF/CRLF de Windows |
 
-Esta evidencia sustituye los recuentos parciales previos de B. Los avisos de
-red/cancelación proceden de fallos simulados; no hubo llamadas a proveedores reales
-ni migración de la base real. No se hicieron commits/push ni una nueva auditoría de A.
-**B está completada técnicamente en local solo en el alcance documentado:** escrituras
-B manuales por CLI con el bot detenido y cerrojo, consultas Telegram deterministas y
-advertencias de reservas al confirmar la captura existente. No acredita flujos B
-completos en lenguaje natural, pruebas de proveedores reales ni preparación para producción;
-Angular sigue fuera de esta entrega.
+Esta evidencia sustituye los recuentos parciales previos de B y de las unidades de deudas.
+Los avisos de red/cancelación proceden de fallos simulados; no hubo llamadas a proveedores
+reales ni migración de la base real. No se hicieron commits/push ni una nueva auditoría de A.
+**B y el módulo de deudas están completados técnicamente en local solo en el alcance
+documentado:** escrituras B y de deudas manuales por CLI con el bot detenido y cerrojo,
+consultas Telegram deterministas y advertencias de reservas al confirmar la captura
+existente. No acredita flujos B completos en lenguaje natural, pruebas de proveedores
+reales ni preparación para producción; Angular sigue fuera de esta entrega.
 
 ## Copias de seguridad y restauración
 
@@ -754,6 +928,10 @@ Las copias B6 requieren la columna `debtPayload` de `capture` **junto** a su mig
 sueltos. Los prefijos completos A/B1/B2/B3/B4/B5 siguen siendo restaurables y se migran
 después: la migración es aditiva y no reescribe los borradores anteriores (la columna
 nueva queda en `null`).
+
+**Ninguna copia anterior queda inservible:** todo prefijo completo (A/B1/B2/B3/B4/B5) se
+restaura en una ruta nueva y se migra después con `npm run migration:run`, con el backend
+detenido. Solo se rechazan los marcadores o las tablas parciales.
 
 ## Cerrojo de una sola instancia
 
@@ -1025,6 +1203,10 @@ El ciclo tiene **tres pasos separados**: aceptar (durable), procesar y entregar.
 | `npm run migration:run`| Aplica las migraciones pendientes                         |
 | `npm run account:add`  | Crea una cuenta                                           |
 | `npm run account:list` | Lista las cuentas                                         |
+| `npm run debt:add`     | Crea una obligación (no mueve dinero)                     |
+| `npm run debt:pay`     | Paga una obligación (gasto o ingreso ordinario)          |
+| `npm run debt:list`    | Lista las deudas con sus totales, sin compensar           |
+| `npm run debt:show`    | Muestra una deuda con su historial de pagos               |
 | `npm run backup`       | Copia de seguridad                                        |
 | `npm run restore`      | Restaura una copia en una ruta nueva                      |
 
@@ -1090,6 +1272,18 @@ un chat que ya no está autorizado (se descarta sin interpretar ni responder); r
 reinicio; fallo de envío (se reintenta); y copia de seguridad + restauración con los mismos
 totales. **Ninguna prueba hace llamadas externas ni usa credenciales reales.**
 
+De las deudas: la CLI con procesos reales (`test/debt-cli.spec.ts`) cubre las dos direcciones,
+los importes exactos en USDT, el pago parcial y total, el replay idempotente de la clave entre
+procesos, el conflicto de contenido, la expectativa obsoleta, la cuenta inactiva, la moneda
+distinta, los flags desconocidos/repetidos/incompletos (sin escrituras) y el listado largo
+(sin recorte). La suite de extremo a extremo de deudas (`test/e2e/debt-flow.e2e.spec.ts`) cubre
+la creación por lenguaje natural sin movimiento ni cambio de saldo, la consulta que no toca el
+borrador pendiente, el pago parcial (un gasto y la deuda a medias), la actualización repetida, el
+pago total con la cuenta aclarada y **con el proceso reiniciado por medio**, el cobro como
+ingreso, el efecto del pago en el resumen, el presupuesto y las reservas, el pendiente
+congelado que caduca cuando cambia por fuera, el veto a editar el movimiento de un pago (y la
+anulación que reabre la deuda) y la copia de seguridad con restauración.
+
 ## Límites conocidos de esta entrega
 
 - **Captura IA solo de ingresos y gastos.** Las transferencias/conversiones se registran
@@ -1099,6 +1293,21 @@ totales. **Ninguna prueba hace llamadas externas ni usa credenciales reales.**
 - **Mutadores B manuales por CLI.** Presupuestos, metas, reservas y liberaciones no
   admiten captura natural ni escritura Telegram. Reservas nominales pueden perder
   respaldo; se registra y advierte, no se bloquean gastos ni se liberan automáticamente.
+- **Una deuda no se edita ni se borra.** El movimiento de un pago no se edita: se anula
+  (con motivo) y se vuelve a pagar, y el pago nuevo queda ligado a la deuda en su propia
+  transacción. No hay intereses, ni conversión de moneda, ni compensación (netting) entre
+  direcciones ni entre monedas, ni clasificación del origen: un préstamo es una deuda
+  `payable` corriente.
+- **La contabilización de un préstamo la elige el operador.** Al crear la deuda se declara
+  la dirección y el sistema aplica solo esa regla: `payable` → el pago es un **gasto**;
+  `receivable` → es un **ingreso**. No reetiqueta ni reinterpreta el movimiento ya
+  registrado.
+- **El pago total solo se reconoce en el mensaje entero.** La forma completa es la única
+  puerta: una frase suelta dentro de un mensaje más largo no autoriza el pago total y todo
+  lo dudoso se pregunta. El importe y la cuenta los dice el usuario: si el modelo los
+  propone y el usuario no los escribió, se pregunta y no se paga. **Todo mutador exige
+  confirmación**: por Telegram, `/confirm` sobre el borrador que el usuario vio; por CLI, el
+  comando explícito con sus flags.
 - **`/summary` no es un saldo.** Son los totales de actividad del mes; no incluye
   aperturas ni principales transferidos. `/balances` conserva cada moneda sin valorarla.
 - **Las fechas son días, no instantes.** Se guarda `YYYY-MM-DD`; el día por defecto es el del
@@ -1125,8 +1334,9 @@ totales. **Ninguna prueba hace llamadas externas ni usa credenciales reales.**
 - **La revocación se aplica al arrancar.** La lista de autorizados se lee al construir el
   bot y no cambia durante la ejecución: el trabajo pendiente de un chat revocado se limpia
   en el primer ciclo, no en caliente.
-- **El requisito de Node 24 sigue en pie.** La validación integrada de B1–B4 se
-  completó en Node 24; la evidencia completa histórica de A se conserva abajo.
+- **El requisito de Node 24 sigue en pie.** La validación integrada de B1–B4 y de las
+  unidades de deudas se completó en Node 24 el 2026-11-12; la evidencia completa histórica
+  de A se conserva abajo.
 
 ## Plan técnico de cierre (Etapa A, registro histórico)
 
@@ -1161,6 +1371,8 @@ Lo que falta para cerrar la Etapa A (tareas del operador, no automatizables en e
   decidir si la entrega puede usarse con datos reales. Una revisión no equivale a
   producción.
 - **Ejecutar la suite en Node 24**, que es la versión que exige `package.json`.
+  Hecho el 2026-11-12 sobre el conjunto actual (34 suites y 468 pruebas, más 2 suites e2e
+  y 18 pruebas, todas en verde); no es una reauditoría de A.
 
 ### Evidencia de la aceptación técnica local (2026-11-10)
 
@@ -1175,9 +1387,10 @@ Revisión final del código sin hallazgos y comprobación local en Node 22.22.3:
 | `git diff --check` | Limpio |
 
 Esto acredita el **código** de la Etapa A en local; **no habilita el uso operativo**: los
-avisos de arriba siguen vigentes (datos reales, proveedores reales, Node 24 y revisión de
+avisos de arriba siguen vigentes (datos reales, proveedores reales y revisión de
 preparación para producción).
 
 El registro anterior corresponde al cierre histórico de A y no reabre su aceptación.
-B1/B2/B3/B4 están aceptados técnicamente en local; B está completada en el alcance
-manual CLI y consultas/advertencias Telegram documentado, no como habilitación operativa.
+B1/B2/B3/B4 y las tres unidades de deudas están aceptados técnicamente en local; B y el
+módulo de deudas están completados en el alcance manual CLI y
+consultas/advertencias Telegram documentado, no como habilitación operativa.

@@ -4,7 +4,7 @@ import { Account } from '../src/accounts/account.entity';
 import { Capture } from '../src/capture/capture.entity';
 import { CaptureEvent } from '../src/capture/capture-event.entity';
 import { CaptureService } from '../src/capture/capture.service';
-import { parseDebtDraft } from '../src/capture/debt-draft';
+import { DebtDraft, parseDebtDraft } from '../src/capture/debt-draft';
 import { InferenceBudgetService } from '../src/capture/inference-budget.service';
 import { AiLimits } from '../src/config/configuration';
 import { DataSource } from 'typeorm';
@@ -302,7 +302,10 @@ describe('Captura de deudas (unidad 2)', () => {
       ]);
       const service = buildService(interpreter);
 
-      const preview = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      const preview = await handle(service, {
+        eventId: 'e1',
+        text: 'ya le pagué todo a Carmen desde la cuenta Efectivo USD',
+      });
 
       expect(preview.captureState).toBe('awaiting_confirmation');
       expect(preview.reply).toContain('pago total');
@@ -375,7 +378,7 @@ describe('Captura de deudas (unidad 2)', () => {
     });
 
     it('una frase que niega el pago completo revoca la autorizacion del borrador', async () => {
-      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda', minor: 1000n });
       const interpreter = new FakeInterpreter([
         operation({
           kind: 'debt_settle',
@@ -412,6 +415,164 @@ describe('Captura de deudas (unidad 2)', () => {
       expect(revoked.reply).not.toContain('pago total');
       expect(await movementCount()).toBe(0);
       expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+    });
+
+    it('una negacion actual no revive el pago total aunque el modelo conserve el importe', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '10.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+      expect(first.reply).toContain('falta la cuenta');
+
+      // El usuario lo niega y el modelo sigue con el importe del pendiente: no se paga.
+      const revoked = await handle(service, { eventId: 'e2', text: 'no le pagué todo a Carmen' });
+
+      expect(revoked.captureState).toBe('awaiting_details');
+      expect(revoked.reply).toContain('es el pendiente completo');
+      expect(revoked.reply).not.toContain('pago total');
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+
+      // El /confirm no registra nada: el borrador ya no tiene un resumen vigente.
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.captureState).toBe('awaiting_details');
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('un importe nuevo revoca el pago total anterior de la misma deuda', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '5.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'partial',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+      expect(first.reply).toContain('falta la cuenta');
+
+      const partial = await handle(service, { eventId: 'e2', text: 'le pagué 5 dólares a Carmen' });
+
+      expect(partial.captureState).toBe('awaiting_confirmation');
+      expect(partial.reply).toContain('pago parcial');
+      expect(partial.reply).toContain('5.00 USD');
+      expect(partial.reply).not.toContain('pago total');
+
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.captureState).toBe('registered');
+      expect(await movementCount()).toBe(1);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(500n);
+    });
+
+    it.each([
+      ['voy a pagar todo'],
+      ['quiero pagar todo'],
+    ])('un pago por hacer no autoriza el pago total: %s', async (text) => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const outcome = await handle(service, { eventId: 'e1', text });
+
+      expect(outcome.captureState).toBe('awaiting_details');
+      expect(outcome.reply).toContain('falta el importe del pago');
+      expect(outcome.reply).not.toContain('pago total');
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('un pago a varias personas no conserva el pago total anterior', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '10.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+
+      const ambiguous = await handle(service, { eventId: 'e2', text: 'le pagué a todos' });
+
+      expect(ambiguous.captureState).toBe('awaiting_details');
+      expect(ambiguous.reply).not.toContain('pago total');
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
     });
 
     it('conserva la intencion de pago total al aclarar la cuenta, incluso tras reiniciar', async () => {
@@ -480,7 +641,10 @@ describe('Captura de deudas (unidad 2)', () => {
       ]);
       const service = buildService(interpreter);
 
-      await handle(service, { eventId: 'e1', text: 'ya le pagué todo' });
+      await handle(service, {
+        eventId: 'e1',
+        text: 'ya le pagué todo desde la cuenta Efectivo USD',
+      });
       expect(await movementCount()).toBe(0);
 
       // Otro pago cambia el pendiente mientras el borrador esta vivo.
@@ -530,7 +694,10 @@ describe('Captura de deudas (unidad 2)', () => {
       ]);
       const service = buildService(interpreter);
 
-      const preview = await handle(service, { eventId: 'e1', text: 'ya le pagué todo' });
+      const preview = await handle(service, {
+        eventId: 'e1',
+        text: 'ya le pagué todo desde la cuenta Efectivo USD',
+      });
       expect(preview.captureState).toBe('awaiting_confirmation');
       expect(preview.reply).toContain('6.00 USD');
 
@@ -651,6 +818,750 @@ describe('Captura de deudas (unidad 2)', () => {
       expect(preview.captureState).toBe('awaiting_details');
       expect(preview.reply).toContain('no coincide con la contraparte, la direccion o la moneda');
       expect(await movementCount()).toBe(0);
+    });
+  });
+
+  describe('autorizacion del pago total', () => {
+    /** Borrador de deuda vivo: es lo que el backend guarda entre mensajes. */
+    async function pendingDebt(): Promise<DebtDraft | null> {
+      const row = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      return parseDebtDraft(row.debtPayload);
+    }
+
+    it.each([
+      ['ya le pagué todo a Carmen. No, solo 5 dólares', null],
+      ['ya le pagué todo a Carmen. No, solo 5 dólares', '10.00'],
+      ['pagué todo, pero me falta pagar cinco', null],
+      ['pagué todo, pero me falta pagar cinco', '10.00'],
+    ])('un modelo que dice "full" no paga el pendiente con el mensaje: %s (importe %s)', async (text, amount) => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount,
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const outcome = await handle(service, { eventId: 'e1', text });
+
+      expect(outcome.captureState).toBe('awaiting_details');
+      expect(outcome.reply).not.toContain('pago total');
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it.each([
+      ['ya le pagué todo a María'],
+      ['ya le pagué todo a Carmen pero a María no'],
+    ])('la forma tiene que nombrar a la contraparte de la deuda: %s', async (text) => {
+      const debt = await seedDebt({ sourceKey: 'deuda', counterparty: 'Carmen', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const outcome = await handle(service, { eventId: 'e1', text });
+
+      expect(outcome.captureState).toBe('awaiting_details');
+      expect(outcome.reply).not.toContain('pago total');
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('el borrador autorizado no hereda el pago total si el mensaje no nombra la cuenta', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '10.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '10.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'unclear',
+          debt: debtData({ direction: 'payable', counterparty: 'Carmen' }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+      expect(first.reply).toContain('falta la cuenta');
+      const authorized = await pendingDebt();
+      expect(authorized?.fullIntent).toBe(true);
+      expect(authorized?.fullAuthorizationVersion).toBe(2);
+      expect(authorized?.amount).toBe('10.00');
+
+      // "no le pagué": no nombra una cuenta, la autorizacion no se hereda.
+      const denied = await handle(service, { eventId: 'e2', text: 'no le pagué' });
+      expect(denied.captureState).toBe('awaiting_details');
+      const afterDenial = await pendingDebt();
+      expect(afterDenial?.fullIntent).toBe(false);
+      expect(afterDenial?.fullAuthorizationVersion).toBeNull();
+      expect(afterDenial?.settlementMode).toBeNull();
+      expect(afterDenial?.amount).toBeNull();
+
+      // Un texto cualquiera tampoco.
+      const arbitrary = await handle(service, { eventId: 'e3', text: 'no sé, luego te digo' });
+      expect(arbitrary.captureState).toBe('awaiting_details');
+      const afterArbitrary = await pendingDebt();
+      expect(afterArbitrary?.fullIntent).toBe(false);
+      expect(afterArbitrary?.amount).toBeNull();
+
+      // Y un mensaje que no se entiende tampoco.
+      const unclear = await handle(service, { eventId: 'e4', text: 'a ver' });
+      expect(unclear.captureState).toBe('awaiting_details');
+      const afterUnclear = await pendingDebt();
+      expect(afterUnclear?.fullIntent).toBe(false);
+      expect(afterUnclear?.fullAuthorizationVersion).toBeNull();
+      expect(afterUnclear?.amount).toBeNull();
+
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('un importe que el modelo recycle no se toma por un pago parcial', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '10.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      // El usuario dice 5 y el modelo devuelve el pendiente entero: se pregunta.
+      const partial = await handle(service, { eventId: 'e2', text: 'le pagué 5 dólares a Carmen' });
+
+      expect(partial.captureState).toBe('awaiting_details');
+      expect(partial.reply).toContain('es el pendiente completo');
+      expect(partial.reply).not.toContain('pago total');
+      const draft = await pendingDebt();
+      expect(draft?.amount).toBeNull();
+      expect(draft?.settlementMode).toBeNull();
+      expect(draft?.fullIntent).toBe(false);
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it.each([
+      ['una cuenta que no existe', 'en la cuenta Cuenta Que No Existe'],
+      ['una frase de mas', 'en la cuenta Efectivo USD y le pagué todo'],
+    ])('una cuenta nombrada que no vale no se reemplaza por la del modelo: %s', async (_caso, text) => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      const second = await handle(service, { eventId: 'e2', text });
+
+      // La cuenta que propone el modelo no vale: se pregunta cual es.
+      expect(second.captureState).toBe('awaiting_details');
+      expect(second.reply).toContain('falta la cuenta');
+      expect(second.reply).not.toContain('pago total');
+      const draft = await pendingDebt();
+      expect(draft?.accountId).toBeNull();
+      expect(draft?.fullIntent).toBe(false);
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it.each([
+      ['una cuenta que no existe', 'en la cuenta Cuenta Que No Existe'],
+      ['una frase de mas', 'en la cuenta Efectivo USD y le pagué todo'],
+      ['un texto cualquiera', 'no le pagué'],
+    ])('la autorizacion anterior no se hereda con %s', async (_caso, text) => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      const second = await handle(service, { eventId: 'e2', text });
+
+      expect(second.captureState).toBe('awaiting_details');
+      expect(second.reply).not.toContain('pago total');
+      const draft = await pendingDebt();
+      expect(draft?.fullIntent).toBe(false);
+      expect(draft?.amount).toBeNull();
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('la autorizacion anterior no se hereda con dos cuentas del mismo nombre', async () => {
+      await accounts.add({ name: 'Efectivo', currency: 'USD' });
+      await accounts.add({ name: 'efectivo', currency: 'VES' });
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      const second = await handle(service, { eventId: 'e2', text: 'en la cuenta Efectivo' });
+
+      expect(second.captureState).toBe('awaiting_details');
+      expect(second.reply).toContain('falta la cuenta');
+      expect(second.reply).not.toContain('pago total');
+      const draft = await pendingDebt();
+      expect(draft?.fullIntent).toBe(false);
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('la autorizacion anterior se hereda con la cuenta exacta', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: null,
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      const byName = await handle(service, { eventId: 'e2', text: 'en la cuenta Efectivo USD' });
+
+      expect(byName.captureState).toBe('awaiting_confirmation');
+      expect(byName.reply).toContain('pago total');
+      expect(byName.reply).toContain('10.00 USD');
+
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.captureState).toBe('registered');
+      expect(await movementCount()).toBe(1);
+      expect((await debts.get(debt.id)).status).toBe('paid');
+    });
+
+    it('la autorizacion anterior se hereda con el id de la cuenta', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: null,
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      // El id cuenta aunque tenga numeros: no es un importe.
+      const byId = await handle(service, { eventId: 'e2', text: `en la cuenta ${usd}` });
+
+      expect(byId.captureState).toBe('awaiting_confirmation');
+      expect(byId.reply).toContain('pago total');
+
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.captureState).toBe('registered');
+      expect(await movementCount()).toBe(1);
+      expect((await debts.get(debt.id)).status).toBe('paid');
+    });
+
+    it.each([
+      ['ya le pagué todo a Carmen desde la cuenta Efectivo USD pero me falta pagar cinco', null],
+      ['ya le pagué todo a Carmen desde la cuenta Efectivo USD pero me falta pagar cinco', '10.00'],
+      ['ya le pagué todo a Carmen desde la cuenta Cuenta Que No Existe', null],
+      ['ya le pagué todo a Carmen desde la cuenta Cuenta Que No Existe', '10.00'],
+    ])(
+      'una cuenta que el mensaje nombra y no vale no autoriza el pago total: %s (importe %s)',
+      async (text, amount) => {
+        const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+        const interpreter = new FakeInterpreter([
+          operation({
+            kind: 'debt_settle',
+            currency: 'USD',
+            amount,
+            accountId: usd,
+            debt: debtData({
+              direction: 'payable',
+              counterparty: 'Carmen',
+              settlementMode: 'full',
+            }),
+          }),
+        ]);
+        const service = buildService(interpreter);
+
+        const outcome = await handle(service, { eventId: 'e1', text });
+
+        expect(outcome.captureState).toBe('awaiting_details');
+        expect(outcome.reply).toContain('falta la cuenta');
+        expect(outcome.reply).not.toContain('pago total');
+        const draft = await pendingDebt();
+        expect(draft?.fullIntent).toBe(false);
+        expect(draft?.fullAuthorizationVersion).toBeNull();
+        expect(draft?.settlementMode).toBeNull();
+        expect(draft?.amount).toBeNull();
+        expect(draft?.accountId).toBeNull();
+        expect(await movementCount()).toBe(0);
+
+        // El /confirm no registra nada: no hay resumen vigente.
+        const confirmed = await handle(service, { eventId: 'e2', text: '/confirm' });
+        expect(confirmed.captureState).toBe('awaiting_details');
+        expect(await movementCount()).toBe(0);
+        expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+        expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+      },
+    );
+
+    it('un importe que solo propone el modelo no convierte un pago sin cuenta en un pago de 10', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          amount: '10.00',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const outcome = await handle(service, {
+        eventId: 'e1',
+        text: 'ya le pagué todo a Carmen desde la cuenta Cuenta Que No Existe',
+      });
+
+      expect(outcome.captureState).toBe('awaiting_details');
+      expect(outcome.reply).toContain('falta la cuenta');
+      expect(outcome.reply).not.toContain('pago total');
+      const draft = await pendingDebt();
+      expect(draft?.amount).toBeNull();
+      expect(draft?.settlementMode).toBeNull();
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('el mensaje entero con la cuenta correcta si paga el pendiente completo', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const preview = await handle(service, {
+        eventId: 'e1',
+        text: 'ya le pagué todo a Carmen desde la cuenta Efectivo USD',
+      });
+
+      expect(preview.captureState).toBe('awaiting_confirmation');
+      expect(preview.reply).toContain('pago total');
+      expect(preview.reply).toContain('10.00 USD');
+      expect(await movementCount()).toBe(0);
+
+      const confirmed = await handle(service, { eventId: 'e2', text: '/confirm' });
+      expect(confirmed.captureState).toBe('registered');
+      expect(await movementCount()).toBe(1);
+      expect((await debts.get(debt.id)).status).toBe('paid');
+    });
+
+    it('el mensaje entero con el id de la cuenta si paga el pendiente completo', async () => {
+      await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const preview = await handle(service, {
+        eventId: 'e1',
+        text: `ya le pagué todo a Carmen desde la cuenta ${usd}`,
+      });
+
+      expect(preview.captureState).toBe('awaiting_confirmation');
+      expect(preview.reply).toContain('pago total');
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('un pago total sin cuenta en el mensaje pregunta la cuenta aunque el modelo propose una', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: null,
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+
+      // La autorizacion es valida, pero la cuenta no sale del texto: se pregunta.
+      expect(first.captureState).toBe('awaiting_details');
+      expect(first.reply).toContain('falta la cuenta');
+      expect(first.reply).not.toContain('pago total');
+      const pending = await pendingDebt();
+      expect(pending?.fullIntent).toBe(true);
+      expect(pending?.fullAuthorizationVersion).toBe(2);
+      expect(pending?.accountId).toBeNull();
+
+      // La cuenta exacta si hereda la autorizacion pendiente.
+      const clarified = await handle(service, { eventId: 'e2', text: 'en la cuenta Efectivo USD' });
+      expect(clarified.captureState).toBe('awaiting_confirmation');
+      expect(clarified.reply).toContain('pago total');
+      expect(clarified.reply).toContain('10.00 USD');
+      expect(await movementCount()).toBe(0);
+
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.captureState).toBe('registered');
+      expect(await movementCount()).toBe(1);
+      expect((await debts.get(debt.id)).status).toBe('paid');
+    });
+
+    it.each([
+      ['ya le pagué todo a María desde la cuenta Efectivo USD', null],
+      ['ya le pagué todo a María desde la cuenta Efectivo USD', '10.00'],
+      ['ya le pagué todo a Carmen pero me falta pagar cinco desde la cuenta Efectivo USD', null],
+      ['ya le pagué todo a Carmen pero me falta pagar cinco desde la cuenta Efectivo USD', '10.00'],
+    ])(
+      'un mensaje con forma que no autoriza no hereda el pago total: %s (importe %s)',
+      async (text, amount) => {
+        const debt = await seedDebt({ sourceKey: 'deuda', counterparty: 'Carmen', minor: 1000n });
+        const interpreter = new FakeInterpreter([
+          operation({
+            kind: 'debt_settle',
+            currency: 'USD',
+            accountId: null,
+            debt: debtData({
+              direction: 'payable',
+              counterparty: 'Carmen',
+              settlementMode: 'full',
+            }),
+          }),
+          operation({
+            kind: 'debt_settle',
+            currency: 'USD',
+            amount,
+            accountId: usd,
+            debt: debtData({
+              direction: 'payable',
+              counterparty: 'Carmen',
+              settlementMode: 'full',
+            }),
+          }),
+        ]);
+        const service = buildService(interpreter);
+
+        // El borrador queda autorizado y esperando la cuenta.
+        const pending = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+        expect(pending.captureState).toBe('awaiting_details');
+        expect(pending.reply).toContain('falta la cuenta');
+        const authorized = await pendingDebt();
+        expect(authorized?.fullIntent).toBe(true);
+        expect(authorized?.fullAuthorizationVersion).toBe(2);
+        expect(authorized?.accountId).toBeNull();
+
+        // El mensaje nuevo no es una aclaracion de cuenta: no hereda nada.
+        const outcome = await handle(service, { eventId: 'e2', text });
+
+        expect(outcome.captureState).toBe('awaiting_details');
+        expect(outcome.reply).not.toContain('pago total');
+        const draft = await pendingDebt();
+        expect(draft?.fullIntent).toBe(false);
+        expect(draft?.fullAuthorizationVersion).toBeNull();
+        expect(draft?.settlementMode).toBeNull();
+        expect(draft?.amount).toBeNull();
+        // El objetivo no se corrige por el texto: sigue siendo la deuda del modelo.
+        expect(draft?.debtId).toBe(debt.id);
+        expect(await movementCount()).toBe(0);
+
+        // El /confirm no registra nada.
+        const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+        expect(confirmed.captureState).toBe('awaiting_details');
+        expect(await movementCount()).toBe(0);
+        expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+        expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+      },
+    );
+
+    it('la autorizacion anterior se hereda con el nombre de la cuenta a secas', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: usd,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: null,
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      const byName = await handle(service, { eventId: 'e2', text: 'Efectivo USD' });
+
+      expect(byName.captureState).toBe('awaiting_confirmation');
+      expect(byName.reply).toContain('pago total');
+      expect(byName.reply).toContain('10.00 USD');
+
+      const confirmed = await handle(service, { eventId: 'e3', text: '/confirm' });
+      expect(confirmed.captureState).toBe('registered');
+      expect(await movementCount()).toBe(1);
+      expect((await debts.get(debt.id)).status).toBe('paid');
+    });
+
+    it('un /confirm antes del resumen no registra nada', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: null,
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const first = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+      expect(first.captureState).toBe('awaiting_details');
+
+      const confirmed = await handle(service, { eventId: 'e2', text: '/confirm' });
+
+      expect(confirmed.captureState).toBe('awaiting_details');
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('una cuenta que propone el modelo y no existe no se paga', async () => {      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_settle',
+          currency: 'USD',
+          accountId: randomUUID(),
+          debt: debtData({
+            direction: 'payable',
+            counterparty: 'Carmen',
+            settlementMode: 'full',
+          }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const outcome = await handle(service, { eventId: 'e1', text: 'ya le pagué todo a Carmen' });
+
+      expect(outcome.captureState).toBe('awaiting_details');
+      expect(outcome.reply).toContain('falta la cuenta');
+      expect(outcome.reply).not.toContain('pago total');
+      expect(await movementCount()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
     });
   });
 
@@ -1145,6 +2056,63 @@ describe('Captura de deudas (unidad 2)', () => {
       expect(await movementCount()).toBe(0);
       expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
       expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+    });
+
+    it('un borrador viejo con el flag de autorizacion pero sin version tampoco paga el pendiente', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', minor: 1000n });
+
+      // La version anterior ya escribia `fullIntent: true`. Sin la version de la
+      // autorizacion ese flag no vale: el pago total se vuelve a pedir.
+      const legacy = {
+        version: 1,
+        kind: 'debt_settle',
+        direction: 'payable',
+        counterparty: 'Carmen',
+        debtId: debt.id,
+        settlementMode: 'full',
+        amount: '10.00',
+        currency: 'USD',
+        accountId: usd,
+        occurredOn: TODAY,
+        description: null,
+        expectedOutstandingMinor: '1000',
+        fullIntent: true,
+      };
+      const parsed = parseDebtDraft(JSON.stringify(legacy));
+      expect(parsed?.fullIntent).toBe(true);
+      expect(parsed?.fullAuthorizationVersion).toBeNull();
+
+      await db.dataSource.getRepository(Capture).save({
+        id: randomUUID(),
+        chatId: 'chat-1',
+        sourceKey: 'capture:antiguo',
+        state: 'awaiting_confirmation',
+        kind: 'debt_settle',
+        amount: '10.00',
+        currency: 'USD',
+        accountId: usd,
+        occurredOn: TODAY,
+        description: null,
+        debtPayload: JSON.stringify(legacy),
+        sourceText: 'Carmen me pagó todo',
+      });
+
+      const interpreter = new FakeInterpreter([]);
+      const service = buildService(interpreter);
+      const confirmed = await handle(service, { eventId: 'e1', text: '/confirm' });
+
+      expect(confirmed.captureState).toBe('awaiting_details');
+      expect(confirmed.reply).toContain('no tiene la autorizacion del usuario');
+      expect(await movementCount()).toBe(0);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(1000n);
+
+      // La invalidacion se persiste: el borrador no queda como un pago total.
+      const row = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      const saved = parseDebtDraft(row.debtPayload);
+      expect(saved?.fullIntent).toBe(false);
+      expect(saved?.settlementMode).toBeNull();
+      expect(saved?.amount).toBeNull();
     });
 
     it('un pago parcial por el importe del pendiente es valido sin autorizacion de pago total', async () => {

@@ -5,6 +5,9 @@ import { DataSource } from 'typeorm';
 import { AccountService } from './accounts/account.service';
 import { AppModule } from './app.module';
 import { BudgetService } from './budgets/budget.service';
+import { debtReportRow, formatDebtDetail, formatDebtList } from './debts/debt-format';
+import { DebtDirection } from './debts/debt.entity';
+import { DebtService, DebtStatus } from './debts/debt.service';
 import { GoalService } from './savings/goal.service';
 import { SavingsService } from './savings/savings.service';
 import { formatGoalStatus, formatSavingsStatus } from './savings/savings-format';
@@ -38,6 +41,10 @@ Comandos:
   savings:reserve|savings:release --source-key <clave> --goal <id> --account <id> --amount <importe>
   savings:status [--account <id>]                                     Saldo, reservado, disponible y deficit actuales
   savings:history [--account <id>] [--goal <id>]                        Historial virtual append-only
+  debt:add --source-key <clave> --direction <payable|receivable> --counterparty <nombre> --currency <moneda> --amount <importe> --on YYYY-MM-DD [--description <texto>]
+  debt:pay --source-key <clave> --debt <id> --account <id> --currency <moneda> --amount <importe> --expected-outstanding <importe> --on YYYY-MM-DD [--description <texto>]
+  debt:list [--direction <payable|receivable>] [--currency <moneda>] [--counterparty <nombre>] [--status <open|partial|paid>]
+  debt:show --debt <id>                                                Deuda con su historial de pagos
   opening:add --source-key <clave> --account <id> --currency <moneda> --amount <firmado> --on YYYY-MM-DD [--description <texto>]
   transfer:add --source-key <clave> --from <id> --from-currency <moneda> --sent <importe> --to <id> --to-currency <moneda> --received <importe> --on YYYY-MM-DD [--description <texto>] [--fee-account <id> --fee-currency <moneda> --fee <importe>]
   migration:run                                                        Aplica las migraciones pendientes
@@ -244,6 +251,64 @@ async function main(): Promise<void> {
         printJson(await app.get(SavingsService).history({ accountId: flags['account'], goalId: flags['goal'] }));
         break;
       }
+      case 'debt:add': {
+        allowFlags(flags, ['source-key', 'direction', 'counterparty', 'currency', 'amount', 'on', 'description']);
+        const currency = requiredCurrency(flags, 'currency');
+        const direction = directionFlag(flags);
+        if (direction === undefined) {
+          throw new Error('Falta la opcion --direction con su valor.');
+        }
+        const result = await app.get(DebtService).create({
+          sourceKey: requiredFlag(flags, 'source-key'),
+          direction,
+          counterparty: requiredFlag(flags, 'counterparty'),
+          money: { currency, minor: parseAmount(requiredFlag(flags, 'amount'), currency) },
+          occurredOn: requiredFlag(flags, 'on'),
+          description: flags['description'],
+        });
+        console.log(`Deuda ${result.debt.id} | ${result.created ? 'creada' : 'existente'}`);
+        break;
+      }
+      case 'debt:pay': {
+        allowFlags(flags, ['source-key', 'debt', 'account', 'currency', 'amount', 'expected-outstanding', 'on', 'description']);
+        const currency = requiredCurrency(flags, 'currency');
+        const debts = app.get(DebtService);
+        const result = await debts.settle({
+          sourceKey: requiredFlag(flags, 'source-key'),
+          debtId: requiredFlag(flags, 'debt'),
+          accountId: requiredFlag(flags, 'account'),
+          money: { currency, minor: parseAmount(requiredFlag(flags, 'amount'), currency) },
+          occurredOn: requiredFlag(flags, 'on'),
+          expectedOutstandingMinor: parseAmount(requiredFlag(flags, 'expected-outstanding'), currency),
+          description: flags['description'],
+        });
+        const view = await debts.get(result.payment.debtId);
+        console.log(`Pago ${result.payment.id} | Deuda ${result.payment.debtId} | Movimiento ${result.movement.id} | ${result.created ? 'creado' : 'existente'} | importe ${formatAmount(result.movement.amountMinor, result.movement.currency)} ${result.movement.currency} | pendiente ${formatAmount(view.outstandingMinor, view.debt.currency)} ${view.debt.currency}`);
+        break;
+      }
+      case 'debt:list': {
+        allowFlags(flags, ['direction', 'currency', 'counterparty', 'status']);
+        const currency = flags['currency'] === undefined ? undefined : requiredCurrency(flags, 'currency');
+        const rows = await app.get(DebtService).list({
+          direction: directionFlag(flags),
+          currency,
+          counterparty: flags['counterparty'],
+          status: statusFlag(flags),
+        });
+        if (rows.length === 0) {
+          console.log('No hay deudas registradas.');
+          break;
+        }
+        console.log('Deudas:');
+        for (const line of formatDebtList(rows.map(debtReportRow))) console.log(line);
+        break;
+      }
+      case 'debt:show': {
+        allowFlags(flags, ['debt']);
+        const view = await app.get(DebtService).get(requiredFlag(flags, 'debt'));
+        for (const line of formatDebtDetail(view)) console.log(line);
+        break;
+      }
       case 'opening:add': {
         allowFlags(flags, ['source-key', 'account', 'currency', 'amount', 'on', 'description']);
         const currency = requiredCurrency(flags, 'currency');
@@ -312,7 +377,7 @@ async function main(): Promise<void> {
         console.log(USAGE);
         process.exitCode = 1;
     }
-    if (['movement:add', 'movement:edit', 'movement:void', 'balance:reconcile', 'opening:add', 'transfer:add'].includes(command)) {
+    if (['movement:add', 'movement:edit', 'movement:void', 'balance:reconcile', 'opening:add', 'transfer:add', 'debt:pay'].includes(command)) {
       for (const warning of await app.get(SavingsService).warnings()) console.log(warning);
     }
   } finally {
@@ -333,7 +398,8 @@ function resolveCommand(args: string[]): ResolvedCommand {
   const strict = ['balance:list', 'opening:add', 'transfer:add', 'movement:add', 'movement:edit', 'movement:void',
     'movement:show', 'movement:history', 'movement:recent', 'summary', 'balance:reconcile', 'reconciliation:list',
     'budget:add', 'budget:list', 'budget:status', 'goal:add', 'goal:list', 'goal:status',
-    'savings:reserve', 'savings:release', 'savings:status', 'savings:history'].includes(command);
+    'savings:reserve', 'savings:release', 'savings:status', 'savings:history',
+    'debt:add', 'debt:pay', 'debt:list', 'debt:show'].includes(command);
   return { command, flags: parseFlags(rest, strict) };
 }
 
@@ -402,6 +468,33 @@ function requiredCurrency(flags: Record<string, string>, key: string) {
     throw new Error(`Moneda no soportada "${currency}". Use ${CURRENCY_CODES.join(', ')}.`);
   }
   return currency;
+}
+
+/**
+ * Direccion de la deuda. `undefined` si la opcion no se paso; `payable` (lo que se
+ * debe) o `receivable` (lo que nos deben) si el valor es valido.
+ */
+function directionFlag(flags: Record<string, string>): DebtDirection | undefined {
+  const direction = flags['direction'];
+  if (direction === undefined) {
+    return undefined;
+  }
+  if (direction !== 'payable' && direction !== 'receivable') {
+    throw new Error('Use --direction payable|receivable.');
+  }
+  return direction;
+}
+
+/** Estado derivado de la deuda. `undefined` si la opcion no se paso. */
+function statusFlag(flags: Record<string, string>): DebtStatus | undefined {
+  const status = flags['status'];
+  if (status === undefined) {
+    return undefined;
+  }
+  if (status !== 'open' && status !== 'partial' && status !== 'paid') {
+    throw new Error('Use --status open|partial|paid.');
+  }
+  return status;
 }
 
 function allowFlags(flags: Record<string, string>, allowed: string[]): void {

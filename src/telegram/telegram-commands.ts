@@ -1,8 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { AccountService } from '../accounts/account.service';
 import { BudgetService } from '../budgets/budget.service';
-import { formatDebtReport, DebtReportRow } from '../debts/debt-format';
-import { DebtService, DebtView } from '../debts/debt.service';
+import { debtReportRow, formatDebtReport } from '../debts/debt-format';
+import { DebtService } from '../debts/debt.service';
 import { SavingsService } from '../savings/savings.service';
 import { formatGoalStatus, formatSavingsStatus } from '../savings/savings-format';
 import { CaptureService } from '../capture/capture.service';
@@ -362,20 +362,6 @@ export class TelegramCommands {
       'Estos son totales de los movimientos registrados del mes; no son el saldo de tus cuentas.',
     ].join('\n');
   }
-}
-
-/** Fila de deuda para el reporte determinista. */
-function debtReportRow(view: DebtView): DebtReportRow {
-  return {
-    id: view.debt.id,
-    direction: view.debt.direction,
-    counterparty: view.debt.counterparty,
-    currency: view.debt.currency,
-    principalMinor: view.debt.principalMinor,
-    paidMinor: view.paidMinor,
-    outstandingMinor: view.outstandingMinor,
-    status: view.status,
-  };
 }
 
 /** `/comando argumento`. Devuelve `null` si el texto no es un comando. */

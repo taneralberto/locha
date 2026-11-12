@@ -1,4 +1,4 @@
-# Guía de puesta en marcha y pruebas — A aceptada, B1–B4 aceptados técnicamente en local
+# Guía de puesta en marcha y pruebas — A, B1–B4 y las tres unidades de deudas: aceptación técnica local
 
 Para probarlo **no necesitas hosting, dominio ni webhook**: funciona localmente mediante *long polling* de Telegram. Tampoco hay interfaz web todavía.
 
@@ -9,6 +9,15 @@ y bajo el cerrojo de instancia única; Telegram ofrece consultas deterministas y
 al confirmar ingresos/gastos de la captura existente. No son flujos B completos en lenguaje
 natural ni pruebas de proveedores reales o preparación para producción. No hay Angular.
 La aceptación de A se conserva sin reauditoría.
+
+**Las deudas siguen su propia serie de unidades y quedan completadas técnicamente en
+local:** la unidad 1 (dominio) ya estaba aceptada; la unidad 2 (conversación, captura y
+bot) se acepta tras la remediación de raíz y la revisión final sin hallazgos; y la unidad
+3 (CLI de deudas, cierre y documentación) se acepta con la CLI y la prueba de extremo a
+extremo integradas. La evidencia vigente es la validación integrada del 2026-11-12
+(sección 3). Esta entrega no reaudita ni cambia los estados de A ni de B1–B4.
+**Quedan fuera:** las pruebas con proveedores reales, la revisión de preparación para
+producción y cualquier uso de la base operativa real.
 
 ## 1. Requisitos
 
@@ -61,26 +70,35 @@ npm run test:e2e -- --runInBand
 git diff --check
 ```
 
-Validación integrada independiente del orquestador (2026-11-11, **Node 24**), tras la
-aceptación de las cuatro revisiones B sin hallazgos. Comando exacto ejecutado:
+Validación integrada independiente del orquestador (2026-11-12, **Node 24**), tras la
+aceptación de las revisiones de B1–B4 y de las tres unidades de deudas sin hallazgos.
+Comando exacto ejecutado:
 
 ```bash
 npm run typecheck && npm run build && npm test -- --runInBand && npm run test:e2e -- --runInBand && git diff --check
 ```
 
-Tipos y compilación correctos; **29 suites y 318 pruebas aprobadas**, más **1 suite e2e
-y 8 pruebas aprobadas**. `git diff --check` sin errores de espacios, solo avisos LF/CRLF
-de Windows. Esta es la evidencia vigente de B1–B4 y sustituye los recuentos parciales.
+Tipos y compilación correctos; **34 suites y 468 pruebas aprobadas** (≈1073 s), más
+**2 suites e2e y 18 pruebas aprobadas** (≈32 s). `git diff --check` sin errores de espacios,
+solo avisos LF/CRLF de Windows. Esta es la evidencia vigente de B1–B4 y de las unidades de
+deudas y sustituye los recuentos parciales.
 La evidencia histórica de A se conserva en README, sin reauditarla. Las suites CLI
 compilan y usan procesos reales con bases temporales; ninguna prueba migra tu base
 configurada ni usa proveedores reales. Sin commits/push.
 
 ## 4. Arrancar y probar desde Telegram
 
+**Orden obligatorio: copia de seguridad → migraciones pendientes → arrancar.** Todo esto
+se hace **con el backend detenido** (`Ctrl+C`): el cerrojo de una sola instancia no
+permite escribir mientras corre. Si ya existe una base, haz antes la copia de seguridad;
+después aplica las **migraciones pendientes** (la aplicación **no** migra sola) y solo
+entonces arranca.
+
 Primero prepara la base y las cuentas ficticias:
 
 ```bash
-npm run migration:run
+npm run backup -- --to data/copia-inicial.sqlite   # copia previa, solo si ya hay base
+npm run migration:run                              # aplica las migraciones pendientes
 
 npm run account:add -- --name Efectivo --currency USD
 npm run account:add -- --name Bolivares --currency VES
@@ -341,8 +359,10 @@ aceptadas sin hallazgos; la evidencia integrada vigente y sus comandos exactos e
 la sección 3 y en README. **B está completada técnicamente en local dentro del alcance
 documentado**, no como flujos B completos en lenguaje natural ni habilitación de producción.
 Siguen pendientes las pruebas con proveedores reales y la revisión de preparación para producción.
+Las tres unidades de deudas quedan igualmente **aceptadas técnicamente en local**
+(secciones 9 y 10), con las mismas salvedades.
 
-## 9. Probar la unidad 2 de deudas: conversación, captura y bot (en curso)
+## 9. Probar la unidad 2 de deudas: conversación, captura y bot (aceptada)
 
 Con el backend detenido y una **base de pruebas separada** (`DATABASE_PATH` de pruebas):
 aplica las migraciones pendientes (`npm run migration:run`) y arranca el backend. La
@@ -374,9 +394,22 @@ Después comprueba:
   nada: el bot pregunta si es una deuda, un pago o una consulta.
 - «Carmen me pagó» **no** paga todo: sin un importe explícito o sin que el usuario diga
   que pagó todo, el bot pregunta el importe (aunque el modelo diga que fue un pago total).
-- «ya le pagué todo» sí paga el pendiente completo, y esa autorización se conserva al
-  aclarar la cuenta (incluso tras reiniciar); si el usuario cambia de persona u otra
-  deuda, se vuelve a pedir.
+- «ya le pagué todo a Carmen» sí paga el pendiente completo: lo autoriza **el mensaje
+  entero**, y la autorización se conserva **solo** al aclarar la cuenta con un mensaje
+  que **sea** la cuenta («Efectivo USD», su id o «en la cuenta Efectivo USD»), incluso
+  tras reiniciar. Cualquier otro mensaje (una negación, un importe, una frase de más,
+  una cuenta que no existe, o un mensaje que además habla del pago) deja la
+  autorización sin efecto y el bot vuelve a preguntar el importe; si el usuario cambia
+  de persona u otra deuda, se vuelve a pedir.
+- Un mensaje que dice que se pagó todo pero **no** se puede preparar (la persona no es
+  la contraparte, o la cuenta que nombra no existe) **no** paga nada: el bot lo revoca y
+  pide el pago de nuevo.
+- La cuenta de un pago total la tiene que decir el usuario: «ya le pagué todo a Carmen
+  desde la cuenta Efectivo USD» paga el pendiente completo, y si la cuenta no existe (o
+  hay dos con el mismo nombre) el bot **pregunta** la cuenta en vez de pagar. Si el
+  mensaje no nombra cuenta, el bot la pide: no la inventa.
+- El id de una cuenta es una cuenta, no una deuda: escribirlo nombra la cuenta y no
+  cambia el objetivo del pago.
 - Con dos deudas de la misma contraparte, el bot **pregunta con los ids** en vez de elegir
   una; al escribir el id, resuelve esa deuda. Un id escrito en el mensaje actual manda
   sobre el borrador anterior.
@@ -394,6 +427,82 @@ npm test -- --runInBand test/debt-capture.spec.ts test/debt-telegram.spec.ts tes
 npm run test:e2e -- --runInBand
 ```
 
-La CLI de deudas y el cierre de la unidad 3 **no** están: no hay comando de debts por
-CLI y esta unidad **no** está aceptada técnicamente. Sigue sin haber pruebas con
-proveedores reales ni revisión de preparación para producción.
+La unidad 2 está **aceptada** (tras la remediación de raíz y la revisión final sin
+hallazgos). La CLI de deudas y el cierre documental son la unidad 3, abajo.
+Sigue sin haber pruebas con proveedores reales ni revisión de preparación para producción.
+
+## 10. Probar la unidad 3 de deudas: CLI, cierre y documentación (aceptada)
+
+**Aceptada técnicamente en local** (revisión final sin hallazgos y validación integrada
+del 2026-11-12). La aceptación es del **alcance documentado**, no operativa. No uses
+ni migres la base real: selecciona una base ficticia en `DATABASE_PATH`. **Detén el
+backend**, haz una copia de la base actual, restáurala en una **ruta nueva**, apunta `DATABASE_PATH`
+ahí, compila y aplica las **migraciones pendientes**. Las migraciones de deudas
+(`Debts1785888000000` y `DebtCapture1788566400000`) son **aditivas**: añaden las tablas
+`debt` y `debt_payment` y **una sola columna** (`debtPayload` de `capture`), sin reescribir
+filas, ids ni claves anteriores. La aplicación **no** migra sola: ese paso es manual.
+
+```bash
+npm run backup -- --to data/copia-antes-deudas.sqlite
+npm run restore -- --from data/copia-antes-deudas.sqlite --to data/pruebas-deudas.sqlite
+# Con DATABASE_PATH apuntando a la ruta nueva:
+npm run migration:run
+
+npm run account:add -- --name Efectivo --currency USD
+npm run account:add -- --name Efectivo --currency USDT
+
+npm run debt:add -- --source-key manual-1 --direction payable --counterparty "Carmen" --currency USD --amount 8.00 --on 2026-11-01 --description "Dos tortas"
+npm run debt:add -- --source-key manual-2 --direction receivable --counterparty "Vecino" --currency USDT --amount 9007199254740993.123456 --on 2026-11-02
+npm run debt:list
+npm run debt:list -- --direction receivable --currency USDT
+npm run debt:show -- --debt ID_DEUDA
+npm run debt:pay -- --source-key pago-1 --debt ID_DEUDA --account ID_CUENTA --currency USD --amount 3.00 --expected-outstanding 8.00 --on 2026-11-05
+```
+
+Comprueba en esa base ficticia:
+
+1. `debt:add` **no mueve dinero**: no hay cuenta, ni movimiento, ni cambio de saldo. La
+   deuda queda en `open`. Repetir la misma clave con el mismo contenido devuelve el mismo
+   id y `existente`; cambiar el contenido da conflicto sin escribir.
+2. `debt:list` sale **completo** (no se recorta como un mensaje de Telegram), separa lo que
+   debo de lo que me deben y da los totales **por dirección y moneda, sin compensar** entre
+   direcciones ni entre monedas. Los filtros (`--direction`, `--currency`, `--counterparty`,
+   `--status`) son opcionales.
+3. `debt:show` da la deuda con su pendiente y su estado, y el historial de pagos con el id
+   de cada movimiento original y si sigue vigente (`vigente`/`anulado`).
+4. `debt:pay` registra **un gasto** si lo que se debe y **un ingreso** si lo que nos deben
+   (también en préstamos), devuelve los tres ids (deuda, pago y movimiento) y **advierte**
+   del déficit de las reservas. `debt:add` no advierte: no cambia saldos.
+5. **No hay «pagar todo» automático**: `--amount` y `--expected-outstanding` son
+   obligatorios, con importes positivos y exactos (USD/VES 2 decimales, USDT 6). Si el
+   pendiente esperado no coincide con el actual, el pago **falla sin escribir**: hay que
+   volver a mirar el pendiente (no se paga en silencio un total que no se vio).
+6. El movimiento de un pago **no se edita**: se anula (`movement:void`, con motivo) y se
+   vuelve a pagar. Anular un pago reabre la deuda y devuelve las cuentas a su estado
+   anterior.
+7. **Contabilidad: el dinero se cuenta una vez.** El pago **es** el movimiento: no vuelvas
+   a apuntar ese mismo dinero como un gasto o un ingreso aparte. Un préstamo se paga con un
+   gasto (o un ingreso) ordinario; no es un tipo especial de apunte.
+8. Flags desconocidos, repetidos, incompletos o posicionales fallan **sin escribir nada**;
+   también las cuentas inactivas, las monedas que no coinciden con la deuda y las
+   expectativas obsoletas.
+
+```bash
+npm run typecheck
+npm run build
+npm test -- --runInBand test/debt-cli.spec.ts test/debt.service.spec.ts test/debt-capture.spec.ts test/debt-telegram.spec.ts test/debt-migration.spec.ts
+npm run test:e2e -- --runInBand
+```
+
+Estas pruebas usan archivos temporales, procesos reales para la CLI y un Telegram y un
+interpretador simulados: ninguna hace llamadas externas, no migra tu base configurada ni
+usa proveedores reales. El detalle del contrato y los límites está en el `README.md`
+(sección «Unidad 3 (deudas)»).
+
+La unidad 3 queda **aceptada técnicamente en local**: con ella, las tres unidades de deudas
+(1: dominio, ya aceptada; 2: conversación, captura y bot; 3: CLI, cierre y documentación).
+**Queda fuera de esta aceptación:** las pruebas con proveedores reales y la revisión de
+preparación para producción. La base operativa real **no** se ha tocado: todo el rollout es
+sobre rutas temporales o ficticias. Toda copia anterior completa (A/B1/B2/B3/B4/B5) se
+puede restaurar en una ruta nueva y migrar después; solo se rechazan marcadores o tablas
+parciales.

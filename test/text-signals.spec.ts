@@ -1,4 +1,7 @@
 import {
+  accountPhrase,
+  amountsInText,
+  completePaymentForm,
   fullPaymentIntent,
   mentionsConversion,
   mentionsDebt,
@@ -107,19 +110,121 @@ describe('Senales del texto', () => {
       expect(mentionsFullPayment('pagué a todos')).toBe(false);
       expect(mentionsFullPayment('les pagué a todos')).toBe(false);
     });
+
+    it('no toma un pago por hacer como un pago ya realizado', () => {
+      expect(mentionsFullPayment('voy a pagar todo')).toBe(false);
+      expect(mentionsFullPayment('quiero pagar todo')).toBe(false);
+      expect(mentionsFullPayment('voy a pagar todo a Carmen')).toBe(false);
+      expect(mentionsFullPayment('pago todo')).toBe(false);
+      expect(mentionsFullPayment('estoy pagando todo')).toBe(false);
+      expect(mentionsFullPayment('falta pagar todo')).toBe(false);
+    });
+
+    it('no toma un pago dudoso como un pago ya realizado', () => {
+      expect(mentionsFullPayment('pagué todo?')).toBe(false);
+      expect(mentionsFullPayment('pagué todo excepto 5')).toBe(false);
+      expect(mentionsFullPayment('pagué todo menos 5')).toBe(false);
+    });
   });
 
   describe('fullPaymentIntent', () => {
     it('distingue afirmacion, negacion y ausencia', () => {
       expect(fullPaymentIntent('ya le pagué todo a Carmen')).toBe('yes');
       expect(fullPaymentIntent('no le pagué todo a Carmen')).toBe('no');
-      expect(fullPaymentIntent('le pagué a todos')).toBe('none');
+      // Un pago a varias personas no es el pago completo de una deuda: no lo afirma.
+      expect(fullPaymentIntent('le pagué a todos')).toBe('no');
       expect(fullPaymentIntent('le pagué 3 dólares a Carmen')).toBe('none');
     });
 
     it('la negacion no arrastra a otra frase', () => {
-      expect(fullPaymentIntent('no pagué el almuerzo. Le pagué todo a Carmen')).toBe('yes');
+      // El mensaje entero tiene que ser la afirmacion: con dos frases no autoriza nada.
+      expect(fullPaymentIntent('no pagué el almuerzo. Le pagué todo a Carmen')).toBe('no');
       expect(fullPaymentIntent('no pagué el almuerzo')).toBe('none');
+    });
+
+    it('un pago por hacer no afirma un pago completo', () => {
+      expect(fullPaymentIntent('voy a pagar todo')).toBe('no');
+      expect(fullPaymentIntent('quiero pagar todo')).toBe('no');
+      expect(fullPaymentIntent('pago todo')).toBe('no');
+      expect(fullPaymentIntent('estoy pagando todo')).toBe('no');
+    });
+
+    it('un pago dudoso no afirma un pago completo', () => {
+      expect(fullPaymentIntent('pagué todo?')).toBe('no');
+      expect(fullPaymentIntent('pagué todo excepto 5')).toBe('no');
+      expect(fullPaymentIntent('pagué todo menos 5')).toBe('no');
+    });
+
+    it('las frases contradictorias no se resuelven con la primera afirmativa', () => {
+      expect(fullPaymentIntent('ya le pagué todo a Carmen. No le pagué todo')).toBe('no');
+      expect(fullPaymentIntent('ya le pagué todo a Carmen. No le pagué nada')).toBe('no');
+      expect(fullPaymentIntent('ya le pagué todo a Carmen. No, solo le pagué la mitad')).toBe('no');
+    });
+  });
+
+  describe('completePaymentForm', () => {
+    it('reconoce las formas completas y lo que nombran', () => {
+      expect(completePaymentForm('ya le pagué todo a Carmen')).toEqual({
+        party: 'Carmen',
+        account: null,
+      });
+      expect(completePaymentForm('Carmen me pagó todo')).toEqual({
+        party: 'Carmen',
+        account: null,
+      });
+      expect(completePaymentForm('lo pagué completo')).toEqual({ party: null, account: null });
+      expect(completePaymentForm('ya saldé la deuda con Carmen')).toEqual({
+        party: 'Carmen',
+        account: null,
+      });
+      expect(completePaymentForm('ya liquidé la deuda')).toEqual({ party: null, account: null });
+      expect(completePaymentForm('ya le pagué todo a Carmen.')).toEqual({
+        party: 'Carmen',
+        account: null,
+      });
+    });
+
+    it('reconoce la cuenta que nombra la forma', () => {
+      expect(
+        completePaymentForm('ya le pagué todo a Carmen desde la cuenta Efectivo USD'),
+      ).toEqual({ party: 'Carmen', account: 'Efectivo USD' });
+      expect(completePaymentForm('ya le pagué todo a Carmen en Efectivo USD')).toEqual({
+        party: 'Carmen',
+        account: 'Efectivo USD',
+      });
+    });
+
+    it('no reconoce una forma que no es el mensaje entero', () => {
+      expect(completePaymentForm('ya le pagué todo a Carmen. No, solo 5 dólares')).toBeNull();
+      expect(completePaymentForm('no le pagué todo a Carmen')).toBeNull();
+      expect(completePaymentForm('pagué todo, pero me falta pagar cinco')).toBeNull();
+      expect(completePaymentForm('pagué todo?')).toBeNull();
+      expect(completePaymentForm('pagué todo excepto 5')).toBeNull();
+      expect(completePaymentForm('voy a pagar todo')).toBeNull();
+      expect(completePaymentForm('le pagué a todos')).toBeNull();
+      expect(completePaymentForm('le pagué 3 dólares a Carmen')).toBeNull();
+    });
+  });
+
+  describe('accountPhrase', () => {
+    it('saca el nombre de la cuenta de la formula', () => {
+      expect(accountPhrase('en la cuenta Efectivo USD')).toBe('Efectivo USD');
+      expect(accountPhrase('desde la cuenta Efectivo USD')).toBe('Efectivo USD');
+      expect(accountPhrase('de la cuenta Efectivo USD')).toBe('Efectivo USD');
+    });
+
+    it('no ve una cuenta si el mensaje no usa la formula', () => {
+      expect(accountPhrase('Efectivo USD')).toBeNull();
+      expect(accountPhrase('no le pagué')).toBeNull();
+      expect(accountPhrase('le pagué 5 dólares a Carmen')).toBeNull();
+    });
+  });
+
+  describe('amountsInText', () => {
+    it('saca los numeros que escribe el usuario', () => {
+      expect(amountsInText('le pagué 5 dólares a Carmen')).toEqual(['5']);
+      expect(amountsInText('le pagué 10,50 dólares')).toEqual(['10.50']);
+      expect(amountsInText('le pagué cinco dólares')).toEqual([]);
     });
   });
 });

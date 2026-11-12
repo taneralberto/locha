@@ -225,14 +225,14 @@ export class DebtService {
     const status = filters.status === undefined ? undefined : normalizeStatus(filters.status);
     const counterparty = filters.counterparty === undefined
       ? undefined
-      : canonicalCounterparty(requireText(filters.counterparty, 'counterparty', MAX_COUNTERPARTY_LENGTH));
+      : canonicalName(requireText(filters.counterparty, 'counterparty', MAX_COUNTERPARTY_LENGTH));
     const read = async (em: EntityManager) => {
       const debts = await em.getRepository(Debt).find({ order: { occurredOn: 'DESC', sourceKey: 'ASC' } });
       const views = await this.views(em, debts);
       return views.filter((view) =>
         (direction === undefined || view.debt.direction === direction) &&
         (currency === undefined || view.debt.currency === currency) &&
-        (counterparty === undefined || canonicalCounterparty(view.debt.counterparty) === counterparty) &&
+        (counterparty === undefined || canonicalName(view.debt.counterparty) === counterparty) &&
         (status === undefined || view.status === status));
     };
     return manager ? read(manager) : this.transactions.run(read);
@@ -282,10 +282,11 @@ export class DebtService {
 }
 
 /**
- * Identidad de la contraparte: NFD sin diacriticos, minusculas y espacios colapsados.
- * Solo sirve para comparar de forma exacta; la forma mostrada se conserva intacta.
+ * Identidad canonica de un nombre: NFD sin diacriticos, minusculas y espacios
+ * colapsados. Solo sirve para comparar de forma exacta (contrapartes y cuentas); la
+ * forma mostrada se conserva intacta.
  */
-export function canonicalCounterparty(value: string): string {
+export function canonicalName(value: string): string {
   return value.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
@@ -364,7 +365,7 @@ function requireText(value: unknown, field: string, maxLength: number): string {
 
 function sameDebt(row: Debt, input: NormalizedDebt): boolean {
   return row.direction === input.direction &&
-    canonicalCounterparty(row.counterparty) === canonicalCounterparty(input.counterparty) &&
+    canonicalName(row.counterparty) === canonicalName(input.counterparty) &&
     row.currency === input.currency && row.principalMinor === input.principalMinor &&
     row.occurredOn === input.occurredOn && (row.description ?? null) === input.description;
 }
