@@ -56,7 +56,26 @@ const SYSTEM_PROMPT = [
   '- debt.debtId: solo si el usuario escribe el id de la deuda. Nunca elijas un id de la lista de deudas por tu cuenta.',
   '- kind "debt_query" si el usuario pregunta por sus deudas. Son consultas de solo lectura: no registres nada.',
   '  Ejemplos: "cuáles son mis deudas", "quién me debe", "qué le debo a Carmen" -> kind "debt_query", con debt.direction, debt.counterparty o debt.status segun lo que pregunte.',
-  '- debt.status: "open", "partial" o "paid" si el usuario filtra por estado; null si no filtra.',
+  '  Una consulta por dirección que no nombra a nadie es autosuficiente: no necesita el turno anterior.',
+  '  Ejemplo: "muéstrame mis deudas por pagar" -> kind "debt_query", debt.direction "payable", debt.counterparty null.',
+  '  Un imperativo de consulta ("muéstrame...") es una consulta: no es una corrección ni un pago.',
+  '- debt.queryDetail: "true" si el usuario pregunta el detalle de una deuda: cuánto debía al principio, cuánto se le ha pagado (o cuánto te han pagado) y cuánto queda pendiente. Es una LECTURA, no un pago: no registres nada.',
+  '  Basta con pedir el monto inicial ("cuánto le debía inicialmente a Luis"), pedir los abonos ("cuánto le he pagado a Luis") o pedir el desglose ("desglósame la deuda con Luis").',
+  '  Ejemplo: "y cuánto le debía inicialmente a Luis?" -> kind "debt_query", debt.queryDetail true, debt.counterparty "Luis", debt.direction "payable".',
+  '  Ejemplo: "¿Cuánto me debía Luis inicialmente?" -> kind "debt_query", debt.queryDetail true, debt.counterparty "Luis", debt.direction "receivable".',
+  '  Ejemplo: "cuánto le he pagado a Luis" -> kind "debt_query", debt.queryDetail true, debt.counterparty "Luis", debt.direction "payable".',
+  '  Ejemplo: "cuánto me han pagado de la deuda" -> kind "debt_query", debt.queryDetail true, debt.direction "receivable".',
+  '- debt.queryDetail: null si el usuario pregunta por el saldo actual o pide el resumen ("cuánto le debo a Luis", "cuáles son mis deudas", "quién me debe"): ahí solo va el pendiente.',
+  '- kind "debt_follow_up" si la pregunta **depende de un turno anterior** del chat y no se puede responder sola: usa un pronombre o una elipsis ("¿y cuánto le debía inicialmente?", "¿y Carmen?", "¿cuánto le he pagado?").',
+  '  También cuando el mensaje **refina un listado anterior** con una frase fragmentaria, sin necesidad de signos de interrogación: "Lo que debo nada más", "de esas, solo las que tengo por cobrar", "solo las por pagar".',
+  '  Es una LECTURA: no registres nada, no elijas deudas y no autorices pagos.',
+  '  NO lo uses si la pregunta es independiente y completa ("¿qué le debo a Luis?", "cuánto le debo a Carmen"): ahí kind "debt_query".',
+  '  NO lo uses si la consulta es autosuficiente ("muéstrame mis deudas por pagar"): ahí kind "debt_query" con la dirección y sin nombre.',
+  '  NO lo uses si el mensaje corrige algo o paga ("no eran 8, eran 10", "ya le pagué 5 a Luis"): ahí kind "debt_settle" o kind "unclear".',
+  '  Ejemplo: "¿y cuánto le debía inicialmente?" -> kind "debt_follow_up", debt null.',
+  '  Ejemplo: "¿y Carmen?" -> kind "debt_follow_up", debt null.',
+  '  Ejemplo: "Lo que debo nada más" (después de un listado de deudas) -> kind "debt_follow_up", debt null.',
+  '- debt.status: "open", "partial" o "paid" si el usuario filtra por estado; "pending" si pide las deudas que todavía no están saldadas ("las pendientes", "lo que no he pagado"); null si no filtra por estado.',
   '- Si el mensaje habla de una deuda ("debo", "me debe", "adeudo", "préstamo") y no puedes distinguirla de un gasto o de un ingreso, usa kind "unclear".',
   '- Moneda: "$" y "dólares" son USD, "bolívares" son VES y "USDT" es USDT. No inventes la moneda: null si no se puede determinar.',
   'Nunca inventes datos: usa null cuando la informacion no este en el mensaje.',
@@ -142,7 +161,7 @@ export class OpenRouterInterpreter extends OperationInterpreter {
 }
 
 /** Traduce el fallo de la llamada HTTP a un fallo de inferencia, sin detalle. */
-function toInterpreterError(error: unknown): InterpreterError {
+export function toInterpreterError(error: unknown): InterpreterError {
   if (error instanceof BoundedFetchError) {
     if (error.reason === 'timeout') {
       return new InterpreterError('timeout', 'El proveedor no respondio a tiempo.');
@@ -211,7 +230,9 @@ function buildContext(request: InterpreterRequest): string {
       sections.push('  (el resumen pendiente esta truncado)');
     }
     sections.push('');
-    sections.push('El mensaje siguiente es la aclaracion del usuario sobre esa operacion.');
+    sections.push(
+      'El mensaje siguiente puede ser una aclaracion, una correccion o una pregunta nueva: usa esa operacion pendiente solo si el mensaje se refiere a ella.',
+    );
   }
 
   return sections.join('\n');
@@ -286,7 +307,7 @@ function parseOperation(payload: string): Operation {
 }
 
 /** Devuelve el contenido del mensaje del proveedor, o `null` si no lo hay (rechazo). */
-function extractContent(payload: unknown): string | null {
+export function extractContent(payload: unknown): string | null {
   if (typeof payload !== 'object' || payload === null) {
     throw new InterpreterError('invalid', 'La respuesta del proveedor no tiene la forma esperada.');
   }

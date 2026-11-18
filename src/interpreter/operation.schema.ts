@@ -31,9 +31,17 @@ export const DebtOperationSchema = z
       .nullable()
       .describe('"partial" si se paga una parte de la deuda, "full" si se paga toda. Null si no es un pago.'),
     status: z
-      .enum(['open', 'partial', 'paid'])
+      .enum(['open', 'partial', 'paid', 'pending'])
       .nullable()
-      .describe('Filtro de estado de la consulta: "open", "partial" o "paid". Null si no se filtra por estado.'),
+      .describe(
+        'Filtro de estado de la consulta: "open", "partial", "paid" (las ya saldadas) o "pending" (las que todavia no estan saldadas: open o partial). Null si no se filtra por estado.',
+      ),
+    queryDetail: z
+      .boolean()
+      .nullable()
+      .describe(
+        'True si el usuario pregunta por el detalle de una deuda (cuanto debia al principio, cuanto se le ha pagado y cuanto queda pendiente). Es una lectura, no un pago. Null si solo pide el resumen o si no lo pide.',
+      ),
   })
   .strict();
 
@@ -66,9 +74,10 @@ export const OperationSchema = z
         'debt_create',
         'debt_settle',
         'debt_query',
+        'debt_follow_up',
       ])
       .describe(
-        'income: entrada de dinero. expense: salida de dinero. transfer: cambio o conversion entre cuentas o monedas. unclear: falta informacion o hay mas de una operacion. unsupported: no es una operacion financiera. debt_create: se crea una obligacion a pagar o a cobrar (no mueve dinero). debt_settle: se paga o se cobra una obligacion existente. debt_query: se consultan las obligaciones (solo lectura).',
+        'income: entrada de dinero. expense: salida de dinero. transfer: cambio o conversion entre cuentas o monedas. unclear: falta informacion o hay mas de una operacion. unsupported: no es una operacion financiera. debt_create: se crea una obligacion a pagar o a cobrar (no mueve dinero). debt_settle: se paga o se cobra una obligacion existente. debt_query: se consultan las obligaciones (solo lectura). debt_follow_up: la pregunta depende de un turno anterior del chat (solo lectura).',
       ),
     occurredOn: z
       .string()

@@ -113,7 +113,7 @@ describe('Flujo completo del bot de Telegram', () => {
       new SavingsService(transactions, financialService, new GoalService(transactions)),
       new DebtService(transactions, financialService),
     );
-    return new TelegramService(source, transactions, commands, telegramClient, SETTINGS);
+    return new TelegramService(source, transactions, commands, capture, telegramClient, SETTINGS);
   }
 
   function update(updateId: number, text: string, message: Partial<TelegramMessage> = {}): TelegramUpdate {

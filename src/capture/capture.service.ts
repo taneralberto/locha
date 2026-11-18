@@ -1,42 +1,73 @@
 import { Injectable } from '@nestjs/common';
-import { DataSource, In } from 'typeorm';
+import { DataSource, EntityManager, In } from 'typeorm';
 import { Account } from '../accounts/account.entity';
 import { isUniqueViolation } from '../data/unique-violation';
 import { TransactionRunner } from '../data/transaction.runner';
-import { dateInTimeZone, parseDate } from '../domain/date';
-import { ConflictError, NotFoundError, ValidationError } from '../domain/errors';
-import { CURRENCY_CODES, Currency, formatAmount, isCurrency, parseAmount } from '../domain/money';
+import { dateInTimeZone } from '../domain/date';
+import { ValidationError } from '../domain/errors';
+import { Currency, isCurrency, parseAmount } from '../domain/money';
 import { DebtDirection } from '../debts/debt.entity';
-import { DEBT_CLI_FALLBACK, formatDebtReport } from '../debts/debt-format';
-import { canonicalName, DebtService, DebtView } from '../debts/debt.service';
+import { DebtService } from '../debts/debt.service';
 import { FinancialService } from '../financial/financial.service';
 import { MovementKind } from '../financial/movement.entity';
+import { AccountOption, InterpreterError, OperationInterpreter } from '../interpreter/interpreter';
 import {
-  AccountOption,
-  DebtCandidate,
-  InterpreterError,
-  MAX_DEBT_CANDIDATES,
-  OperationInterpreter,
-  PendingOperation,
-} from '../interpreter/interpreter';
+  DebtFollowUp,
+  DebtFollowUpInterpreter,
+  UnavailableDebtFollowUpInterpreter,
+} from '../interpreter/debt-follow-up';
+import { HistoryLoader, HistoryTurn } from '../interpreter/history-window';
 import { Operation } from '../interpreter/operation.schema';
-import { Capture, CaptureKind, CaptureState } from './capture.entity';
-import { sourceKeyFor } from './source-key';
-import { CaptureEvent } from './capture-event.entity';
+import { Capture, CaptureState } from './capture.entity';
+import { CaptureEvent, CaptureEventState } from './capture-event.entity';
 import {
-  DebtChoice,
-  DebtDraft,
-  directionLabel,
-  FULL_AUTHORIZATION_VERSION,
-  MAX_DEBT_CHOICES,
-  parseDebtDraft,
-  serializeDebtDraft,
-} from './debt-draft';
+  BROKEN_DEBT_DRAFT_REPLY,
+  BUDGET_EXHAUSTED_REPLY,
+  CANCELLED_REPLY,
+  confirmationReply,
+  CONVERSION_REPLY,
+  debtCreatedReply,
+  debtSettledReply,
+  DEBT_CLARIFY_REPLY,
+  detailsReply,
+  EMPTY_MESSAGE_REPLY,
+  FOLLOW_UP_CLARIFY_REPLY,
+  FOLLOW_UP_NO_CONTEXT_REPLY,
+  FOLLOW_UP_REFORMULATE_REPLY,
+  MULTIPLE_OPERATIONS_REPLY,
+  NOTHING_TO_CANCEL_REPLY,
+  NOTHING_TO_CONFIRM_REPLY,
+  NOT_CONFIGURED_REPLY,
+  NOT_READY_REPLY,
+  registeredReply,
+  RESEND_REPLY,
+  RETRY_REPLY,
+  safeErrorMessage,
+  TOO_LONG_REPLY,
+  UNSUPPORTED_REPLY,
+  unclearReply,
+} from './capture-format';
+import { choiceIndex, DebtCapture } from './debt-capture';
+import { serializeDebtDraft } from './debt-draft';
+import {
+  Draft,
+  DraftResult,
+  draftOf,
+  emptyDraft,
+  normalizeAmount,
+  normalizeCounterparty,
+  normalizeDescription,
+  PendingDraft,
+  resolveDate,
+  toPendingOperation,
+  validateDebtDraft,
+  validateDraft,
+  withoutFullAuthorization,
+} from './draft';
 import { BudgetExhaustedError, DEFAULT_TIME_ZONE, InferenceBudgetService } from './inference-budget.service';
+import { sourceKeyFor } from './source-key';
 import {
-  accountPhrase,
-  amountsInText,
-  completePaymentForm,
+  isReadOnlyDebtQuestion,
   mentionsConversion,
   mentionsDebt,
   mentionsMultipleAmounts,
@@ -44,60 +75,6 @@ import {
 
 /** Longitud maxima del texto original que se guarda mientras el borrador esta vivo. */
 const MAX_SOURCE_TEXT_LENGTH = 1000;
-/** Longitud maxima de la descripcion de una operacion (limite de `Movement`). */
-const MAX_DESCRIPTION_LENGTH = 280;
-/** Longitud maxima del importe guardado: un importe mas largo no es un importe. */
-const MAX_AMOUNT_LENGTH = 40;
-/** Longitud maxima de la contraparte de una deuda (limite de `Debt`). */
-const MAX_COUNTERPARTY_LENGTH = 120;
-/** Longitud maxima de la etiqueta de una opcion de la lista de deudas. */
-const MAX_CHOICE_LABEL_LENGTH = 140;
-
-const EMPTY_MESSAGE_REPLY = 'El mensaje esta vacio: no hay nada que registrar.';
-const NOTHING_TO_CONFIRM_REPLY = 'No hay ninguna operacion pendiente por confirmar.';
-const NOT_READY_REPLY =
-  'La operacion pendiente no tiene un resumen vigente: envia el mensaje de nuevo para ver el resumen y despues confirma con /confirm.';
-const NOTHING_TO_CANCEL_REPLY = 'No hay ninguna operacion pendiente por cancelar.';
-const CANCELLED_REPLY = 'Operacion descartada. No se registro nada.';
-const CONVERSION_REPLY =
-  'Las conversiones entre cuentas o monedas no se registran: no son un gasto ni un ingreso. Envia la compra o el ingreso por separado.';
-const MULTIPLE_OPERATIONS_REPLY =
-  'Ese mensaje describe mas de una operacion. Envia una sola operacion por mensaje (importe, moneda y cuenta).';
-const UNSUPPORTED_REPLY =
-  'Ese mensaje no parece un gasto ni un ingreso que se pueda registrar.';
-const UNCLEAR_REPLY =
-  'No pude identificar una sola operacion en ese mensaje.';
-const NOT_CONFIGURED_REPLY =
-  'La captura no esta configurada: falta OPENROUTER_API_KEY u OPENROUTER_MODEL. Configuralo y vuelve a enviar el mensaje.';
-const BUDGET_EXHAUSTED_REPLY =
-  'Se alcanzo el limite diario de inferencia configurado. No se llamo al proveedor y no se registro nada.';
-const TOO_LONG_REPLY =
-  'El mensaje es demasiado largo para interpretarlo. Envia uno mas corto.';
-const RETRY_REPLY = 'No pude interpretar el mensaje y no lo reintento automaticamente.';
-/**
- * El borrador vivo se cancela cuando la interpretacion falla: un `/confirm` no puede
- * confirmar un borrador anterior a una correccion que no se pudo interpretar. El
- * usuario tiene que volver a enviar la operacion **completa**.
- */
-const RESEND_REPLY =
-  'Vuelve a enviar el mensaje completo (importe, moneda y cuenta) para preparar la operacion de nuevo.';
-
-/**
- * Salvaguarda determinista: el mensaje habla de una deuda pero el modelo lo clasifico
- * como gasto o ingreso. No se registra nada: se pregunta que quiso decir.
- */
-const DEBT_CLARIFY_REPLY = [
-  'Ese mensaje parece hablar de una deuda (lo que debes o lo que te deben), no de un gasto ni de un ingreso.',
-  'Dime cual es:',
-  '  - una deuda nueva: "le debo 8$ a Carmen" o "Carmen me debe 8$"',
-  '  - un pago de una deuda que ya existe: "le pagué 3 dólares a Carmen" o "ya le pagué todo"',
-  '  - una consulta: "cuáles son mis deudas"',
-  'No se registro nada.',
-].join('\n');
-
-/** El borrador de deuda guardado no se pudo leer: se pide de nuevo, sin mostrar nada. */
-const BROKEN_DEBT_DRAFT_REPLY =
-  'No se pudo leer el borrador pendiente de deuda. Vuelve a enviar el mensaje completo (importe, moneda, contraparte y cuenta si es un pago). No se registro nada.';
 
 /**
  * Cola de la captura. El `handle` completo se serializa por conexion: asi no se
@@ -113,6 +90,12 @@ export interface CaptureRequest {
   text: string;
   /** Marca de tiempo del mensaje. */
   receivedAt: string;
+  /**
+   * Carga **perezosa** del historial del chat. Solo se usa si el mensaje necesita
+   * contexto (una pregunta de seguimiento): los comandos y las operaciones normales no
+   * la piden. Sin historial, la pregunta se responde pidiendo la persona.
+   */
+  history?: HistoryLoader | null;
 }
 
 export interface CaptureOutcome {
@@ -128,47 +111,31 @@ export interface CaptureOutcome {
   movementId: string | null;
 }
 
+/**
+ * Lo que la captura dice de un borrador vivo: su identidad, su conversacion y la clave
+ * de su origen. Es lo unico que un transporte necesita para decidir si ese borrador
+ * sigue siendo suyo: la captura no expone el borrador entero.
+ */
+export interface PendingOrigin {
+  id: string;
+  chatId: string;
+  sourceKey: string;
+}
+
 interface NormalizedRequest {
   eventId: string;
   chatId: string;
   text: string;
   receivedAt: Date;
+  /** La carga perezosa del historial: `null` si el transporte no lo trae. */
+  history: HistoryLoader | null;
 }
-
-/** Borrador en memoria: los campos que el backend valida antes de pedir confirmacion. */
-interface Draft {
-  kind: CaptureKind | null;
-  amount: string | null;
-  /** Moneda tal como la entendio el modelo: puede no estar soportada. */
-  currency: string | null;
-  accountId: string | null;
-  occurredOn: string | null;
-  description: string | null;
-  /** Datos de deuda: `null` en los borradores que no son de deuda. */
-  debt: DebtDraft | null;
-}
-
-interface DraftProblem {
-  field:
-    | 'kind'
-    | 'amount'
-    | 'currency'
-    | 'account'
-    | 'date'
-    | 'direction'
-    | 'counterparty'
-    | 'debtId'
-    | 'mode';
-  message: string;
-}
-
-/** Resultado de buscar la deuda que el usuario quiere pagar. */
-type TargetResolution =
-  | { kind: 'resolved'; debt: DebtView }
-  | { kind: 'ask'; problems: DraftProblem[]; detail?: string; choices?: DebtChoice[] };
 
 @Injectable()
 export class CaptureService {
+  /** La captura de deudas: prepara borradores, responde consultas y explica errores. */
+  private readonly debtCapture: DebtCapture;
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly transactions: TransactionRunner,
@@ -176,7 +143,14 @@ export class CaptureService {
     private readonly interpreter: OperationInterpreter,
     private readonly budget: InferenceBudgetService,
     private readonly debts: DebtService,
-  ) {}
+    /**
+     * La via de seguimiento. Es **opcional**: sin ella la pregunta contextual se
+     * responde pidiendo la persona de forma explicita, sin tocar el borrador.
+     */
+    private readonly followUp: DebtFollowUpInterpreter = new UnavailableDebtFollowUpInterpreter(),
+  ) {
+    this.debtCapture = new DebtCapture(this.debts);
+  }
 
   /**
    * Atiende un evento del transporte y devuelve la respuesta al usuario.
@@ -199,19 +173,60 @@ export class CaptureService {
     return result;
   }
 
+  /**
+   * Los borradores vivos de las conversaciones, con su origen.
+   *
+   * La captura es la unica que sabe que borrador esta vivo: quien los necesita (el
+   * transporte, al revisar que trabajo sigue autorizado) los pide aqui y decide que
+   * hacer con ellos. El `manager` es obligatorio: la lectura comparte transaccion con
+   * la decision que se tome sobre ellos.
+   */
+  async pendingOrigins(manager: EntityManager): Promise<PendingOrigin[]> {
+    const rows = await manager.getRepository(Capture).find({
+      where: { state: In(['awaiting_details', 'awaiting_confirmation']) },
+    });
+    return rows.map((row) => ({ id: row.id, chatId: row.chatId, sourceKey: row.sourceKey }));
+  }
+
+  /**
+   * Cancela el borrador vivo de una conversacion: no queda texto original ni datos de
+   * deuda. Solo se toca el borrador **vivo**: lo ya registrado no se toca.
+   *
+   * El `manager` es obligatorio: la cancelacion comparte transaccion con lo que la
+   * acompaña (la limpieza del transporte, por ejemplo). Cancelar por conversacion es lo
+   * mismo que cancelar por id: hay un unico borrador vivo por conversacion.
+   */
+  async cancelPending(chatId: string, manager: EntityManager): Promise<void> {
+    await manager.getRepository(Capture).update(
+      { chatId, state: In(['awaiting_details', 'awaiting_confirmation']) },
+      { state: 'cancelled', sourceText: null, debtPayload: null },
+    );
+  }
+
   private async process(input: NormalizedRequest): Promise<CaptureOutcome> {
+    // La forma de la pregunta de consulta de deuda que no depende del modelo. Si el
+    // clasificador falla, una pregunta de lectura **no** cancela el borrador: no es una
+    // correccion. La señal es grammatical y conservadora (ver `text-signals`) y se
+    // calcula **una sola vez**, antes de crear el evento: decide con que estado nace.
+    const readOnlyQuestion = isReadOnlyDebtQuestion(input.text);
+
     const existing = await this.findEvent(input.eventId, input.chatId);
     if (existing) {
       if (existing.state === 'processing') {
         // La inferencia quedo interrumpida: no se vuelve a llamar al proveedor.
         return this.markUncertain(existing, input, RETRY_REPLY);
       }
+      if (existing.state === 'reading') {
+        // La consulta de seguimiento quedo a medias: se completa sin volver a gastar
+        // y sin tocar el borrador.
+        return this.recoverReading(existing, input);
+      }
       return replay(existing);
     }
 
     let event: CaptureEvent;
     try {
-      event = await this.createEvent(input);
+      event = await this.createEvent(input, readOnlyQuestion ? 'reading' : 'processing');
     } catch (error) {
       if (!isUniqueViolation(error)) {
         throw error;
@@ -221,9 +236,13 @@ export class CaptureService {
       if (!winner) {
         throw error;
       }
-      return winner.state === 'processing'
-        ? this.markUncertain(winner, input, RETRY_REPLY)
-        : replay(winner);
+      if (winner.state === 'processing') {
+        return this.markUncertain(winner, input, RETRY_REPLY);
+      }
+      if (winner.state === 'reading') {
+        return this.recoverReading(winner, input);
+      }
+      return replay(winner);
     }
 
     const command = detectCommand(input.text);
@@ -238,24 +257,32 @@ export class CaptureService {
     }
 
     const pending = await this.findPendingCapture(input.chatId);
+    const pendingDraft = pending === null ? null : this.pendingOf(pending);
 
     // Una eleccion de la lista de deudas se resuelve **antes** del modelo: el numero
     // es la fuente de verdad (el id guardado es el que se paga) y asi no se gasta
     // inferencia en un mensaje que ya esta dicho.
-    if (pending !== null) {
-      const choice = choiceIndex(input.text, pending);
+    if (pending !== null && pendingDraft !== null) {
+      const choice = choiceIndex(input.text, pendingDraft.draft.debt?.choices ?? []);
       if (choice !== null) {
-        return this.debtChoice(event, input, pending, choice);
+        return this.debtChoice(event, input, pending, pendingDraft, choice);
       }
     }
 
+    // La forma de la pregunta de consulta de deuda que no depende del modelo ya se
+    // calculo al principio (ver `readOnlyQuestion`): si el clasificador falla, una
+    // pregunta de lectura **no** cancela el borrador: no es una correccion.
+
     if (!this.interpreter.enabled) {
-      return this.markUncertain(event, input, NOT_CONFIGURED_REPLY);
+      // Una pregunta de lectura no cancela el borrador: no es una correccion.
+      return readOnlyQuestion
+        ? this.complete(event, input, pending?.state ?? null, NOT_CONFIGURED_REPLY)
+        : this.markUncertain(event, input, NOT_CONFIGURED_REPLY);
     }
 
     const accounts = await this.activeAccounts();
     const defaultDate = dateInTimeZone(input.receivedAt, DEFAULT_TIME_ZONE);
-    const candidates = await this.debtCandidates();
+    const candidates = await this.debtCapture.candidates();
 
     let operation: Operation;
     try {
@@ -269,6 +296,17 @@ export class CaptureService {
         debtsTruncated: candidates.truncated,
       });
     } catch (error) {
+      if (readOnlyQuestion) {
+        // La pregunta no se pudo clasificar: se responde sin tocar el borrador (no es
+        // una correccion) y sin reintentar.
+        if (error instanceof BudgetExhaustedError) {
+          return this.complete(event, input, pending?.state ?? null, BUDGET_EXHAUSTED_REPLY);
+        }
+        if (error instanceof InterpreterError && error.reason === 'too_long') {
+          return this.complete(event, input, pending?.state ?? null, TOO_LONG_REPLY);
+        }
+        return this.complete(event, input, pending?.state ?? null, RETRY_REPLY);
+      }
       if (error instanceof BudgetExhaustedError) {
         return this.markUncertain(event, input, BUDGET_EXHAUSTED_REPLY);
       }
@@ -278,10 +316,34 @@ export class CaptureService {
       return this.markUncertain(event, input, RETRY_REPLY);
     }
 
+    // Una pregunta de lectura que el clasificador resuelve como otra cosa (una
+    // operacion, un pago, una duda) **no se escribe**: la rama es de solo lectura.
+    if (readOnlyQuestion && operation.kind !== 'debt_follow_up' && operation.kind !== 'debt_query') {
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_REFORMULATE_REPLY);
+    }
+
     // Una consulta de deudas es de solo lectura: va antes de cualquier conversion,
     // operacion multiple o descarte, y no toca el borrador pendiente.
     if (operation.kind === 'debt_query') {
-      return this.debtQueryReply(event, input, pending, operation, accounts);
+      // La forma inequivoca de la pregunta de seguimiento **no** es una consulta
+      // general: depende de un turno anterior del chat. Se resuelve con la ventana (o
+      // se pide la persona), nunca con una lista de deudas: un nombre que venga del
+      // modelo no se usa.
+      if (readOnlyQuestion) {
+        return this.debtFollowUp(event, input, pending, accounts);
+      }
+      const reply = await this.debtCapture.query({
+        operation,
+        accounts,
+        text: input.text,
+      });
+      return this.complete(event, input, pending?.state ?? null, reply);
+    }
+
+    // Una pregunta contextual ("¿y cuánto le debía inicialmente?") se resuelve con la
+    // ventana del chat. Tambien es de solo lectura: no toca el borrador pendiente.
+    if (operation.kind === 'debt_follow_up') {
+      return this.debtFollowUp(event, input, pending, accounts);
     }
 
     if (operation.kind === 'transfer' || mentionsConversion(input.text)) {
@@ -294,7 +356,7 @@ export class CaptureService {
       return this.discard(event, input, pending, UNSUPPORTED_REPLY);
     }
     if (operation.kind === 'unclear') {
-      const draft = pending ? draftOf(pending) : emptyDraft();
+      const draft = pendingDraft?.draft ?? emptyDraft();
       // Un mensaje que no se entiende no conserva ni la autorizacion de pago total ni el
       // importe derivado de ella: se vuelve a pedir el pago.
       const cleared = withoutFullAuthorization(draft);
@@ -302,33 +364,36 @@ export class CaptureService {
       const problems = isDebt
         ? validateDebtDraft(cleared, accounts)
         : validateDraft(cleared, accounts);
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        cleared,
-        'awaiting_details',
-        unclearReply(problems, accounts),
-      );
+      return this.saveDraft(event, input, pending, {
+        draft: cleared,
+        state: 'awaiting_details',
+        reply: unclearReply(problems, accounts),
+      });
     }
     if (operation.kind === 'debt_create') {
-      return this.debtCreateDraft(event, input, pending, operation, accounts, defaultDate);
+      const prepared = await this.debtCapture.prepareCreate({ operation, accounts, defaultDate });
+      return this.saveDraft(event, input, pending, prepared);
     }
     if (operation.kind === 'debt_settle') {
-      return this.debtSettleDraft(event, input, pending, operation, accounts, defaultDate);
+      const prepared = await this.debtCapture.prepareSettle({
+        operation,
+        accounts,
+        defaultDate,
+        text: input.text,
+        pending: pendingDraft,
+        resolved: null,
+      });
+      return this.saveDraft(event, input, pending, prepared);
     }
 
     // Salvaguarda: el mensaje habla de una deuda y el modelo lo clasifico como gasto o
     // ingreso. No se registra nada: se pregunta que quiso decir.
     if (mentionsDebt(input.text)) {
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        emptyDraft(),
-        'awaiting_details',
-        DEBT_CLARIFY_REPLY,
-      );
+      return this.saveDraft(event, input, pending, {
+        draft: emptyDraft(),
+        state: 'awaiting_details',
+        reply: DEBT_CLARIFY_REPLY,
+      });
     }
 
     const draft: Draft = {
@@ -342,688 +407,173 @@ export class CaptureService {
     };
     const problems = validateDraft(draft, accounts);
     if (problems.length > 0) {
-      return this.saveDraft(event, input, pending, draft, 'awaiting_details', detailsReply(problems, accounts));
-    }
-    return this.saveDraft(
-      event,
-      input,
-      pending,
-      draft,
-      'awaiting_confirmation',
-      confirmationReply(draft, accounts),
-    );
-  }
-
-  /**
-   * Prepara el borrador de una deuda nueva. Crear una deuda **no** mueve dinero: no
-   * hay cuenta, no hay movimiento y no hay saldo.
-   */
-  private async debtCreateDraft(
-    event: CaptureEvent,
-    input: NormalizedRequest,
-    pending: Capture | null,
-    operation: Operation,
-    accounts: AccountOption[],
-    defaultDate: string,
-  ): Promise<CaptureOutcome> {
-    const model = operation.debt;
-    const debt: DebtDraft = {
-      version: 1,
-      kind: 'debt_create',
-      direction: model?.direction ?? null,
-      counterparty: normalizeCounterparty(model?.counterparty ?? null),
-      debtId: null,
-      settlementMode: null,
-      amount: normalizeAmount(operation.amount),
-      currency: operation.currency === null ? null : operation.currency.trim(),
-      accountId: null,
-      occurredOn: resolveDate(operation.occurredOn, defaultDate),
-      description: normalizeDescription(operation.description),
-      expectedOutstandingMinor: null,
-      fullIntent: false,
-      fullAuthorizationVersion: null,
-      choices: [],
-    };
-    const draft: Draft = {
-      kind: 'debt_create',
-      amount: debt.amount,
-      currency: debt.currency,
-      accountId: null,
-      occurredOn: debt.occurredOn,
-      description: debt.description,
-      debt,
-    };
-    const problems = validateDebtCreate(draft);
-    if (problems.length > 0) {
-      return this.saveDraft(
-        event,
-        input,
-        pending,
+      return this.saveDraft(event, input, pending, {
         draft,
-        'awaiting_details',
-        detailsReply(problems, accounts, 'Faltan datos para registrar la deuda:'),
-      );
+        state: 'awaiting_details',
+        reply: detailsReply(problems, accounts),
+      });
     }
-    return this.saveDraft(
-      event,
-      input,
-      pending,
+    return this.saveDraft(event, input, pending, {
       draft,
-      'awaiting_confirmation',
-      debtCreateReply(draft),
-    );
+      state: 'awaiting_confirmation',
+      reply: confirmationReply(draft, accounts),
+    });
   }
 
   /**
-   * Prepara el borrador de un pago de deuda. El pendiente se **congela** al preparar el
-   * pago: si despues cambia (otro pago o una anulacion), el `/confirm` se rechaza y hay
-   * que volver a preparar el pago.
+   * Pregunta **contextual**: el mensaje depende de un turno anterior del chat ("¿y
+   * cuánto le debia inicialmente?").
    *
-   * `resolved` es la deuda ya elegida (la lista numerada): entonces no se busca otra y
-   * el pago se prepara con los datos que ya tiene el borrador.
+   * Se resuelve con una llamada propia que ve la ventana del chat como **datos**, y
+   * la respuesta sale de la base de datos: el historial nunca aporta importes ni
+   * estados. La rama es de **solo lectura**: no toca el borrador, no registra nada y
+   * no elige deudas.
+   *
+   * Si no hay ventana, o no se puede resolver de quien es la pregunta, se pide la
+   * persona de forma explicita (sin listar todas las deudas). Un fallo del proveedor
+   * **no** cancela el borrador: se pide repetir la pregunta.
+   *
+   * Tambien se resuelve aqui un **grupo por direccion** ("lo que debo nada mas"): no
+   * tiene persona, asi que su filtro es la direccion; sin estado explicito solo
+   * salen las pendientes (tambien en el detalle) y no se usa ningun id escrito.
    */
-  private async debtSettleDraft(
+  private async debtFollowUp(
     event: CaptureEvent,
     input: NormalizedRequest,
     pending: Capture | null,
-    operation: Operation,
     accounts: AccountOption[],
-    defaultDate: string,
-    resolved: DebtView | null = null,
   ): Promise<CaptureOutcome> {
-    const model = operation.debt;
-    const direction = model?.direction ?? null;
-    const counterparty = normalizeCounterparty(model?.counterparty ?? null);
-    const rawCurrency = operation.currency === null ? null : operation.currency.trim();
-    const modelAmount = normalizeAmount(operation.amount);
-    const modelAccountId = operation.accountId === null ? null : operation.accountId.trim();
-    const pendingDraft = pending === null ? null : draftOf(pending);
-    const pendingDebt = pendingDraft?.debt ?? null;
-    const pendingDebtId = pendingDebt?.debtId ?? null;
+    // El evento queda en 'reading' **antes de cualquier carga**: si la ventana no se
+    // puede leer, o si la llamada se interrumpe, la reentrada ve este estado y completa
+    // la respuesta **sin volver a gastar** y sin tocar el borrador. La forma inequivoca
+    // ya nacio en 'reading' (no hay transicion que repetir); una pregunta que solo el
+    // modelo reconocio viene en 'processing' y se marca aqui.
+    if (event.state !== 'reading') {
+      await this.markReading(event);
+    }
 
-    const resolution: TargetResolution =
-      resolved !== null
-        ? { kind: 'resolved', debt: resolved }
-        : await this.resolveDebtTarget({
-            direction,
+    let window: HistoryTurn[];
+    try {
+      window = await this.readHistoryWindow(input);
+    } catch (error) {
+      // El historial no se pudo leer: se pide repetir la pregunta. No se reserva ni se
+      // llama al proveedor, y el borrador no se toca.
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_REFORMULATE_REPLY);
+    }
+    if (window.length === 0) {
+      // Sin ventana no hay referencia que resolver: se pide la persona.
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_NO_CONTEXT_REPLY);
+    }
+
+    let answer: DebtFollowUp;
+    try {
+      await this.budget.reserve();
+      answer = await this.followUp.resolve({ text: input.text, history: window });
+    } catch (error) {
+      if (error instanceof BudgetExhaustedError) {
+        return this.complete(event, input, pending?.state ?? null, BUDGET_EXHAUSTED_REPLY);
+      }
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_REFORMULATE_REPLY);
+    }
+
+    const counterparty = normalizeCounterparty(answer.counterparty);
+    const isGroup = answer.kind === 'debt_group';
+    if (answer.kind === 'clarify') {
+      // No se sabe de quien es la pregunta (o hay varias personas posibles): se pide,
+      // sin listar todas las deudas.
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_CLARIFY_REPLY);
+    }
+    if (isGroup) {
+      // Un **grupo** por direccion: la direccion tiene que estar clara y no hay
+      // persona. La contraparte se comprueba **literalmente**: un grupo no admite una
+      // persona, ni siquiera una cadena vacia. Un grupo sin direccion, o con una
+      // persona, es contradictorio: se pide y no se lista nada (fail-closed: nunca se
+      // amplia a todas las deudas).
+      if (answer.direction === null || answer.counterparty !== null) {
+        return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_CLARIFY_REPLY);
+      }
+    } else if (counterparty === null) {
+      // Una consulta de una persona sin persona no se amplia: se pide la persona,
+      // aunque la direccion este clara.
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_CLARIFY_REPLY);
+    }
+
+    // La consulta la responde el backend con los datos **actuales**: la misma consulta
+    // de deudas, con los filtros que resolved la pregunta. El grupo filtra por
+    // direccion y deja la contraparte en null.
+    let reply: string;
+    try {
+      reply = await this.debtCapture.query({
+        operation: {
+          kind: 'debt_query',
+          amount: null,
+          currency: answer.currency,
+          accountId: null,
+          occurredOn: null,
+          description: null,
+          debt: {
+            direction: answer.direction,
             counterparty,
-            currency: rawCurrency,
-            userText: input.text,
-            pendingDebtId,
-            accounts,
-          });
-
-    const debt: DebtDraft = {
-      version: 1,
-      kind: 'debt_settle',
-      direction,
-      counterparty,
-      debtId: resolution.kind === 'resolved' ? resolution.debt.debt.id : null,
-      settlementMode: null,
-      amount: modelAmount,
-      currency: rawCurrency,
-      accountId: modelAccountId,
-      occurredOn: resolveDate(operation.occurredOn, defaultDate),
-      description: normalizeDescription(operation.description),
-      expectedOutstandingMinor: null,
-      fullIntent: false,
-      fullAuthorizationVersion: null,
-      choices: resolution.kind === 'ask' ? resolution.choices ?? [] : [],
-    };
-    const draft: Draft = {
-      kind: 'debt_settle',
-      amount: debt.amount,
-      currency: debt.currency,
-      accountId: modelAccountId,
-      occurredOn: debt.occurredOn,
-      description: debt.description,
-      debt,
-    };
-
-    if (resolution.kind === 'ask') {
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        draft,
-        'awaiting_details',
-        detailsReply(resolution.problems, accounts, 'Faltan datos para registrar el pago:', resolution.detail),
-      );
-    }
-
-    const target = resolution.debt;
-    const debtCurrency = target.debt.currency;
-    const problems: DraftProblem[] = [];
-
-    // La moneda del pago es la de la deuda: si el mensaje no la dice, se usa la de la
-    // deuda que el usuario acaba de señalar.
-    const paymentCurrency: Currency =
-      rawCurrency !== null && isCurrency(rawCurrency) ? rawCurrency : debtCurrency;
-    if (rawCurrency !== null && !isCurrency(rawCurrency)) {
-      problems.push({ field: 'currency', message: `la moneda "${rawCurrency}" no esta soportada` });
-    } else if (rawCurrency !== null && rawCurrency !== debtCurrency) {
-      problems.push({
-        field: 'currency',
-        message: `la deuda esta en ${debtCurrency} y el pago es en ${rawCurrency}`,
+            debtId: null,
+            settlementMode: null,
+            // En el grupo el estado es explicito por defecto: sin el, el detalle
+            // dejaria pasar tambien las deudas saldadas. Un estado pedido de forma
+            // explicita manda. Las vistas nominales conservan su politica previa.
+            status: isGroup ? (answer.status ?? 'pending') : answer.status,
+            queryDetail: answer.queryDetail,
+          },
+        },
+        accounts,
+        // El id escrito manda sobre los filtros de una **consulta nominal**: es su
+        // politica previa y no se toca. En el grupo no se extraen ids: un id escrito
+        // sustituiria la direccion y podria devolver el lado contrario.
+        text: isGroup ? '' : input.text,
       });
+    } catch (error) {
+      // Fallo de **solo lectura**: la respuesta se pide de nuevo y el borrador no se
+      // toca. Esta rama no registra nada ni elige deudas.
+      return this.complete(event, input, pending?.state ?? null, FOLLOW_UP_REFORMULATE_REPLY);
     }
-    debt.currency = rawCurrency ?? debtCurrency;
-    draft.currency = debt.currency;
-
-    // ---- La autorizacion de un pago total la da el mensaje entero ----
-    // La forma tiene que describir TODO el mensaje ("ya le pagué todo a Carmen") y la
-    // persona que nombra tiene que ser la contraparte de la deuda resuelta. Cualquier
-    // otra cosa (una negacion, una duda, otra frase, otra persona) no autoriza nada.
-    const form = completePaymentForm(input.text);
-    const sameParty =
-      form === null ||
-      form.party === null ||
-      canonicalName(form.party) === canonicalName(target.debt.counterparty);
-
-    // ---- La cuenta la nombra el usuario ----
-    // La cola de la forma ("desde la cuenta Efectivo USD"), la formula ("en la cuenta
-    // Efectivo USD") o el nombre a secas ("Efectivo USD"). Si el nombre no resuelve a
-    // una sola cuenta activa **no** se reemplaza por la que propone el modelo: se
-    // pregunta cual es.
-    const phrase = accountPhrase(input.text);
-    const formAccountName = form?.account ?? null;
-    const accountText = formAccountName ?? phrase;
-    const named = groundAccount(accountText ?? input.text.trim(), accounts);
-    const accountNamed = accountText !== null || named.ambiguous;
-    // La cuenta que nombra el usuario manda sobre la que propone el modelo. En un pago
-    // total la cuenta tiene que salir del texto: el modelo no la inventa.
-    const modelAccount =
-      form === null && !accountNamed
-        ? accounts.find((candidate) => candidate.id === modelAccountId)
-        : undefined;
-    const accountId = named.account?.id ?? modelAccount?.id ?? null;
-
-    // La aclaracion de cuenta: el mensaje entero tiene que ser el nombre de una cuenta
-    // activa (o su id) o la formula "en la cuenta X". La cola de una forma completa
-    // **no** es una aclaracion: un mensaje con forma no hereda nada.
-    const clarification = groundAccount(phrase ?? input.text.trim(), accounts);
-
-    // La forma con una cuenta nombrada solo autoriza si esa cuenta existe, es unica y
-    // opera en la moneda del pago: una cuenta que no existe o que son dos no autoriza
-    // un pago del pendiente entero.
-    const accountUsable =
-      named.account !== null && named.account.currency === paymentCurrency;
-    const authorized =
-      form !== null && sameParty && (formAccountName === null || accountUsable);
-    // Un mensaje con forma completa que no autoriza (la persona no es la contraparte o
-    // la cuenta que nombra no vale) no hereda nada ni deja ningun importe.
-    const invalidForm = form !== null && !authorized;
-
-    // ---- Del borrador anterior solo se hereda el campo que faltaba ----
-    // La autorizacion anterior sobrevive unicamente cuando el borrador estaba esperando
-    // la cuenta y este mensaje entero **es** esa cuenta: cualquier otro mensaje (una
-    // negacion, un importe, una frase de mas, una forma) la deja sin efecto.
-    const inherited =
-      !authorized &&
-      form === null &&
-      clarification.account !== null &&
-      pending?.state === 'awaiting_details' &&
-      pendingDebt?.kind === 'debt_settle' &&
-      pendingDebt.fullIntent === true &&
-      pendingDebt.fullAuthorizationVersion === FULL_AUTHORIZATION_VERSION &&
-      pendingDebt.accountId === null &&
-      pendingDebt.debtId === target.debt.id;
-    const full = authorized || inherited;
-
-    if (form !== null && !sameParty) {
-      problems.push({
-        field: 'counterparty',
-        message: `el mensaje nombra a "${form.party}" y la deuda es con "${target.debt.counterparty}"`,
-      });
-    }
-
-    // Modo e importe. El `settlementMode` del modelo es una lectura, no una
-    // autorizacion: el modo lo decide la autorizacion del texto y el importe lo dice el
-    // usuario. Un importe explicito es un pago parcial; si coincide con el pendiente,
-    // salda la deuda igual.
-    const outstanding = formatAmount(target.outstandingMinor, debtCurrency);
-    let mode: 'full' | 'partial' | null = null;
-    let paymentAmount: string | null = modelAmount;
-    if (full) {
-      if (inherited) {
-        // La autorizacion viene del borrador: el importe sigue siendo el pendiente.
-        mode = 'full';
-        paymentAmount = outstanding;
-      } else if (modelAmount === null) {
-        mode = 'full';
-        paymentAmount = outstanding;
-      } else {
-        const minor = tryParseAmount(modelAmount, paymentCurrency);
-        if (minor === null) {
-          problems.push({ field: 'amount', message: `el importe "${modelAmount}" no es valido` });
-          mode = 'partial';
-        } else if (minor > target.outstandingMinor) {
-          problems.push({
-            field: 'amount',
-            message: `el importe "${modelAmount}" supera el pendiente de la deuda (${outstanding})`,
-          });
-          mode = 'partial';
-        } else if (minor !== target.outstandingMinor) {
-          problems.push({
-            field: 'amount',
-            message: `dijiste que se pago todo, pero el importe "${modelAmount}" no coincide con el pendiente de la deuda (${outstanding})`,
-          });
-          mode = 'partial';
-        } else {
-          mode = 'full';
-          paymentAmount = outstanding;
-        }
-      }
-    } else if (invalidForm) {
-      // El mensaje es un pago del pendiente entero que el backend no puede preparar:
-      // no se hereda nada y el importe que propone el modelo no se usa. Se revoca y se
-      // vuelve a pedir el pago.
-      mode = null;
-      paymentAmount = null;
-      problems.push({
-        field: 'mode',
-        message:
-          'el mensaje dice que se pago todo pero no se puede preparar el pago: envialo otra vez con la persona y la cuenta',
-      });
-    } else if (modelAmount === null) {
-      // Sin autorizacion y sin importe: se pregunta el importe.
-      problems.push({
-        field: 'amount',
-        message:
-          'falta el importe del pago: di cuanto pagaste o di explicitamente que pagaste todo (por ejemplo, "ya le pagué todo")',
-      });
-      mode = null;
-      paymentAmount = null;
-    } else {
-      const minor = tryParseAmount(modelAmount, paymentCurrency);
-      if (minor === null) {
-        problems.push({ field: 'amount', message: `el importe "${modelAmount}" no es valido` });
-        mode = 'partial';
-      } else if (minor > target.outstandingMinor) {
-        problems.push({
-          field: 'amount',
-          message: `el importe "${modelAmount}" supera el pendiente de la deuda (${outstanding})`,
-        });
-        mode = 'partial';
-      } else if (
-        minor === target.outstandingMinor &&
-        !amountWritten(input.text, modelAmount, paymentCurrency)
-      ) {
-        // El importe es el pendiente entero y el usuario no lo escribio: es el importe
-        // del borrador anterior, no un pago dicho ahora. Se pregunta cuanto se pago.
-        problems.push({
-          field: 'amount',
-          message: `el importe "${modelAmount}" es el pendiente completo de la deuda (${outstanding}): di cuanto pagaste`,
-        });
-        mode = null;
-        paymentAmount = null;
-      } else {
-        mode = 'partial';
-      }
-    }
-
-    const account = accountId ? accounts.find((candidate) => candidate.id === accountId) : undefined;
-    if (!account) {
-      problems.push({
-        field: 'account',
-        message: accountProblem(accountText ?? input.text.trim(), accountText, named.ambiguous),
-      });
-    } else if (account.currency !== paymentCurrency) {
-      problems.push({
-        field: 'currency',
-        message: `la cuenta "${account.name}" opera en ${account.currency}, no en ${paymentCurrency}`,
-      });
-    }
-    problems.push(...dateProblems(draft));
-    if (draft.occurredOn !== null && isValidDate(draft.occurredOn) && draft.occurredOn < target.debt.occurredOn) {
-      problems.push({
-        field: 'date',
-        message: `el pago no puede ser anterior a la fecha de la deuda (${target.debt.occurredOn})`,
-      });
-    }
-
-    debt.direction = target.debt.direction;
-    debt.counterparty = target.debt.counterparty;
-    debt.debtId = target.debt.id;
-    debt.settlementMode = mode;
-    debt.amount = paymentAmount;
-    debt.accountId = accountId;
-    debt.expectedOutstandingMinor = target.outstandingMinor.toString();
-    debt.fullIntent = full;
-    debt.fullAuthorizationVersion = full ? FULL_AUTHORIZATION_VERSION : null;
-    draft.amount = debt.amount;
-    draft.accountId = debt.accountId;
-
-    if (problems.length > 0) {
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        draft,
-        'awaiting_details',
-        detailsReply(problems, accounts, 'Faltan datos para registrar el pago:'),
-      );
-    }
-    return this.saveDraft(
-      event,
-      input,
-      pending,
-      draft,
-      'awaiting_confirmation',
-      debtSettleReply(draft, target, account),
-    );
+    return this.complete(event, input, pending?.state ?? null, reply);
   }
 
   /**
-   * Elige una deuda de la lista numerada que quedo pendiente. La eleccion se resuelve
-   * **sin llamar al modelo**: el numero es la fuente de verdad y el id es el que estaba
-   * guardado, no el que el modelo proponga.
+   * La ventana del chat del mensaje actual. Se carga **una vez** y solo cuando hace
+   * falta: los comandos y las operaciones normales no la piden.
    *
-   * La opcion solo vale si la deuda **sigue igual que cuando se mostro** (mismo
-   * pendiente, misma moneda, todavia pendiente). Si no, no se elige en silencio: se
-   * refresca la lista —sin cambiar el orden, para que el numero signifique siempre la
-   * misma deuda— y se vuelve a preguntar.
-   *
-   * La eleccion **no autoriza un pago total**: el importe y la cuenta se siguen
-   * pidiendo si faltan.
+   * Solo viajan el rol y el texto: ningun metadato interno del transporte sale de aqui.
+   */
+  private async readHistoryWindow(input: NormalizedRequest): Promise<HistoryTurn[]> {
+    const loader = input.history;
+    if (loader === null) {
+      return [];
+    }
+    const turns = await loader();
+    return turns.map((turn) => ({ role: turn.role, text: turn.text }));
+  }
+
+  /**
+   * Elige una deuda de la lista numerada que quedo pendiente y prepara el pago con
+   * ella. La lista y el pago los prepara la captura de deudas; aqui solo se guarda
+   * lo que devuelve.
    */
   private async debtChoice(
     event: CaptureEvent,
     input: NormalizedRequest,
     pending: Capture,
+    pendingDraft: PendingDraft,
     index: number,
   ): Promise<CaptureOutcome> {
-    const draft = draftOf(pending);
-    const debt = draft.debt;
-    const choices = debt?.choices ?? [];
-    if (index < 1 || index > choices.length) {
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        draft,
-        'awaiting_details',
-        `La opcion ${index} no esta en la lista.\n${choicePrompt(choices)}`,
-      );
-    }
-
-    const chosen = choices[index - 1]!;
-    const view = await this.debts.get(chosen.id).catch(() => null);
-    if (view === null || !this.choiceStillHolds(chosen, view, debt)) {
-      // La opcion ya no vale: se refresca la lista y se vuelve a preguntar.
-      const refreshed = await this.openChoices(choices);
-      const cleared = debt === null ? draft : { ...draft, debt: { ...debt, debtId: null, choices: refreshed } };
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        cleared,
-        'awaiting_details',
-        refreshed.every((choice) => choice.outstandingMinor === null)
-          ? 'Ninguna de las deudas que te mostre sigue pendiente. Vuelve a escribir el pago con la persona y el importe.'
-          : `La deuda que elegiste ya no esta pendiente o su importe cambio. Elige de nuevo:\n${choicePrompt(refreshed)}`,
-      );
-    }
-
-    // La deuda elegida manda: el resto del pago se prepara como siempre, con los datos
-    // que ya tenia el borrador y sin que la eleccion autorice un pago total.
-    const operation: Operation = {
-      kind: 'debt_settle',
-      amount: debt?.amount ?? null,
-      currency: debt?.currency ?? null,
-      accountId: debt?.accountId ?? null,
-      occurredOn: debt?.occurredOn ?? null,
-      description: debt?.description ?? null,
-      debt: {
-        direction: debt?.direction ?? null,
-        counterparty: debt?.counterparty ?? null,
-        debtId: null,
-        settlementMode: null,
-        status: null,
-      },
-    };
     const accounts = await this.activeAccounts();
     const defaultDate = dateInTimeZone(input.receivedAt, DEFAULT_TIME_ZONE);
-    return this.debtSettleDraft(event, input, pending, operation, accounts, defaultDate, view);
-  }
-
-  /**
-   * `true` si la opcion elegida sigue valiendo: la deuda sigue pendiente, con el mismo
-   * pendiente y la misma moneda que se le mostraron, y encaja con lo que pide el
-   * borrador.
-   *
-   * Una opcion **sin foto** (escrita antes de existirla) no vale: se refresca la lista
-   * y se vuelve a preguntar, nunca se elige a ciegas.
-   */
-  private choiceStillHolds(choice: DebtChoice, view: DebtView, debt: DebtDraft | null): boolean {
-    if (view.status === 'paid') {
-      return false;
-    }
-    if (choice.outstandingMinor === null || choice.currency === null) {
-      return false;
-    }
-    if (choice.outstandingMinor !== view.outstandingMinor.toString()) {
-      return false;
-    }
-    if (choice.currency !== view.debt.currency) {
-      return false;
-    }
-    return !contradicts(view, {
-      direction: debt?.direction ?? null,
-      counterparty: debt?.counterparty ?? null,
-      currency: debt?.currency ?? null,
+    const prepared = await this.debtCapture.choose({
+      pending: pendingDraft,
+      index,
+      accounts,
+      defaultDate,
+      text: input.text,
     });
-  }
-
-  /**
-   * Las deudas de una lista, **en el mismo orden** (el numero sigue significando la
-   * misma deuda) y con la etiqueta y la foto al dia. Las que ya no están pendientes se
-   * marcan en vez de quitarse: asi el usuario no elige por numero una deuda que no es
-   * la que tenia delante.
-   */
-  private async openChoices(choices: DebtChoice[]): Promise<DebtChoice[]> {
-    const refreshed: DebtChoice[] = [];
-    for (const choice of choices) {
-      const view = await this.debts.get(choice.id).catch(() => null);
-      if (view === null) {
-        refreshed.push({ ...choice, outstandingMinor: null, currency: null, label: `${choice.label} | ya no existe` });
-        continue;
-      }
-      if (view.status === 'paid') {
-        refreshed.push({ ...choice, outstandingMinor: null, currency: null, label: `${choice.label} | ya esta pagada` });
-        continue;
-      }
-      refreshed.push(debtChoiceOf(view));
-    }
-    return refreshed;
-  }
-
-  /**
-   * Busca la deuda que el usuario quiere pagar.
-   *
-   * El id cuenta solo si el usuario **lo escribió en este mensaje**: manda sobre el
-   * borrador vivo. Sin id escrito ahora, el del borrador vivo es una pista (tiene que
-   * seguir siendo compatible) y, si no lo es, se busca por contraparte, direccion y
-   * moneda exactas. Un id propuesto por el modelo nunca resuelve nada.
-   *
-   * Cuando hay mas de una deuda posible no se elige ninguna: se muestran numeradas y
-   * el usuario elige con el numero. Los ids de la lista no se muestran nunca.
-   */
-  private async resolveDebtTarget(input: {
-    direction: DebtDirection | null;
-    counterparty: string | null;
-    currency: string | null;
-    userText: string;
-    pendingDebtId: string | null;
-    accounts: AccountOption[];
-  }): Promise<TargetResolution> {
-    const written = idsInText(input.userText, input.accounts);
-    if (written.length > 1) {
-      // Varias deudas escritas en este mensaje: la ambiguedad se conserva, no se elige.
-      const rows = await this.debts.list();
-      const mentioned = rows.filter((row) => row.status !== 'paid' && written.includes(row.debt.id));
-      if (mentioned.length === 0) {
-        return {
-          kind: 'ask',
-          problems: [{ field: 'debtId', message: 'no existe ninguna de las deudas que mencionas' }],
-        };
-      }
-      const choices = debtChoices(mentioned);
-      return {
-        kind: 'ask',
-        problems: [{ field: 'debtId', message: 'el mensaje menciona varias deudas; indica cual es' }],
-        detail: choicePrompt(choices),
-        choices,
-      };
-    }
-    if (written.length === 1) {
-      return this.resolveWrittenDebt(written[0]!, input);
-    }
-
-    // Sin id escrito ahora: el del borrador vivo sirve solo si sigue encajando.
-    if (input.pendingDebtId !== null) {
-      const view = await this.debts.get(input.pendingDebtId).catch(() => null);
-      if (view !== null && view.status !== 'paid' && !contradicts(view, input)) {
-        return { kind: 'resolved', debt: view };
-      }
-    }
-
-    const problems: DraftProblem[] = [];
-    if (input.direction === null) {
-      problems.push({ field: 'direction', message: 'falta indicar si la deuda es a pagar o a cobrar' });
-    }
-    if (input.counterparty === null) {
-      problems.push({ field: 'counterparty', message: 'falta la contraparte' });
-    }
-    if (input.currency === null) {
-      problems.push({ field: 'currency', message: `falta la moneda (${CURRENCY_CODES.join(', ')})` });
-    } else if (!isCurrency(input.currency)) {
-      problems.push({ field: 'currency', message: `la moneda "${input.currency}" no esta soportada` });
-    }
-    if (problems.length > 0) {
-      return { kind: 'ask', problems };
-    }
-
-    const rows = await this.debts.list({
-      direction: input.direction as DebtDirection,
-      currency: input.currency as Currency,
-      counterparty: input.counterparty as string,
-    });
-    const candidates = rows.filter((row) => row.status !== 'paid');
-    if (candidates.length === 0) {
-      return {
-        kind: 'ask',
-        problems: [
-          {
-            field: 'counterparty',
-            message: `no hay ninguna deuda pendiente con "${input.counterparty}" en ${input.currency}`,
-          },
-        ],
-      };
-    }
-    if (candidates.length > 1) {
-      const choices = debtChoices(candidates);
-      return {
-        kind: 'ask',
-        problems: [
-          { field: 'debtId', message: 'hay varias deudas con esa contraparte; indica cual quieres pagar' },
-        ],
-        detail: choicePrompt(choices, candidates.length > choices.length),
-        choices,
-      };
-    }
-    return { kind: 'resolved', debt: candidates[0]! };
-  }
-
-  /**
-   * Deuda que el usuario escribio en este mensaje. El id es del usuario, pero tiene que
-   * encajar con lo que el mismo mensaje pide (contraparte, direccion y moneda): si no,
-   * se pregunta y no se muta nada.
-   */
-  private async resolveWrittenDebt(
-    id: string,
-    input: { direction: DebtDirection | null; counterparty: string | null; currency: string | null },
-  ): Promise<TargetResolution> {
-    const view = await this.debts.get(id).catch(() => null);
-    if (!view) {
-      return {
-        kind: 'ask',
-        problems: [{ field: 'debtId', message: `no existe ninguna deuda con el id "${id}"` }],
-      };
-    }
-    if (view.status === 'paid') {
-      return {
-        kind: 'ask',
-        problems: [{ field: 'debtId', message: `la deuda "${id}" ya esta pagada` }],
-      };
-    }
-    if (contradicts(view, input)) {
-      return {
-        kind: 'ask',
-        problems: [
-          {
-            field: 'debtId',
-            message:
-              'la deuda indicada no coincide con la contraparte, la direccion o la moneda del pago',
-          },
-        ],
-      };
-    }
-    return { kind: 'resolved', debt: view };
-  }
-
-  /**
-   * Responde a una consulta de deudas. Es de solo lectura: no toca el borrador
-   * pendiente y no registra nada.
-   */
-  private async debtQueryReply(
-    event: CaptureEvent,
-    input: NormalizedRequest,
-    pending: Capture | null,
-    operation: Operation,
-    accounts: AccountOption[],
-  ): Promise<CaptureOutcome> {
-    const model = operation.debt;
-    const direction = model?.direction ?? null;
-    const counterparty = normalizeCounterparty(model?.counterparty ?? null);
-    const status = model?.status ?? null;
-    const currency = operation.currency === null ? null : operation.currency.trim();
-    const rows = await this.debts.list();
-
-    const written = idsInText(input.text, accounts);
-    const selected = written.length > 0
-      ? rows.filter((row) => written.includes(row.debt.id))
-      : rows.filter(
-          (row) =>
-            (direction === null || row.debt.direction === direction) &&
-            (counterparty === null ||
-              canonicalName(row.debt.counterparty) === canonicalName(counterparty)) &&
-            (currency === null || row.debt.currency === currency) &&
-            (status === null ? row.status !== 'paid' : row.status === status),
-        );
-
-    const reply = formatDebtReport(
-      selected.map((row) => ({
-        id: row.debt.id,
-        direction: row.debt.direction,
-        counterparty: row.debt.counterparty,
-        currency: row.debt.currency,
-        principalMinor: row.debt.principalMinor,
-        paidMinor: row.paidMinor,
-        outstandingMinor: row.outstandingMinor,
-        status: row.status,
-      })),
-      {
-        title: 'Deudas:',
-        showIds: false,
-        fallback: DEBT_CLI_FALLBACK,
-        empty:
-          status === null
-            ? 'No hay deudas pendientes que coincidan con la consulta.'
-            : 'No hay deudas que coincidan con la consulta.',
-      },
-    );
-    return this.complete(event, input, pending?.state ?? null, reply);
+    return this.saveDraft(event, input, pending, prepared);
   }
 
   /** Confirma el borrador vivo y registra el movimiento. */
@@ -1044,14 +594,11 @@ export class CaptureService {
     const defaultDate = dateInTimeZone(input.receivedAt, DEFAULT_TIME_ZONE);
     const problems = validateDraft(draft, accounts);
     if (problems.length > 0) {
-      return this.saveDraft(
-        event,
-        input,
-        pending,
+      return this.saveDraft(event, input, pending, {
         draft,
-        'awaiting_details',
-        detailsReply(problems, accounts),
-      );
+        state: 'awaiting_details',
+        reply: detailsReply(problems, accounts),
+      });
     }
 
     const account = accounts.find((candidate) => candidate.id === pending.accountId);
@@ -1096,14 +643,11 @@ export class CaptureService {
       // cualquier otro fallo se informa de forma generica para no filtrar detalles
       // internos de la base de datos.
       const message = safeErrorMessage(error);
-      return this.saveDraft(
-        event,
-        input,
-        pending,
+      return this.saveDraft(event, input, pending, {
         draft,
-        'awaiting_details',
-        `No se pudo registrar la operacion: ${message}`,
-      );
+        state: 'awaiting_details',
+        reply: `No se pudo registrar la operacion: ${message}`,
+      });
     }
   }
 
@@ -1121,14 +665,11 @@ export class CaptureService {
     const debt = draft.debt;
     if (debt === null) {
       // El borrador guardado no se pudo leer: no se adivina nada.
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        emptyDraft(),
-        'awaiting_details',
-        BROKEN_DEBT_DRAFT_REPLY,
-      );
+      return this.saveDraft(event, input, pending, {
+        draft: emptyDraft(),
+        state: 'awaiting_details',
+        reply: BROKEN_DEBT_DRAFT_REPLY,
+      });
     }
     const problems = validateDebtDraft(draft, accounts);
     if (problems.length > 0) {
@@ -1138,14 +679,11 @@ export class CaptureService {
           : 'Faltan datos para registrar el pago:';
       // Un pago total sin autorizacion vigente no se queda guardado como tal: la
       // invalidacion se persiste para que el borrador no pueda volver a confirmar.
-      return this.saveDraft(
-        event,
-        input,
-        pending,
-        withoutFullAuthorization(draft),
-        'awaiting_details',
-        detailsReply(problems, accounts, title),
-      );
+      return this.saveDraft(event, input, pending, {
+        draft: withoutFullAuthorization(draft),
+        state: 'awaiting_details',
+        reply: detailsReply(problems, accounts, title),
+      });
     }
 
     try {
@@ -1216,15 +754,12 @@ export class CaptureService {
         movementId: result.movementId,
       };
     } catch (error) {
-      const message = await this.debtErrorMessage(error, draft);
-      return this.saveDraft(
-        event,
-        input,
-        pending,
+      const message = await this.debtCapture.errorMessage(error, draft);
+      return this.saveDraft(event, input, pending, {
         draft,
-        'awaiting_details',
-        `No se pudo registrar la operacion: ${message}`,
-      );
+        state: 'awaiting_details',
+        reply: `No se pudo registrar la operacion: ${message}`,
+      });
     }
   }
 
@@ -1235,10 +770,7 @@ export class CaptureService {
       return this.complete(event, input, null, NOTHING_TO_CANCEL_REPLY);
     }
     await this.transactions.run(async (manager) => {
-      await manager.getRepository(Capture).update(
-        { id: pending.id },
-        { state: 'cancelled', sourceText: null, debtPayload: null },
-      );
+      await this.cancelPending(input.chatId, manager);
       await manager.getRepository(CaptureEvent).update(
         { id: event.id },
         { state: 'completed', reply: CANCELLED_REPLY, captureState: 'cancelled', movementId: null },
@@ -1259,10 +791,9 @@ export class CaptureService {
     event: CaptureEvent,
     input: NormalizedRequest,
     pending: Capture | null,
-    draft: Draft,
-    state: 'awaiting_details' | 'awaiting_confirmation',
-    reply: string,
+    result: DraftResult,
   ): Promise<CaptureOutcome> {
+    const { draft, state, reply } = result;
     await this.transactions.run(async (manager) => {
       const repository = manager.getRepository(Capture);
       // Lo que no aplica al borrador se limpia: al cambiar de una operacion ordinaria a
@@ -1372,10 +903,7 @@ export class CaptureService {
   ): Promise<CaptureOutcome> {
     const message = `${reply}\n\n${RESEND_REPLY}`;
     await this.transactions.run(async (manager) => {
-      await manager.getRepository(Capture).update(
-        { chatId: input.chatId, state: In(['awaiting_details', 'awaiting_confirmation']) },
-        { state: 'cancelled', sourceText: null, debtPayload: null },
-      );
+      await this.cancelPending(input.chatId, manager);
       await manager.getRepository(CaptureEvent).update(
         { id: event.id },
         { state: 'uncertain', reply: message },
@@ -1391,14 +919,62 @@ export class CaptureService {
     };
   }
 
-  private async createEvent(input: NormalizedRequest): Promise<CaptureEvent> {
+  /**
+   * El evento queda **leyendo** el contexto: la consulta de seguimiento esta en
+   * curso. Si el proceso se cae aqui, la reentrada ve este estado y completa la
+   * respuesta sin volver a llamar al proveedor.
+   */
+  private async markReading(event: CaptureEvent): Promise<void> {
+    await this.transactions.run(async (manager) => {
+      await manager.getRepository(CaptureEvent).update({ id: event.id }, { state: 'reading' });
+    });
+  }
+
+  /**
+   * La consulta de seguimiento quedo interrumpida: se completa **sin volver a gastar**
+   * y **sin tocar el borrador** (a diferencia del evento 'processing', que cancela el
+   * borrador porque era una correccion que no se pudo interpretar).
+   *
+   * La respuesta pide repetir la pregunta con la persona.
+   */
+  private async recoverReading(event: CaptureEvent, input: NormalizedRequest): Promise<CaptureOutcome> {
+    await this.transactions.run(async (manager) => {
+      await manager.getRepository(CaptureEvent).update(
+        { id: event.id },
+        {
+          state: 'completed',
+          reply: FOLLOW_UP_REFORMULATE_REPLY,
+          captureState: null,
+          movementId: null,
+        },
+      );
+    });
+    return {
+      eventId: input.eventId,
+      chatId: input.chatId,
+      captureState: null,
+      reply: FOLLOW_UP_REFORMULATE_REPLY,
+      replayed: false,
+      movementId: null,
+    };
+  }
+
+  /**
+   * Crea el evento con el estado con el que **nace**.
+   *
+   * La pregunta de lectura nace en 'reading': no hay un paso transitorio por
+   * 'processing', asi que una interrupcion (o un fallo) despues de esta escritura
+   * deja el evento en 'reading' y la reentrada completa la respuesta **sin volver a
+   * clasificar ni gastar** y sin tocar el borrador.
+   */
+  private async createEvent(input: NormalizedRequest, state: CaptureEventState): Promise<CaptureEvent> {
     return this.transactions.run(async (manager) => {
       const repository = manager.getRepository(CaptureEvent);
       return repository.save(
         repository.create({
           eventId: input.eventId,
           chatId: input.chatId,
-          state: 'processing',
+          state,
           reply: null,
           captureState: null,
           movementId: null,
@@ -1420,6 +996,11 @@ export class CaptureService {
     });
   }
 
+  /** El borrador vivo de la conversacion, con su estado. */
+  private pendingOf(pending: Capture): PendingDraft {
+    return { draft: draftOf(pending), state: pending.state };
+  }
+
   private async activeAccounts(): Promise<AccountOption[]> {
     const accounts = await this.dataSource.getRepository(Account).find({
       where: { active: true },
@@ -1430,47 +1011,6 @@ export class CaptureService {
       name: account.name,
       currency: account.currency,
     }));
-  }
-
-  /**
-   * Resumenes acotados de las deudas que se pueden pagar. La lista es la que ve el
-   * modelo; la fuente de verdad sigue siendo la base de datos del backend.
-   */
-  private async debtCandidates(): Promise<{ debts: DebtCandidate[]; truncated: boolean }> {
-    const rows = await this.debts.list();
-    const pending = rows.filter((row) => row.status !== 'paid');
-    const debts = pending.slice(0, MAX_DEBT_CANDIDATES).map((row) => ({
-      id: row.debt.id,
-      direction: row.debt.direction,
-      counterparty: row.debt.counterparty,
-      currency: row.debt.currency,
-      outstanding: formatAmount(row.outstandingMinor, row.debt.currency),
-      status: row.status as 'open' | 'partial',
-      occurredOn: row.debt.occurredOn,
-      description: row.debt.description,
-    }));
-    return { debts, truncated: pending.length > MAX_DEBT_CANDIDATES };
-  }
-
-  /**
-   * Mensaje de error de un pago de deuda. Si el pendiente cambio, se dice con todas las
-   * letras: no se paga un total nuevo en silencio.
-   */
-  private async debtErrorMessage(error: unknown, draft: Draft): Promise<string> {
-    if (error instanceof ConflictError && draft.debt?.expectedOutstandingMinor) {
-      const currency = (draft.debt.currency ?? 'USD') as Currency;
-      const expected = formatAmount(BigInt(draft.debt.expectedOutstandingMinor), currency);
-      const current = await this.debts
-        .get(draft.debt.debtId as string)
-        .then((view) => formatAmount(view.outstandingMinor, view.debt.currency))
-        .catch(() => null);
-      return (
-        `el pendiente de la deuda cambio: se preparo con ${expected}` +
-        (current === null ? '' : ` y ahora es ${current}`) +
-        '. Vuelve a enviar el mensaje para preparar el pago de nuevo; no se registro nada'
-      );
-    }
-    return safeErrorMessage(error);
   }
 }
 
@@ -1487,6 +1027,7 @@ function normalizeRequest(request: CaptureRequest): NormalizedRequest {
     chatId,
     text: typeof request?.text === 'string' ? request.text : '',
     receivedAt: instant,
+    history: request?.history ?? null,
   };
 }
 
@@ -1519,594 +1060,6 @@ function detectCommand(text: string): 'confirm' | 'cancel' | null {
     return 'cancel';
   }
   return null;
-}
-
-function emptyDraft(): Draft {
-  return {
-    kind: null,
-    amount: null,
-    currency: null,
-    accountId: null,
-    occurredOn: null,
-    description: null,
-    debt: null,
-  };
-}
-
-/**
- * Lee el borrador guardado. Para un borrador de deuda manda el JSON validado: si el
- * JSON esta roto, el borrador se considera ilegible y no se adivina nada.
- */
-function draftOf(capture: Capture): Draft {
-  const isDebt = capture.kind === 'debt_create' || capture.kind === 'debt_settle';
-  const debt = isDebt ? parseDebtDraft(capture.debtPayload) : null;
-  if (debt !== null) {
-    return {
-      kind: capture.kind,
-      amount: debt.amount,
-      currency: debt.currency,
-      accountId: debt.accountId,
-      occurredOn: debt.occurredOn,
-      description: debt.description,
-      debt,
-    };
-  }
-  return {
-    kind: isDebt ? null : capture.kind,
-    amount: capture.amount,
-    currency: capture.currency,
-    accountId: capture.accountId,
-    occurredOn: capture.occurredOn,
-    description: capture.description,
-    debt: null,
-  };
-}
-
-function toPendingOperation(capture: Capture): PendingOperation {
-  const draft = draftOf(capture);
-  const pending: PendingOperation = {
-    kind: draft.kind === 'income' || draft.kind === 'expense' ? draft.kind : null,
-    amount: draft.amount,
-    currency: draft.currency,
-    accountId: draft.accountId,
-    occurredOn: draft.occurredOn,
-    description: draft.description,
-    sourceText: capture.sourceText ?? '',
-  };
-  if (draft.debt !== null) {
-    pending.debt = {
-      kind: draft.debt.kind,
-      direction: draft.debt.direction,
-      counterparty: draft.debt.counterparty,
-      debtId: draft.debt.debtId,
-      settlementMode: draft.debt.settlementMode,
-      amount: draft.debt.amount,
-      currency: draft.debt.currency,
-      accountId: draft.debt.accountId,
-      occurredOn: draft.debt.occurredOn,
-      description: draft.debt.description,
-    };
-  }
-  return pending;
-}
-
-/**
- * Ids de deuda que el usuario **escribio** en su mensaje. El id de una cuenta no es un
- * id de deuda: escribirlo nombra la cuenta, no cambia el objetivo del pago.
- */
-function idsInText(text: string, accounts: AccountOption[]): string[] {
-  const matches = text.match(/[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}/gi) ?? [];
-  const accountIds = new Set(accounts.map((account) => account.id.toLowerCase()));
-  return [...new Set(matches.map((value) => value.toLowerCase()))].filter(
-    (id) => !accountIds.has(id),
-  );
-}
-
-/**
- * Las deudas que el usuario puede elegir, en orden, con su etiqueta legible. El id se
- * guarda para poder pagar esa deuda, pero no se muestra: el usuario elige con el
- * numero. Cada opcion guarda tambien la **foto** de lo que se mostro (el pendiente y
- * su moneda) para poder comprobar despues que la opcion sigue valiendo.
- */
-function debtChoices(rows: DebtView[]): DebtChoice[] {
-  return rows.slice(0, MAX_DEBT_CHOICES).map(debtChoiceOf);
-}
-
-/** Una opcion de la lista: id, etiqueta y foto del pendiente. */
-function debtChoiceOf(row: DebtView): DebtChoice {
-  return {
-    id: row.debt.id,
-    label: debtChoiceLabel(row),
-    outstandingMinor: row.outstandingMinor.toString(),
-    currency: row.debt.currency,
-  };
-}
-
-/** Etiqueta de una deuda: fecha, pendiente, direccion, persona y descripcion. */
-function debtChoiceLabel(row: DebtView): string {
-  const currency = row.debt.currency;
-  const parts = [
-    row.debt.occurredOn,
-    `pendiente ${formatAmount(row.outstandingMinor, currency)} ${currency}`,
-    directionLabel(row.debt.direction),
-    row.debt.counterparty,
-  ];
-  const description = row.debt.description;
-  if (description !== null && description.length > 0) {
-    parts.push(description);
-  }
-  return parts.join(' | ').slice(0, MAX_CHOICE_LABEL_LENGTH);
-}
-
-/** La lista de deudas que ve el usuario: numerada y sin identificadores. */
-function choicePrompt(choices: DebtChoice[], more = false): string {
-  return [
-    'Elige la deuda (responde solo con el numero de la opcion):',
-    ...choices.map((choice, index) => `  ${index + 1}. ${choice.label}`),
-    ...(more ? ['Hay mas deudas con esa persona: di el importe o la fecha para saber cual es.'] : []),
-  ].join('\n');
-}
-
-/**
- * El numero de opcion que responde el usuario, si el mensaje es solo eso. Solo cuenta
- * si hay una lista de deudas pendiente: un numero suelto responde a esa lista.
- */
-function choiceIndex(text: string, pending: Capture): number | null {
-  const choices = draftOf(pending).debt?.choices ?? [];
-  if (choices.length === 0) {
-    return null;
-  }
-  const match = /^(?:(?:la|el)\s+)?(?:opci[oó]n\s+)?#?(\d{1,2})$/i.exec(text.trim());
-  return match === null ? null : Number(match[1]);
-}
-
-/**
- * `true` si la contraparte, la direccion o la moneda del pago contradicen la deuda
- * indicada. La contraparte se compara de forma canonica (como en el dominio): solo
- * encaja si es la misma persona.
- */
-function contradicts(
-  debt: DebtView,
-  input: { direction: DebtDirection | null; counterparty: string | null; currency: string | null },
-): boolean {
-  if (input.direction !== null && input.direction !== debt.debt.direction) {
-    return true;
-  }
-  if (input.currency !== null && isCurrency(input.currency) && input.currency !== debt.debt.currency) {
-    return true;
-  }
-  if (
-    input.counterparty !== null &&
-    canonicalName(input.counterparty) !== canonicalName(debt.debt.counterparty)
-  ) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * La fecha por defecto (la del mensaje en la zona del usuario) se aplica **solo** cuando
- * el modelo no da fecha (`null`). Cualquier otro valor no nulo se conserva tal cual: una
- * fecha vacia, en blanco o que no existe en el calendario no se sustituye en silencio, se
- * pide una fecha valida y la operacion no se puede confirmar.
- */
-function resolveDate(value: string | null, defaultDate: string): string | null {
-  if (value === null) {
-    return defaultDate;
-  }
-  return value.trim();
-}
-
-/** `true` si la fecha existe en el calendario. */
-function isValidDate(value: string): boolean {
-  try {
-    parseDate(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * El importe se guarda como decimal corto. Un valor que no cabe no es un importe: se
- * descarta y se vuelve a pedir.
- */
-function normalizeAmount(value: string | null): string | null {
-  if (value === null) {
-    return null;
-  }
-  const trimmed = value.trim();
-  if (trimmed.length === 0 || trimmed.length > MAX_AMOUNT_LENGTH) {
-    return null;
-  }
-  return trimmed;
-}
-
-/** La contraparte se guarda como texto corto y con espacios colapsados. */
-function normalizeCounterparty(value: string | null): string | null {
-  if (value === null) {
-    return null;
-  }
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length === 0) {
-    return null;
-  }
-  return normalized.slice(0, MAX_COUNTERPARTY_LENGTH);
-}
-
-/**
- * Mensaje seguro para el usuario. Solo los errores de dominio del backend (reglas de
- * negocio) se muestran tal cual; cualquier otro fallo se resume sin detalle.
- */
-function safeErrorMessage(error: unknown): string {
-  if (
-    error instanceof ValidationError ||
-    error instanceof ConflictError ||
-    error instanceof NotFoundError
-  ) {
-    return error.message;
-  }
-  return 'ocurrio un error inesperado y no se registro nada.';
-}
-
-/**
- * La descripcion se guarda en una sola linea: se colapsan los espacios y se recortan los
- * saltos de linea del modelo. Se conserva un maximo de caracteres porque la columna
- * del movimiento es corta.
- */
-function normalizeDescription(value: string | null): string | null {
-  if (value === null) {
-    return null;
-  }
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length === 0) {
-    return null;
-  }
-  return normalized.slice(0, MAX_DESCRIPTION_LENGTH);
-}
-
-/**
- * Valida el borrador con las reglas del backend: cuenta existente y activa, moneda
- * soportada y coherente con la cuenta, importe exacto para la escala de la moneda.
- * Lo que falta se pide al usuario: no se inventa ningun dato.
- */
-function validateDraft(draft: Draft, accounts: AccountOption[]): DraftProblem[] {
-  const problems: DraftProblem[] = [];
-  const account = draft.accountId
-    ? accounts.find((candidate) => candidate.id === draft.accountId)
-    : undefined;
-
-  if (draft.kind === null) {
-    problems.push({ field: 'kind', message: 'falta indicar si es un gasto o un ingreso' });
-  }
-  problems.push(...amountProblems(draft));
-  problems.push(...currencyProblems(draft, account));
-
-  if (!account) {
-    problems.push({ field: 'account', message: 'falta la cuenta' });
-  }
-  problems.push(...dateProblems(draft));
-
-  return problems;
-}
-
-/** Importe: presente, positivo y con la escala exacta de la moneda. */
-function amountProblems(draft: Draft): DraftProblem[] {
-  const problems: DraftProblem[] = [];
-  if (draft.amount === null) {
-    problems.push({ field: 'amount', message: 'falta el importe' });
-  } else if (!isPositiveDecimal(draft.amount)) {
-    problems.push({ field: 'amount', message: `el importe "${draft.amount}" no es valido` });
-  } else if (draft.currency !== null && isCurrency(draft.currency)) {
-    try {
-      parseAmount(draft.amount, draft.currency);
-    } catch (error) {
-      problems.push({
-        field: 'amount',
-        message: error instanceof Error ? error.message : 'el importe no es valido',
-      });
-    }
-  }
-  return problems;
-}
-
-/** Moneda: presente, soportada y coherente con la cuenta elegida. */
-function currencyProblems(draft: Draft, account: AccountOption | undefined): DraftProblem[] {
-  const problems: DraftProblem[] = [];
-  if (draft.currency === null) {
-    problems.push({ field: 'currency', message: `falta la moneda (${CURRENCY_CODES.join(', ')})` });
-  } else if (!isCurrency(draft.currency)) {
-    problems.push({
-      field: 'currency',
-      message: `la moneda "${draft.currency}" no esta soportada`,
-    });
-  } else if (account && account.currency !== draft.currency) {
-    problems.push({
-      field: 'currency',
-      message: `la cuenta "${account.name}" opera en ${account.currency}, no en ${draft.currency}`,
-    });
-  }
-  return problems;
-}
-
-/** Fecha: presente y existente en el calendario. */
-function dateProblems(draft: Draft): DraftProblem[] {
-  if (draft.occurredOn === null || isValidDate(draft.occurredOn)) {
-    return [];
-  }
-  return [
-    {
-      field: 'date',
-      message:
-        draft.occurredOn.length === 0
-          ? 'falta la fecha (se espera YYYY-MM-DD)'
-          : `la fecha "${draft.occurredOn}" no es valida (se espera YYYY-MM-DD)`,
-    },
-  ];
-}
-
-/** Deuda nueva: direccion, contraparte, importe, moneda y fecha. */
-function validateDebtCreate(draft: Draft): DraftProblem[] {
-  const problems: DraftProblem[] = [];
-  const debt = draft.debt;
-  if (debt === null || debt.direction === null) {
-    problems.push({ field: 'direction', message: 'falta indicar si la deuda es a pagar o a cobrar' });
-  }
-  if (debt === null || debt.counterparty === null) {
-    problems.push({ field: 'counterparty', message: 'falta la contraparte' });
-  }
-  problems.push(...amountProblems(draft));
-  problems.push(...currencyProblems(draft, undefined));
-  problems.push(...dateProblems(draft));
-  return problems;
-}
-
-/** Pago de deuda: cuenta activa, importe, moneda y fecha. */
-function validateDebtDraft(draft: Draft, accounts: AccountOption[]): DraftProblem[] {
-  const debt = draft.debt;
-  if (debt === null) {
-    return [{ field: 'kind', message: 'falta el borrador de la deuda' }];
-  }
-  if (debt.kind === 'debt_create') {
-    return validateDebtCreate(draft);
-  }
-  const problems: DraftProblem[] = [];
-  if (debt.debtId === null) {
-    problems.push({ field: 'debtId', message: 'falta la deuda que se quiere pagar' });
-  }
-  if (debt.settlementMode === 'full' && !hasFullAuthorization(debt)) {
-    // Un pago total solo es valido si el mensaje entero del usuario lo autorizo. Los
-    // borradores escritos antes de existir la autorizacion no la tienen: se piden de
-    // nuevo, aunque su `fullIntent` diga que si.
-    problems.push({
-      field: 'mode',
-      message:
-        'el pago total no tiene la autorizacion del usuario: pide de nuevo el pago para que confirme que pago todo',
-    });
-  }
-  if (debt.amount === null) {
-    problems.push({ field: 'amount', message: 'falta el importe del pago' });
-  }
-  const account = debt.accountId
-    ? accounts.find((candidate) => candidate.id === debt.accountId)
-    : undefined;
-  if (!account) {
-    problems.push({ field: 'account', message: 'falta la cuenta' });
-  }
-  problems.push(...currencyProblems(draft, account));
-  problems.push(...dateProblems(draft));
-  return problems;
-}
-
-function isPositiveDecimal(value: string): boolean {
-  const match = /^\d+(?:\.\d+)?$/.exec(value.trim());
-  if (!match) {
-    return false;
-  }
-  const [whole = '0', fraction = '0'] = match[0].split('.');
-  return BigInt(whole) > 0n || BigInt(fraction) > 0n;
-}
-
-/** Importe en unidades menores, o `null` si no es un importe valido para la moneda. */
-function tryParseAmount(value: string, currency: Currency): bigint | null {
-  try {
-    return parseAmount(value, currency);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * `true` cuando el borrador tiene una autorizacion de pago total vigente: la que da el
- * mensaje entero del usuario. Un borrador escrito antes de existir esa autorizacion
- * (`fullIntent` en `true` pero sin version) no la tiene.
- */
-function hasFullAuthorization(debt: DebtDraft): boolean {
-  return debt.fullIntent === true && debt.fullAuthorizationVersion === FULL_AUTHORIZATION_VERSION;
-}
-
-/**
- * Un pago total sin autorizacion vigente (un borrador viejo, o una autorizacion que el
- * mensaje nuevo ha dejado sin efecto) no puede seguir guardado como un pago total: se
- * borran el modo, el importe derivado y la autorizacion.
- */
-function withoutFullAuthorization(draft: Draft): Draft {
-  const debt = draft.debt;
-  if (debt === null || (debt.settlementMode !== 'full' && !debt.fullIntent)) {
-    return draft;
-  }
-  const cleared: DebtDraft = {
-    ...debt,
-    settlementMode: null,
-    amount: null,
-    fullIntent: false,
-    fullAuthorizationVersion: null,
-  };
-  return { ...draft, amount: cleared.amount, debt: cleared };
-}
-
-/**
- * Cuenta que nombra el usuario. El nombre tiene que ser **exacto** (comparacion
- * canonica): el id de la cuenta tambien vale. Con dos cuentas activas del mismo nombre
- * no se elige ninguna: se pregunta.
- */
-function groundAccount(
-  name: string | null,
-  accounts: AccountOption[],
-): { account: AccountOption | null; ambiguous: boolean } {
-  if (name === null) {
-    return { account: null, ambiguous: false };
-  }
-  const trimmed = name.trim();
-  if (trimmed.length === 0) {
-    return { account: null, ambiguous: false };
-  }
-  const byId = accounts.find((account) => account.id.toLowerCase() === trimmed.toLowerCase());
-  if (byId) {
-    return { account: byId, ambiguous: false };
-  }
-  const canonical = canonicalName(trimmed);
-  const matches = accounts.filter((account) => canonicalName(account.name) === canonical);
-  if (matches.length === 1) {
-    return { account: matches[0]!, ambiguous: false };
-  }
-  return { account: null, ambiguous: matches.length > 1 };
-}
-
-/**
- * Mensaje del problema de la cuenta: falta la cuenta, o la que nombra el usuario no
- * existe o hay varias con ese nombre. Un nombre que no vale no se reemplaza por la
- * cuenta que propone el modelo: se pregunta.
- */
-function accountProblem(candidate: string, explicit: string | null, ambiguous: boolean): string {
-  if (ambiguous) {
-    return `falta la cuenta: hay varias cuentas con el nombre "${candidate}"`;
-  }
-  if (explicit !== null) {
-    return `falta la cuenta: la cuenta "${explicit}" no existe`;
-  }
-  return 'falta la cuenta';
-}
-
-/**
- * `true` cuando el usuario escribio ese importe en el mensaje. Un importe que solo
- * aparece en la respuesta del modelo (el pendiente del borrador anterior) no es el
- * importe del pago: se pregunta.
- */
-function amountWritten(text: string, amount: string, currency: Currency): boolean {
-  const minor = tryParseAmount(amount, currency);
-  if (minor === null) {
-    return false;
-  }
-  return amountsInText(text).some((written) => {
-    const value = tryParseAmount(written, currency);
-    return value !== null && value === minor;
-  });
-}
-
-function detailsReply(
-  problems: DraftProblem[],
-  accounts: AccountOption[],
-  title = 'Faltan datos para registrar la operacion:',
-  detail?: string,
-): string {
-  const lines = problems.map((problem) => `  - ${problem.message}`);
-  if (problems.some((problem) => problem.field === 'account') && accounts.length > 0) {
-    lines.push(`  cuentas: ${accounts.map((account) => `${account.name} (${account.currency})`).join(', ')}`);
-  }
-  const body = [title, ...lines];
-  if (detail !== undefined) {
-    body.push(detail);
-  }
-  body.push('', 'Escribe los datos que faltan.');
-  return body.join('\n');
-}
-
-/**
- * Respuesta a un mensaje que el modelo no pudo interpretar como una sola operacion.
- * Es util aunque el borrador conserve datos completos: el resumen vigente se vuelve a
- * pedir antes de poder confirmar.
- */
-function unclearReply(problems: DraftProblem[], accounts: AccountOption[]): string {
-  const lines = [UNCLEAR_REPLY];
-  if (problems.length > 0) {
-    lines.push('Ademas sigue faltando:');
-    lines.push(...problems.map((problem) => `  - ${problem.message}`));
-    if (problems.some((problem) => problem.field === 'account') && accounts.length > 0) {
-      lines.push(
-        `  cuentas: ${accounts.map((account) => `${account.name} (${account.currency})`).join(', ')}`,
-      );
-    }
-  }
-  lines.push('Envia una sola operacion por mensaje (importe, moneda y cuenta).');
-  return lines.join('\n');
-}
-
-function confirmationReply(draft: Draft, accounts: AccountOption[]): string {
-  const account = accounts.find((candidate) => candidate.id === draft.accountId);
-  return [
-    'Entendi esta operacion:',
-    `  - tipo: ${draft.kind === 'income' ? 'ingreso' : 'gasto'}`,
-    `  - importe: ${draft.amount} ${draft.currency}`,
-    `  - cuenta: ${account ? `${account.name} (${account.currency})` : '(sin cuenta)'}`,
-    `  - fecha: ${draft.occurredOn}`,
-    `  - descripcion: ${draft.description ?? '(sin descripcion)'}`,
-    '',
-    'Responde /confirm para registrarla o /cancel para descartarla.',
-  ].join('\n');
-}
-
-/** Resumen de una deuda nueva: no hay cuenta porque todavia no se movio dinero. */
-function debtCreateReply(draft: Draft): string {
-  const debt = draft.debt;
-  return [
-    'Entendi esta deuda:',
-    `  - tipo: ${directionLabel(debt?.direction ?? null)}`,
-    `  - contraparte: ${debt?.counterparty ?? '(sin dato)'}`,
-    `  - importe: ${draft.amount} ${draft.currency}`,
-    `  - fecha: ${draft.occurredOn}`,
-    `  - descripcion: ${draft.description ?? '(sin descripcion)'}`,
-    '',
-    'Crear la deuda no mueve dinero: no hay cuenta ni movimiento.',
-    'Responde /confirm para registrarla o /cancel para descartarla.',
-  ].join('\n');
-}
-
-/** Resumen de un pago de deuda: muestra el pendiente congelado del momento. */
-function debtSettleReply(draft: Draft, debt: DebtView, account: AccountOption | undefined): string {
-  const payload = draft.debt;
-  const currency = debt.debt.currency;
-  const outstanding = formatAmount(debt.outstandingMinor, currency);
-  const original = formatAmount(debt.debt.principalMinor, currency);
-  return [
-    'Entendi este pago de deuda:',
-    `  - deuda: ${debt.debt.counterparty} | ${directionLabel(payload?.direction ?? null)} | ${currency}`,
-    `  - original: ${original} ${currency} | pendiente: ${outstanding} ${currency} | fecha de la deuda: ${debt.debt.occurredOn}`,
-    `  - modo: ${payload?.settlementMode === 'full' ? 'pago total' : 'pago parcial'}`,
-    `  - importe: ${payload?.amount} ${payload?.currency}`,
-    `  - cuenta: ${account ? `${account.name} (${account.currency})` : '(sin cuenta)'}`,
-    `  - fecha: ${payload?.occurredOn}`,
-    `  - descripcion: ${payload?.description ?? '(sin descripcion)'}`,
-    '',
-    'Responde /confirm para registrarlo o /cancel para descartarlo.',
-  ].join('\n');
-}
-
-function registeredReply(draft: Draft, account: AccountOption | undefined): string {
-  const where = account ? ` en la cuenta ${account.name}` : '';
-  return `Registrado: ${draft.kind === 'income' ? 'ingreso' : 'gasto'} de ${draft.amount} ${draft.currency}${where} (${draft.occurredOn}).`;
-}
-
-/** Confirmacion de una deuda nueva: no hay movimiento, solo la obligacion. */
-function debtCreatedReply(draft: Draft): string {
-  const debt = draft.debt;
-  return `Registrado: deuda de ${debt?.amount} ${debt?.currency} con ${debt?.counterparty} (${directionLabel(debt?.direction ?? null)}).`;
-}
-
-/** Confirmacion de un pago de deuda: la persona, el importe y el pendiente. */
-function debtSettledReply(draft: Draft): string {
-  const debt = draft.debt;
-  return `Registrado: pago de ${debt?.amount} ${debt?.currency} de la deuda con ${debt?.counterparty} (${directionLabel(debt?.direction ?? null)}).`;
 }
 
 function replay(event: CaptureEvent): CaptureOutcome {

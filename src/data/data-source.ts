@@ -18,6 +18,7 @@ import { LedgerOperation } from '../financial/ledger-operation.entity';
 import { MovementRevision } from '../financial/movement-revision.entity';
 import { BalanceReconciliation } from '../financial/balance-reconciliation.entity';
 import { TelegramCursor } from '../telegram/telegram-cursor.entity';
+import { TelegramHistory } from '../telegram/telegram-history.entity';
 import { TelegramInbox } from '../telegram/telegram-inbox.entity';
 import { TelegramOutbox } from '../telegram/telegram-outbox.entity';
 import { InitialSchema1767225600000 } from './migrations/1767225600000-InitialSchema';
@@ -26,6 +27,7 @@ import { TelegramDelivery1772582400000 } from './migrations/1772582400000-Telegr
 import { LedgerOperations1775260800000 } from './migrations/1775260800000-LedgerOperations';
 import { MovementCorrections1777939200000 } from './migrations/1777939200000-MovementCorrections';
 import { Budgets1780617600000 } from './migrations/1780617600000-Budgets';
+import { TelegramHistory1791158400000 } from './migrations/1791158400000-TelegramHistory';
 
 /**
  * Opciones de conexion compartidas por la aplicacion NestJS, la CLI y las pruebas.
@@ -52,6 +54,7 @@ export function buildDataSourceOptions(databasePath: string): DataSourceOptions 
       TelegramInbox,
       TelegramOutbox,
       TelegramCursor,
+      TelegramHistory,
     ],
     migrations: [
       InitialSchema1767225600000,
@@ -63,6 +66,7 @@ export function buildDataSourceOptions(databasePath: string): DataSourceOptions 
       GoalsAndSavings1783209600000,
       Debts1785888000000,
       DebtCapture1788566400000,
+      TelegramHistory1791158400000,
     ],
     synchronize: false,
     migrationsRun: false,

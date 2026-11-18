@@ -64,6 +64,7 @@ describe('Contexto de aplicacion NestJS', () => {
             'telegram_inbox',
             'telegram_outbox',
             'telegram_cursor',
+            'telegram_history',
           ]),
         );
       } finally {

@@ -8,6 +8,7 @@ import { Capture } from '../src/capture/capture.entity';
 import { CaptureEvent } from '../src/capture/capture-event.entity';
 import { CaptureService } from '../src/capture/capture.service';
 import { InferenceBudgetService } from '../src/capture/inference-budget.service';
+import { sourceKeyFor } from '../src/capture/source-key';
 import { TelegramSettings } from '../src/config/configuration';
 import { TransactionRunner } from '../src/data/transaction.runner';
 import { DebtService } from '../src/debts/debt.service';
@@ -153,6 +154,20 @@ describe('TelegramService', () => {
     );
   }
 
+  /** Captura sobre una conexion concreta: el bot la usa para revisar sus borradores. */
+  function captureFor(source: DataSource, interpreter: FakeInterpreter): CaptureService {
+    const transactions = new TransactionRunner(source);
+    const financial = new FinancialService(transactions);
+    return new CaptureService(
+      source,
+      transactions,
+      financial,
+      interpreter,
+      new InferenceBudgetService(transactions, LIMITS),
+      new DebtService(transactions, financial),
+    );
+  }
+
   /**
    * Fila de la bandeja de entrada de una actualizacion ya procesada. Es la procedencia
    * durable de un borrador: de ella sale el usuario que lo creo.
@@ -188,18 +203,10 @@ describe('TelegramService', () => {
 
   function buildCommands(
     target: TempDatabase,
-    interpreter: FakeInterpreter,
+    capture: CaptureService,
   ): TelegramCommands {
     const transactions = new TransactionRunner(target.dataSource);
     const financial = new FinancialService(transactions);
-    const capture = new CaptureService(
-      target.dataSource,
-      transactions,
-      financial,
-      interpreter,
-      new InferenceBudgetService(transactions, LIMITS),
-      new DebtService(transactions, financial),
-    );
     return new TelegramCommands(
       capture,
       financial,
@@ -219,10 +226,12 @@ describe('TelegramService', () => {
     settings: TelegramSettings = SETTINGS,
   ): TelegramService {
     const transactions = new TransactionRunner(target.dataSource);
+    const capture = captureFor(target.dataSource, interpreter);
     return new TelegramService(
       target.dataSource,
       transactions,
-      buildCommands(target, interpreter),
+      buildCommands(target, capture),
+      capture,
       telegramClient,
       settings,
     );
@@ -388,11 +397,13 @@ describe('TelegramService', () => {
       },
     }) as DataSource;
     const interpreter = new FakeInterpreter([operation(account.id)]);
-    const commands = buildCommands(database, interpreter);
+    const capture = captureFor(failing, interpreter);
+    const commands = buildCommands(database, capture);
     telegram = new TelegramService(
       failing,
       new TransactionRunner(failing),
       commands,
+      capture,
       client,
       SETTINGS,
     );
@@ -509,6 +520,7 @@ describe('TelegramService', () => {
         database.dataSource,
         database.transactions,
         stubCommands((eventId) => eventId === 'telegram:10', processed),
+        captureFor(database.dataSource, new FakeInterpreter([])),
         client,
         SETTINGS,
       );
@@ -563,6 +575,7 @@ describe('TelegramService', () => {
           failures -= 1;
           return true;
         }, processed),
+        captureFor(database.dataSource, new FakeInterpreter([])),
         client,
         SETTINGS,
       );
@@ -588,6 +601,7 @@ describe('TelegramService', () => {
             throw new Error('fallo de procesamiento simulado');
           },
         } as unknown as TelegramCommands,
+        captureFor(database.dataSource, new FakeInterpreter([])),
         client,
         SETTINGS,
       );
@@ -999,6 +1013,168 @@ describe('TelegramService', () => {
       const live = captures.find((row) => row.state === 'awaiting_confirmation');
       expect(live?.sourceText).not.toBeNull();
       expect(captures.filter((row) => row.state === 'cancelled')).toHaveLength(0);
+    });
+
+    it('la revocacion le quita al borrador el texto y los datos de deuda', async () => {
+      // Un borrador de deuda vivo, creado desde Telegram.
+      const captures = database.dataSource.getRepository(Capture);
+      await captures.save(
+        captures.create({
+          chatId: String(CHAT_ID),
+          sourceKey: sourceKeyFor(String(CHAT_ID), telegramEventId(70)),
+          state: 'awaiting_confirmation',
+          kind: 'debt_create',
+          amount: '8.00',
+          currency: 'USD',
+          accountId: null,
+          occurredOn: '2026-11-10',
+          description: 'deuda',
+          debtPayload: JSON.stringify({
+            version: 1,
+            kind: 'debt_create',
+            direction: 'payable',
+            counterparty: 'Carmen',
+            debtId: null,
+            settlementMode: null,
+            amount: '8.00',
+            currency: 'USD',
+            accountId: null,
+            occurredOn: '2026-11-10',
+            description: 'deuda',
+            expectedOutstandingMinor: null,
+            fullIntent: false,
+            fullAuthorizationVersion: null,
+            choices: [],
+          }),
+          sourceText: 'le debo 8$ a Carmen',
+        }),
+      );
+      await seedInbox(70, String(USER_ID));
+
+      const revoked = buildService(database, client, new FakeInterpreter([]), {
+        ...SETTINGS,
+        allowedChatId: 222,
+      });
+      extra.push(revoked);
+      await revoked.start();
+      await waitUntil(() => client.offsets.length >= 2, 20_000);
+
+      const row = await captures.findOneBy({ chatId: String(CHAT_ID) });
+      expect(row?.state).toBe('cancelled');
+      expect(row?.sourceText).toBeNull();
+      expect(row?.debtPayload).toBeNull();
+    });
+
+    it('un borrador que no viene de Telegram no se cancela', async () => {
+      // El borrador nace de otro transporte: su origen no esta en la bandeja de Telegram.
+      await buildCapture(1).handle({
+        eventId: 'otro-transporte:1',
+        chatId: String(CHAT_ID),
+        text: 'Helado 2 dolares',
+        receivedAt: RECEIVED_AT,
+      });
+      await seedInbox(50, String(USER_ID));
+
+      const revoked = buildService(database, client, new FakeInterpreter([]), {
+        ...SETTINGS,
+        allowedChatId: 222,
+      });
+      extra.push(revoked);
+      await revoked.start();
+      await waitUntil(() => client.offsets.length >= 2, 20_000);
+
+      const captures = await database.dataSource.getRepository(Capture).find();
+      expect(captures.filter((row) => row.state === 'awaiting_confirmation')).toHaveLength(1);
+      expect(captures.filter((row) => row.state === 'cancelled')).toHaveLength(0);
+    });
+
+    it('si la cancelacion del borrador falla se revierte la limpieza del inbox y del outbox', async () => {
+      // Un borrador vivo del usuario 111, con su origen en Telegram.
+      await buildCapture(1).handle({
+        eventId: telegramEventId(50),
+        chatId: String(CHAT_ID),
+        text: 'Helado 2 dolares',
+        receivedAt: RECEIVED_AT,
+      });
+      await seedInbox(50, String(USER_ID));
+
+      // Trabajo pendiente de entrada y de salida.
+      const inbox = database.dataSource.getRepository(TelegramInbox);
+      await inbox.save(
+        inbox.create({
+          updateId: 51,
+          chatId: String(CHAT_ID),
+          userId: String(USER_ID),
+          text: 'Helado 2 dolares',
+          receivedAt: RECEIVED_AT,
+          state: 'accepted',
+        }),
+      );
+      const outbox = database.dataSource.getRepository(TelegramOutbox);
+      await outbox.save(
+        outbox.create({
+          updateId: 51,
+          chatId: String(CHAT_ID),
+          userId: String(USER_ID),
+          text: 'Respuesta pendiente',
+          state: 'pending',
+          attempts: 0,
+          nextAttemptAt: 0,
+          lastError: null,
+        }),
+      );
+
+      const captures = database.dataSource.getRepository(Capture);
+      // Estado inicial: se compara con lo que queda cuando la limpieza falla.
+      const before = {
+        inbox: await inbox.findOneBy({ updateId: 51 }),
+        outbox: await outbox.findOneBy({ updateId: 51 }),
+        capture: await captures.findOneBy({ chatId: String(CHAT_ID) }),
+      };
+
+      // La cancelacion del borrador revienta: la limpieza entera se revierte.
+      const original = Repository.prototype.update;
+      const spy = jest.spyOn(Repository.prototype, 'update').mockImplementation(async function (
+        this: Repository<ObjectLiteral>,
+        criteria: unknown,
+        partialEntity: unknown,
+      ) {
+        if (this.target === Capture) {
+          throw new Error('fallo de escritura simulado');
+        }
+        return original.call(this, criteria as never, partialEntity as never);
+      });
+
+      try {
+        const revoked = buildService(database, client, new FakeInterpreter([]), {
+          ...SETTINGS,
+          allowedChatId: 222,
+        });
+
+        // Una sola limpieza, sin sondeo: la transaccion falla y se revierte entera.
+        const cleaned = await revoked['cleanRevokedWork']();
+        expect(cleaned).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+
+      // Lo que la limpieza descarto quedo sin confirmar: se revirtio con ella.
+      const after = {
+        inbox: await inbox.findOneBy({ updateId: 51 }),
+        outbox: await outbox.findOneBy({ updateId: 51 }),
+        capture: await captures.findOneBy({ chatId: String(CHAT_ID) }),
+      };
+      expect(after.inbox).toEqual(before.inbox);
+      expect(after.outbox).toEqual(before.outbox);
+      expect(after.capture).toEqual(before.capture);
+      // El estado y el texto original siguen en su sitio.
+      expect(after.inbox?.state).toBe('accepted');
+      expect(after.inbox?.text).toBe('Helado 2 dolares');
+      expect(after.outbox?.state).toBe('pending');
+      expect(after.outbox?.text).toBe('Respuesta pendiente');
+      // Y el borrador sigue vivo: sin limpiar, no se procesa nada.
+      expect(after.capture?.state).toBe('awaiting_confirmation');
+      expect(after.capture?.sourceText).toBe('Helado 2 dolares');
     });
   });
 

@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { DataSource, EntityManager, In, Repository } from 'typeorm';
-import { Capture } from '../capture/capture.entity';
+import { DataSource, EntityManager, Repository } from 'typeorm';
+import { CaptureService } from '../capture/capture.service';
 import { sourceKeyFor } from '../capture/source-key';
 import { TelegramSettings } from '../config/configuration';
 import { TransactionRunner } from '../data/transaction.runner';
@@ -8,6 +8,12 @@ import { TelegramClient, TelegramError } from './telegram-client';
 import { TelegramCommands } from './telegram-commands';
 import { sanitizeTelegramText } from './bot-text';
 import { POLLING_CURSOR_ID, TelegramCursor } from './telegram-cursor.entity';
+import {
+  isOlderThanHistoryWindow,
+  isWithinHistoryWindow,
+  TelegramHistoryEntry,
+  TelegramHistoryStore,
+} from './telegram-history.store';
 import { TelegramInbox } from './telegram-inbox.entity';
 import { TelegramOutbox } from './telegram-outbox.entity';
 import { TelegramUpdate, telegramEventId } from './telegram-update';
@@ -44,6 +50,30 @@ interface ChatBackoff {
 }
 
 /**
+ * Una entrega que Telegram **ya confirmo** y que solo falta guardar en la base.
+ *
+ * Vive solo en memoria: si el proceso se cae entre la confirmacion y el commit, el
+ * mensaje se vuelve a enviar al arrancar (la garantia de "al menos una vez" de
+ * siempre). Con el proceso vivo el mensaje **no** se reenvia: lo que se reintenta es
+ * unicamente guardar la entrega y su respuesta.
+ */
+interface ConfirmedDelivery {
+  /** Fila de la bandeja de salida que hay que marcar como entregada. */
+  outboxId: string;
+  updateId: number;
+  chatId: string;
+  userId: string;
+  /** Texto exacto que salio al chat. */
+  text: string;
+  /** Instante de la entrega, en milisegundos desde epoch. */
+  sentAt: number;
+  /** Intentos de escritura ya realizados. */
+  persistAttempts: number;
+  /** Momento en el que se puede volver a intentar la escritura (epoch). */
+  persistNextAttemptAt: number;
+}
+
+/**
  * Bot de Telegram en modo long polling.
  *
  * El ciclo es durable y tiene tres pasos separados:
@@ -67,20 +97,30 @@ interface ChatBackoff {
 @Injectable()
 export class TelegramService implements OnModuleDestroy {
   private readonly logger = new Logger(TelegramService.name);
+  /** Historial temporal del chat: texto del usuario y respuesta del bot. */
+  private readonly history: TelegramHistoryStore;
   private running = false;
   private loop: Promise<void> | null = null;
   private abort: AbortController | null = null;
   private delivering = false;
   /** Espera de reintento por chat, tras un fallo de procesamiento. */
   private readonly backoff = new Map<string, ChatBackoff>();
+  /**
+   * Entregas confirmadas por Telegram que todavia no estan guardadas. Se guardan en
+   * memoria: si el proceso sigue vivo, el mensaje **no** se reenvia.
+   */
+  private readonly confirmed = new Map<string, ConfirmedDelivery>();
 
   constructor(
     private readonly dataSource: DataSource,
     private readonly transactions: TransactionRunner,
     private readonly commands: TelegramCommands,
+    private readonly capture: CaptureService,
     private readonly client: TelegramClient,
     private readonly settings: TelegramSettings,
-  ) {}
+  ) {
+    this.history = new TelegramHistoryStore(dataSource);
+  }
 
   /** `true` solo con token, usuario y chat configurados. */
   get enabled(): boolean {
@@ -125,6 +165,10 @@ export class TelegramService implements OnModuleDestroy {
     let pollFailures = 0;
     let batchFailures = 0;
     while (this.running) {
+      // La purga del historial va antes de todo: lo que ya no esta en la ventana o
+      // ya no esta autorizado se borra, y lo que quede se borra en la vuelta
+      // siguiente. Va **aparte** del trabajo pendiente.
+      await this.purgeHistory();
       // La limpieza de lo revocado va antes de procesar: mientras no se haya
       // logrado, no se procesa nada (tampoco se confirma ningun borrador).
       const cleaned = await this.cleanRevokedWork();
@@ -186,6 +230,61 @@ export class TelegramService implements OnModuleDestroy {
   }
 
   /**
+   * Purga el historial que ya no sirve: lo que se salio de la ventana de una hora y lo
+   * que pertenece a un chat o a un usuario que ya no estan autorizados.
+   *
+   * Es **durable** y va **aparte** de la bandeja de entrada, de la bandeja de salida y
+   * de los borradores: el historial no se mezcla con el trabajo pendiente ni con lo que
+   * ya ocurrio. Se hace en cada vuelta del ciclo (la primera, al arrancar, tambien).
+   *
+   * Si la purga falla, el ciclo sigue: la lectura aplica el filtro de la ventana
+   * aunque lo que quedo en la base todavia no se haya borrado.
+   */
+  private async purgeHistory(): Promise<void> {
+    const chatId = this.settings.allowedChatId;
+    const userId = this.settings.allowedUserId;
+    if (chatId === null || userId === null) {
+      // Sin lista de autorizados no hay contra que purgar: el bot esta apagado.
+      return;
+    }
+    try {
+      await this.history.purge({ chatId: String(chatId), userId: String(userId) }, Date.now());
+    } catch (error) {
+      this.logger.warn(`No se pudo purgar el historial de Telegram (${reasonOf(error)}).`);
+    }
+  }
+
+  /**
+   * Historial del chat para una consulta: los roles y el texto, en orden.
+   *
+   * Solo se lee el sujeto **vigente**: el chat y el usuario que estan autorizados
+   * ahora mismo. Si el bot esta apagado, si la configuracion esta a medias o si el
+   * par chat/usuario no es el autorizado, no se devuelve nada: lo revocado no se lee
+   * aunque todavia no se haya purgado.
+   *
+   * Ademas, solo devuelve lo anterior a `beforeUpdateId`: la actualizacion actual y las
+   * siguientes quedan fuera. La ventana de una hora se aplica al leer, aunque la purga
+   * no se haya hecho.
+   */
+  async readHistory(subject: {
+    chatId: string;
+    userId: string;
+    beforeUpdateId: number;
+  }): Promise<TelegramHistoryEntry[]> {
+    const chatId = this.settings.allowedChatId;
+    const userId = this.settings.allowedUserId;
+    if (!this.enabled || chatId === null || userId === null) {
+      // Sin lista de autorizados vigente no se lee nada.
+      return [];
+    }
+    if (subject.chatId !== String(chatId) || subject.userId !== String(userId)) {
+      // Lo de otro chat o de otro usuario no se lee: lo revocado no sale.
+      return [];
+    }
+    return this.history.read(subject, Date.now());
+  }
+
+  /**
    * Descarta, de forma durable y en una sola transaccion, el trabajo pendiente que ya
    * no esta autorizado: la actualizacion aceptada, la respuesta pendiente y el
    * borrador vivo cuya origen en Telegram ya no esta autorizado. Los movimientos ya
@@ -218,6 +317,9 @@ export class TelegramService implements OnModuleDestroy {
             { id: row.id },
             { state: 'discarded', text: '', lastError: 'not_allowed', nextAttemptAt: 0 },
           );
+          // Si esta entrega ya habia salido al chat, su confirmacion se suelta: lo
+          // revocado no se guarda y no se reenvia.
+          this.confirmed.delete(row.id);
         }
 
         await this.cancelUnauthorizedDrafts(manager, inbox);
@@ -242,14 +344,16 @@ export class TelegramService implements OnModuleDestroy {
    *   historicas de otro usuario del mismo chat;
    * - los borradores de **otros transportes** (sin evidencia de que vengan de
    *   Telegram) no se tocan.
+   *
+   * El borrador vivo no se consulta ni se escribe aqui: la captura es su unica
+   * propietaria. El bot solo decide si su origen sigue autorizado y, si no, pide la
+   * cancelacion (que comparte esta misma transaccion).
    */
   private async cancelUnauthorizedDrafts(
     manager: EntityManager,
     inbox: Repository<TelegramInbox>,
   ): Promise<void> {
-    const drafts = await manager.getRepository(Capture).find({
-      where: { state: In(['awaiting_details', 'awaiting_confirmation']) },
-    });
+    const drafts = await this.capture.pendingOrigins(manager);
     for (const draft of drafts) {
       const rows = await inbox.find({ where: { chatId: draft.chatId } });
       const origin = rows.find(
@@ -262,9 +366,7 @@ export class TelegramService implements OnModuleDestroy {
       if (this.isAllowed(origin.chatId, origin.userId)) {
         continue;
       }
-      await manager
-        .getRepository(Capture)
-        .update({ id: draft.id }, { state: 'cancelled', sourceText: null });
+      await this.capture.cancelPending(draft.chatId, manager);
     }
   }
 
@@ -350,7 +452,10 @@ export class TelegramService implements OnModuleDestroy {
     return {
       chatId: message.chatId,
       userId: message.userId,
-      text: message.text.slice(0, MAX_INBOX_TEXT_LENGTH),
+      // El texto original, **sin recortar**: el historial guarda el mensaje tal
+      // como llego. El recorte de la bandeja de entrada se aplica al guardarlo
+      // alli, no al historial.
+      text: message.text,
       receivedAt: message.receivedAt,
     };
   }
@@ -374,13 +479,55 @@ export class TelegramService implements OnModuleDestroy {
             updateId,
             chatId: accepted.chatId,
             userId: accepted.userId,
-            text: accepted.text,
+            // Aqui si se recorta: la bandeja de entrada guarda lo que hace falta para
+            // procesar. El historial guarda el texto entero.
+            text: accepted.text.slice(0, MAX_INBOX_TEXT_LENGTH),
             receivedAt: accepted.receivedAt,
             state: 'accepted',
           }),
         );
       }
+      await this.recordUserMessage(manager, updateId, accepted);
       await this.advanceCursorWith(manager, updateId);
+    });
+  }
+
+  /**
+   * Guarda el texto del usuario en el historial, en la **misma transaccion** de la
+   * aceptacion.
+   *
+   * Solo se guarda lo que sigue autorizado y lo que sigue dentro de la ventana de una
+   * hora: un mensaje viejo (por ejemplo, uno que Telegram devuelve al reconnectar) no
+   * entra en el historial, porque ya estaria fuera de la ventana al leerlo.
+   *
+   * Una fecha **futura** (un desfase del reloj) se capea al instante local de la
+   * aceptacion: el mensaje no se pierde, pero tampoco puede retener el historial mas
+   * de una hora. La hora original del mensaje no se toca en ningun otro sitio.
+   */
+  private async recordUserMessage(
+    manager: EntityManager,
+    updateId: number,
+    accepted: AcceptedMessage,
+  ): Promise<void> {
+    if (!this.isAllowed(accepted.chatId, accepted.userId)) {
+      return;
+    }
+    const instant = epochMs(accepted.receivedAt);
+    if (instant === null) {
+      return;
+    }
+    const now = Date.now();
+    const sentAt = instant > now ? now : instant;
+    if (!isWithinHistoryWindow(sentAt, now)) {
+      return;
+    }
+    await this.history.recordUser(manager, {
+      updateId,
+      chatId: accepted.chatId,
+      userId: accepted.userId,
+      // El texto original, sin recortar: el historial es la copia fiel del mensaje.
+      text: accepted.text,
+      sentAt,
     });
   }
 
@@ -425,6 +572,17 @@ export class TelegramService implements OnModuleDestroy {
       chatId: row.chatId,
       text: row.text ?? '',
       receivedAt: row.receivedAt,
+      // El historial se carga **perezoso**: solo si el mensaje necesita contexto (una
+      // pregunta de seguimiento). Solo viajan el rol y el texto, y solo lo anterior a
+      // esta actualizacion.
+      history: async () => {
+        const entries = await this.readHistory({
+          chatId: row.chatId,
+          userId: row.userId,
+          beforeUpdateId: updateId,
+        });
+        return entries.map((entry) => ({ role: entry.role, text: entry.text }));
+      },
     });
     await this.transactions.run(async (manager) => {
       const outbox = manager.getRepository(TelegramOutbox);
@@ -484,6 +642,11 @@ export class TelegramService implements OnModuleDestroy {
    * siguiente intento no puede adelantarse a su hora. El envio es "al menos una vez":
    * una interrupcion puede repetir una respuesta, pero nunca duplica un movimiento.
    *
+   * Cuando Telegram **ya confirmo** el envio y lo que falla es la escritura, el
+   * mensaje **no** se reenvia: la confirmacion se guarda en memoria y lo que se
+   * reintenta es unicamente guardar la entrega y su respuesta. El chat espera a que la
+   * escritura cuadre para no adelantarse.
+   *
    * Las respuestas de un chat se envian **en orden**: si una anterior esta retrasada o
    * falla de forma transitoria, las siguientes de ese chat esperan su turno.
    */
@@ -493,6 +656,9 @@ export class TelegramService implements OnModuleDestroy {
     }
     this.delivering = true;
     try {
+      // Lo que Telegram ya confirmo y que solo falta guardar: se guarda, **no** se
+      // reenvia. El chat queda bloqueado hasta que la escritura cuadre.
+      await this.persistConfirmedDeliveries();
       const outbox = this.dataSource.getRepository(TelegramOutbox);
       const pending = await outbox.find({
         where: { state: 'pending' },
@@ -511,10 +677,17 @@ export class TelegramService implements OnModuleDestroy {
             { id: row.id },
             { state: 'discarded', text: '', lastError: 'not_allowed', nextAttemptAt: 0 },
           );
+          this.confirmed.delete(row.id);
           continue;
         }
         if (waiting.has(row.chatId)) {
           // Hay una respuesta anterior de este chat sin entregar: no se adelanta.
+          continue;
+        }
+        if (this.confirmed.has(row.id)) {
+          // Esta entrega ya salio al chat: no se reenvia. Se guarda en otra vuelta y,
+          // hasta entonces, el chat espera su turno.
+          waiting.add(row.chatId);
           continue;
         }
         if (row.nextAttemptAt > Date.now()) {
@@ -526,9 +699,38 @@ export class TelegramService implements OnModuleDestroy {
         try {
           // La red de seguridad: una respuesta guardada antes (o pendiente en la bandeja
           // de salida) no puede enviar identificadores tecnicos ni JSON crudo.
-          await this.client.sendMessage(row.chatId, sanitizeTelegramText(row.text), this.abort?.signal);
-          await outbox.update({ id: row.id }, { state: 'sent', lastError: null, nextAttemptAt: 0 });
+          // El texto que sale se calcula **una vez**: el que se envia es exactamente
+          // el que se guarda en el historial.
+          const delivered = sanitizeTelegramText(row.text);
+          await this.client.sendMessage(row.chatId, delivered, this.abort?.signal);
+          // Telegram ya confirmo: desde aqui el mensaje **no** se reenvia. Lo que
+          // queda es escribirlo, y esa escritura se reintenta sola si falla.
+          const confirmation: ConfirmedDelivery = {
+            outboxId: row.id,
+            updateId: row.updateId,
+            chatId: row.chatId,
+            userId: row.userId,
+            text: delivered,
+            sentAt: Date.now(),
+            persistAttempts: 0,
+            persistNextAttemptAt: 0,
+          };
+          this.confirmed.set(row.id, confirmation);
+          await this.persistDelivery(confirmation);
+          this.confirmed.delete(row.id);
         } catch (error) {
+          const confirmed = this.confirmed.get(row.id);
+          if (confirmed) {
+            // El envio **salio**: lo que fallo fue la escritura. El mensaje no se
+            // reenvia; lo que se reintenta es guardar la entrega y su respuesta.
+            confirmed.persistAttempts = Math.min(confirmed.persistAttempts + 1, MAX_ATTEMPTS);
+            confirmed.persistNextAttemptAt = Date.now() + backoffMs(confirmed.persistAttempts);
+            this.logger.warn(
+              `No se pudo guardar la respuesta entregada de Telegram (${reasonOf(error)}). Se reintentara sin volver a enviarla.`,
+            );
+            waiting.add(row.chatId);
+            continue;
+          }
           const attempts = Math.min(row.attempts + 1, MAX_ATTEMPTS);
           const permanent = isPermanentFailure(error);
           await outbox.update(
@@ -562,6 +764,80 @@ export class TelegramService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Guarda una entrega que Telegram **ya confirmo**: marca la fila de la bandeja de
+   * salida como entregada y guarda la respuesta en el historial, en la **misma
+   * transaccion**.
+   *
+   * La respuesta entra al historial solo si su entrega no es mas vieja que la ventana:
+   * si la confirmacion ya caducó, la entrega se marca igual pero su texto no se
+   * guarda. El criterio es de **antiguedad** solamente: si el reloj retrocede un
+   * instante entre la confirmacion y esta escritura, la respuesta se guarda igual
+   * (con su instante original) y la lectura la oculta hasta que el reloj se recupere.
+   */
+  private async persistDelivery(entry: ConfirmedDelivery): Promise<void> {
+    await this.transactions.run(async (manager) => {
+      const outbox = manager.getRepository(TelegramOutbox);
+      const row = await outbox.findOneBy({ id: entry.outboxId });
+      if (!row || row.state !== 'pending') {
+        // La entrega ya no esta pendiente (se descarto): no se toca.
+        return;
+      }
+      await outbox.update(
+        { id: entry.outboxId },
+        { state: 'sent', lastError: null, nextAttemptAt: 0 },
+      );
+      if (!isOlderThanHistoryWindow(entry.sentAt, Date.now())) {
+        await this.history.recordBot(manager, {
+          updateId: entry.updateId,
+          chatId: entry.chatId,
+          userId: entry.userId,
+          text: entry.text,
+          sentAt: entry.sentAt,
+        });
+      }
+    });
+  }
+
+  /**
+   * Reintenta guardar las entregas ya confirmadas por Telegram que siguen sin
+   * guardar. **No se reenvia nada**: solo se escribe.
+   *
+   * Si un chat tiene una entrega sin guardar, el chat queda bloqueado: sus siguientes
+   * respuestas esperan a que la escritura cuadre.
+   */
+  private async persistConfirmedDeliveries(): Promise<void> {
+    const entries = [...this.confirmed.values()].sort(
+      (left, right) => left.updateId - right.updateId,
+    );
+    const blocked = new Set<string>();
+    for (const entry of entries) {
+      if (blocked.has(entry.chatId)) {
+        continue;
+      }
+      if (!this.isAllowed(entry.chatId, entry.userId)) {
+        // El sujeto ya no esta autorizado: no se guarda nada y la cache se limpia.
+        this.confirmed.delete(entry.outboxId);
+        continue;
+      }
+      if (entry.persistNextAttemptAt > Date.now()) {
+        blocked.add(entry.chatId);
+        continue;
+      }
+      try {
+        await this.persistDelivery(entry);
+        this.confirmed.delete(entry.outboxId);
+      } catch (error) {
+        entry.persistAttempts = Math.min(entry.persistAttempts + 1, MAX_ATTEMPTS);
+        entry.persistNextAttemptAt = Date.now() + backoffMs(entry.persistAttempts);
+        blocked.add(entry.chatId);
+        this.logger.warn(
+          `No se pudo guardar la respuesta entregada de Telegram (${reasonOf(error)}). Se reintentara sin volver a enviarla.`,
+        );
+      }
+    }
+  }
+
   /** Espera que se corta en cuanto el bot se detiene. */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
@@ -588,6 +864,12 @@ export class TelegramService implements OnModuleDestroy {
 function backoffMs(attempts: number): number {
   const step = Math.min(Math.max(Math.trunc(attempts), 1), MAX_BACKOFF_STEP);
   return Math.min(BACKOFF_BASE_MS * 2 ** (step - 1), BACKOFF_MAX_MS);
+}
+
+/** Instante en milisegundos desde epoch, o `null` si la marca de tiempo no vale. */
+function epochMs(instant: string): number | null {
+  const milliseconds = new Date(instant).getTime();
+  return Number.isNaN(milliseconds) ? null : milliseconds;
 }
 
 /** Motivo del fallo, sin detalle: nunca contiene la credencial ni el mensaje. */

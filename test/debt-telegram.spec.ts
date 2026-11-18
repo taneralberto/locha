@@ -56,6 +56,7 @@ function debtData(overrides: Partial<NonNullable<Operation['debt']>> = {}) {
     debtId: null,
     settlementMode: null,
     status: null,
+    queryDetail: null,
     ...overrides,
   };
 }
@@ -128,7 +129,7 @@ describe('Telegram de deudas (unidad 2)', () => {
       new SavingsService(transactions, financialService, new GoalService(transactions)),
       new DebtService(transactions, financialService),
     );
-    return new TelegramService(source, transactions, commands, telegramClient, SETTINGS);
+    return new TelegramService(source, transactions, commands, capture, telegramClient, SETTINGS);
   }
 
   function answer(text: string, eventId = `telegram:deuda:${event++}`): Promise<string> {
@@ -323,6 +324,122 @@ describe('Telegram de deudas (unidad 2)', () => {
     expect(query).toContain('Carmen');
     expect(await dataSource.getRepository(Capture).findOneByOrFail({ chatId: String(CHAT_ID) })).toEqual(before);
     expect(await dataSource.getRepository(Debt).count()).toBe(1);
+  });
+
+  it('el bot responde la consulta en lenguaje natural con la lista breve', async () => {
+    const debt = (
+      await debts.create({
+        sourceKey: 'deuda',
+        direction: 'payable',
+        counterparty: 'Carmen',
+        money: { currency: 'USD', minor: 700n },
+        occurredOn: '2026-11-01',
+      })
+    ).debt;
+    const receivable = (
+      await debts.create({
+        sourceKey: 'cobro',
+        direction: 'receivable',
+        counterparty: 'Ana',
+        money: { currency: 'USDT', minor: 1123456n },
+        occurredOn: '2026-11-01',
+      })
+    ).debt;
+    interpreter.responses.push({
+      amount: null,
+      currency: null,
+      accountId: null,
+      kind: 'debt_query',
+      occurredOn: null,
+      description: null,
+      debt: debtData(),
+    });
+
+    await telegram.start();
+    client.enqueue(update(10, 'cuáles son mis deudas'));
+    await waitUntil(() => client.sent.length === 1);
+
+    // El mensaje que ve el usuario: la lista breve, con la linea en blanco entre los
+    // grupos y sin ningun identificador tecnico.
+    const sent = client.lastSent?.text ?? '';
+    expect(sent).toBe(
+      ['Lo que debo:', '• Carmen — $7', '', 'Lo que me deben:', '• Ana — 1.123456 USDT'].join('\n'),
+    );
+    expect(sent).not.toContain(debt.id);
+    expect(sent).not.toContain(receivable.id);
+    expect(await dataSource.getRepository(Debt).count()).toBe(2);
+  });
+
+  it('el bot no pierde el nombre ni el importe de una persona que se llama Clave', async () => {
+    const debt = (
+      await debts.create({
+        sourceKey: 'deuda',
+        direction: 'payable',
+        counterparty: 'Clave',
+        money: { currency: 'USD', minor: 500n },
+        occurredOn: '2026-11-01',
+      })
+    ).debt;
+    interpreter.responses.push({
+      amount: null,
+      currency: null,
+      accountId: null,
+      kind: 'debt_query',
+      occurredOn: null,
+      description: null,
+      debt: debtData(),
+    });
+
+    await telegram.start();
+    client.enqueue(update(12, 'cuáles son mis deudas'));
+    await waitUntil(() => client.sent.length === 1);
+
+    // El sanitizer de Telegram quita lo que va detras de un "clave:" o un "key:":
+    // por eso la viñeta usa un separador visual y no un dos puntos.
+    const sent = client.lastSent?.text ?? '';
+    expect(sent).toBe('Lo que debo:\n• Clave — $5');
+    expect(sent).toContain('Clave');
+    expect(sent).toContain('$5');
+    expect(sent).not.toContain(debt.id);
+  });
+
+  it('el bot responde el detalle de una deuda con el monto inicial y los abonos', async () => {
+    const debt = (
+      await debts.create({
+        sourceKey: 'deuda',
+        direction: 'payable',
+        counterparty: 'Carmen',
+        money: { currency: 'USD', minor: 800n },
+        occurredOn: '2026-11-01',
+      })
+    ).debt;
+    await debts.settle({
+      sourceKey: 'pago',
+      debtId: debt.id,
+      accountId,
+      money: { currency: 'USD', minor: 300n },
+      occurredOn: '2026-11-05',
+      expectedOutstandingMinor: 800n,
+    });
+    interpreter.responses.push({
+      amount: null,
+      currency: null,
+      accountId: null,
+      kind: 'debt_query',
+      occurredOn: null,
+      description: null,
+      debt: debtData({ direction: 'payable', counterparty: 'Carmen', queryDetail: true }),
+    });
+
+    await telegram.start();
+    client.enqueue(update(11, 'cuánto le he pagado a Carmen'));
+    await waitUntil(() => client.sent.length === 1);
+
+    const sent = client.lastSent?.text ?? '';
+    expect(sent).toContain('Monto inicial: $8');
+    expect(sent).toContain('Le he pagado: $3');
+    expect(sent).toContain('Me falta por pagar: $5');
+    expect(sent).not.toContain(debt.id);
   });
 
   it('el bot registra la deuda una sola vez cuando Telegram repite la actualizacion', async () => {

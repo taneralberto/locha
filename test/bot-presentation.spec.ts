@@ -144,7 +144,7 @@ describe('Presentacion del bot sin identificadores tecnicos', () => {
       new SavingsService(transactions, financialService, new GoalService(transactions)),
       new DebtService(transactions, financialService),
     );
-    return new TelegramService(dataSource, transactions, commands, client, SETTINGS);
+    return new TelegramService(dataSource, transactions, commands, capture, client, SETTINGS);
   }
 
   /** Datos de los cuatro dominios: cuentas, movimientos, deudas, metas y presupuestos. */
@@ -321,6 +321,7 @@ describe('Presentacion del bot sin identificadores tecnicos', () => {
         debtId: null,
         settlementMode: null,
         status: null,
+        queryDetail: null,
       },
     });
     const preview = await answer('le debo 8$ a Carmen');
@@ -333,6 +334,37 @@ describe('Presentacion del bot sin identificadores tecnicos', () => {
     const debtsReply = await answer('/debts Carmen');
     expectClean(debtsReply);
     expect(debtsReply).toContain('Carmen');
+  });
+
+  it('la consulta de deudas en lenguaje natural no muestra ids, estados internos ni totales', async () => {
+    const query = {
+      amount: null,
+      currency: null,
+      accountId: null,
+      kind: 'debt_query' as const,
+      occurredOn: null,
+      description: null,
+      debt: {
+        direction: null,
+        counterparty: null,
+        debtId: null,
+        settlementMode: null,
+        status: null,
+        queryDetail: null,
+      },
+    };
+    interpreter.responses.push(query);
+    interpreter.responses.push({ ...query, debt: { ...query.debt, queryDetail: true } });
+
+    const summary = await answer('cuáles son mis deudas');
+    expectClean(summary);
+    expect(summary).toBe('Lo que debo:\n• Carmen — $70');
+
+    const detail = await answer('cuánto le he pagado a Carmen');
+    expectClean(detail);
+    expect(detail).toContain('Monto inicial: $100');
+    expect(detail).toContain('Le he pagado: $30');
+    expect(detail).toContain('Me falta por pagar: $70');
   });
 
   it('una respuesta durable vieja (con ids y JSON) nunca se envia tal cual', async () => {

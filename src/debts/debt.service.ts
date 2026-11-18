@@ -6,6 +6,7 @@ import { isUniqueViolation } from '../data/unique-violation';
 import { parseDate } from '../domain/date';
 import { ConflictError, NotFoundError, ValidationError } from '../domain/errors';
 import { Currency, isCurrency } from '../domain/money';
+import { canonicalName } from '../domain/name';
 import { FinancialService } from '../financial/financial.service';
 import { Movement, MovementKind } from '../financial/movement.entity';
 import { Debt, DebtDirection } from './debt.entity';
@@ -279,15 +280,6 @@ export class DebtService {
       };
     });
   }
-}
-
-/**
- * Identidad canonica de un nombre: NFD sin diacriticos, minusculas y espacios
- * colapsados. Solo sirve para comparar de forma exacta (contrapartes y cuentas); la
- * forma mostrada se conserva intacta.
- */
-export function canonicalName(value: string): string {
-  return value.normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
 function kindOf(direction: DebtDirection): MovementKind {

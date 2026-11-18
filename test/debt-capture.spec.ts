@@ -15,6 +15,7 @@ import { DebtService } from '../src/debts/debt.service';
 import { FinancialService } from '../src/financial/financial.service';
 import { Movement } from '../src/financial/movement.entity';
 import { Operation } from '../src/interpreter/operation.schema';
+import { InterpreterError } from '../src/interpreter/interpreter';
 import { FakeInterpreter } from './helpers/fake-interpreter';
 import { createTempDatabase, openDatabase, TempDatabase } from './helpers/temp-database';
 
@@ -36,6 +37,7 @@ function debtData(overrides: Partial<NonNullable<Operation['debt']>> = {}) {
     debtId: null,
     settlementMode: null,
     status: null,
+    queryDetail: null,
     ...overrides,
   };
 }
@@ -2195,7 +2197,7 @@ describe('Captura de deudas (unidad 2)', () => {
 
       expect(query.reply).toContain('Carmen');
       expect(query.reply).toContain('Lo que debo');
-      expect(query.reply).toContain('pendiente 10.00');
+      expect(query.reply).toContain('• Carmen — $10');
       expect(query.reply).not.toContain(debt.id);
       expect(await movementCount()).toBe(0);
 
@@ -2233,6 +2235,374 @@ describe('Captura de deudas (unidad 2)', () => {
       expect(query.reply).not.toContain('conversiones');
       expect(query.captureState).toBeNull();
       expect(await db.dataSource.getRepository(Capture).count()).toBe(0);
+    });
+  });
+
+  describe('consultas en lenguaje natural', () => {
+    it('la lista breve separa lo que debo de lo que me deben, con los importes exactos y una linea en blanco', async () => {
+      const luis = await seedDebt({ sourceKey: 'deuda-luis', counterparty: 'Luis', minor: 500n });
+      const carmen = await seedDebt({ sourceKey: 'deuda-carmen', counterparty: 'Carmén', minor: 700n });
+      const ana = await seedDebt({
+        sourceKey: 'deuda-ana',
+        direction: 'receivable',
+        counterparty: 'Ana',
+        currency: 'USDT',
+        minor: 1123456n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData() }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas' });
+
+      // La lista es breve: una viñeta por deuda, los importes exactos y los grupos
+      // separados por una linea en blanco.
+      expect(query.reply).toBe(
+        [
+          'Lo que debo:',
+          '• Carmén — $7',
+          '• Luis — $5',
+          '',
+          'Lo que me deben:',
+          '• Ana — 1.123456 USDT',
+        ].join('\n'),
+      );
+      // Sin ids, sin estados internos, sin totales y sin el pie de la CLI.
+      expect(query.reply).not.toContain(luis.id);
+      expect(query.reply).not.toContain(carmen.id);
+      expect(query.reply).not.toContain(ana.id);
+      expect(query.reply).not.toContain('pendiente');
+      expect(query.reply).not.toContain('Totales');
+      expect(query.reply).not.toContain('CLI');
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('los importes son exactos: sin redondear y sin ceros sobrantes', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', counterparty: 'Luis', minor: 1050n });
+      await seedDebt({ sourceKey: 'deuda-2', counterparty: 'Ana', minor: 10000n });
+      await seedDebt({
+        sourceKey: 'deuda-3',
+        counterparty: 'Rosa',
+        currency: 'VES',
+        minor: 123450n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData() }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas' });
+
+      // 10.50 es 10.5 y 100.00 es 100: los ceros enteros se conservan.
+      expect(query.reply).toContain('• Ana — $100');
+      expect(query.reply).toContain('• Luis — $10.5');
+      // La moneda va como sufijo cuando no es el dollar.
+      expect(query.reply).toContain('• Rosa — 1234.5 VES');
+    });
+
+    it('el detalle muestra el monto inicial, los abonos y lo que falta', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', counterparty: 'Carmen', minor: 800n });
+      // Un pago parcial de verdad: el saldo pendiente sale de el.
+      await debts.settle({
+        sourceKey: 'pago',
+        debtId: debt.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 300n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 800n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ direction: 'payable', counterparty: 'Carmen', queryDetail: true }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'y cuánto le debía inicialmente a Carmen?' });
+
+      expect(query.reply).toContain('Monto inicial: $8');
+      expect(query.reply).toContain('Le he pagado: $3');
+      expect(query.reply).toContain('Me falta por pagar: $5');
+      expect(query.reply).not.toContain(debt.id);
+      expect(await movementCount()).toBe(1);
+    });
+
+    it('el detalle de un cobro usa los verbos de la otra direccion', async () => {
+      const debt = await seedDebt({
+        sourceKey: 'cobro',
+        direction: 'receivable',
+        counterparty: 'Ana',
+        minor: 1000n,
+      });
+      await debts.settle({
+        sourceKey: 'cobro-parcial',
+        debtId: debt.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 400n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 1000n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ direction: 'receivable', counterparty: 'Ana', queryDetail: true }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuánto me han pagado de la deuda de Ana' });
+
+      expect(query.reply).toContain('Monto inicial: $10');
+      expect(query.reply).toContain('Me ha pagado: $4');
+      expect(query.reply).toContain('Me falta por cobrar: $6');
+    });
+
+    it('el detalle trae la deuda saldada y el resumen la deja fuera', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', counterparty: 'Carmen', minor: 1000n });
+      await debts.settle({
+        sourceKey: 'pago',
+        debtId: debt.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 1000n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 1000n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData({ counterparty: 'Carmen' }) }),
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ counterparty: 'Carmen', queryDetail: true }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const summary = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas' });
+      expect(summary.reply).toBe('No hay deudas pendientes que coincidan con la consulta.');
+
+      const detail = await handle(service, { eventId: 'e2', text: 'cuánto le he pagado a Carmen' });
+      expect(detail.reply).toContain('Monto inicial: $10');
+      expect(detail.reply).toContain('Le he pagado: $10');
+      expect(detail.reply).toContain('Esta deuda está saldada.');
+      // El detalle no inventa un pendiente que no hay.
+      expect(detail.reply).not.toContain('Me falta por pagar');
+    });
+
+    it('el resumen con estado pagado muestra lo que se saldo, no un cero', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', counterparty: 'Carmen', minor: 1000n });
+      await debts.settle({
+        sourceKey: 'pago',
+        debtId: debt.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 1000n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 1000n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData({ status: 'paid' }) }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas saldadas' });
+
+      expect(query.reply).toContain('• Carmen — $10 (saldada)');
+      expect(query.reply).not.toContain('$0');
+    });
+
+    it('varias deudas que coinciden se muestran por separado, sin sumarlas', async () => {
+      await seedDebt({ sourceKey: 'deuda-1', counterparty: 'Carmen', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-2', counterparty: 'Carmen', minor: 2500n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ counterparty: 'Carmen', queryDetail: true }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuánto le debo a Carmen' });
+
+      expect(query.reply).toContain('Monto inicial: $10');
+      expect(query.reply).toContain('Monto inicial: $25');
+      // No se suman: los dos pendientes salen por separado.
+      expect(query.reply).not.toContain('$35');
+    });
+
+    it('la consulta de detalle no toca el borrador pendiente', async () => {
+      const debt = await seedDebt({ sourceKey: 'deuda', counterparty: 'Carmen', minor: 800n });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_create', amount: '8.00', currency: 'USD', debt: debtData({ direction: 'payable', counterparty: 'Carmen' }) }),
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ direction: 'payable', counterparty: 'Carmen', queryDetail: true }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      await handle(service, { eventId: 'e1', text: 'le debo 8$ a Carmen' });
+      const before = await onlyRow(await db.dataSource.getRepository(Capture).find());
+
+      const query = await handle(service, { eventId: 'e2', text: 'cuánto le he pagado a Carmen' });
+
+      expect(query.reply).toContain('Monto inicial: $8');
+      expect(await onlyRow(await db.dataSource.getRepository(Capture).find())).toEqual(before);
+      expect(await db.dataSource.getRepository(DebtPayment).count()).toBe(0);
+      expect((await debts.get(debt.id)).outstandingMinor).toBe(800n);
+    });
+
+    it('una lista que no cabe se acorta y avisa', async () => {
+      for (let index = 0; index < 150; index += 1) {
+        await seedDebt({
+          sourceKey: `deuda-${String(index).padStart(3, '0')}`,
+          counterparty: `Persona de prueba ${String(index).padStart(3, '0')}`,
+          minor: 1000n,
+        });
+      }
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData() }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas' });
+
+      expect(query.reply.length).toBeLessThanOrEqual(4096);
+      expect(query.reply).toContain('detalle omitido por el limite de Telegram');
+      expect(query.reply).toContain('Escribe una pregunta más concreta');
+    });
+
+    it('el filtro pending trae las que no estan saldadas y la direccion explicita decide', async () => {
+      // Tres estados: abierta, a medias y saldada.
+      const luis = await seedDebt({ sourceKey: 'deuda-luis', counterparty: 'Luis', minor: 1000n });
+      const carmen = await seedDebt({ sourceKey: 'deuda-carmen', counterparty: 'Carmen', minor: 800n });
+      await debts.settle({
+        sourceKey: 'pago-carmen',
+        debtId: carmen.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 300n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 800n,
+      });
+      const ana = await seedDebt({
+        sourceKey: 'deuda-ana',
+        direction: 'receivable',
+        counterparty: 'Ana',
+        minor: 500n,
+      });
+      await debts.settle({
+        sourceKey: 'pago-ana',
+        debtId: ana.id,
+        accountId: usd,
+        money: { currency: 'USD', minor: 500n },
+        occurredOn: '2026-11-05',
+        expectedOutstandingMinor: 500n,
+      });
+      // La misma persona en las dos direcciones: decide la direccion explicita.
+      await seedDebt({
+        sourceKey: 'deuda-luis-cobro',
+        direction: 'receivable',
+        counterparty: 'Luis',
+        minor: 2000n,
+      });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData({ status: 'pending' }) }),
+        operation({ kind: 'debt_query', debt: debtData({ status: 'open' }) }),
+        operation({ kind: 'debt_query', debt: debtData({ status: 'paid' }) }),
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ counterparty: 'Luis', direction: 'receivable' }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      // Pending: las abiertas y las a medias, pero no las saldadas.
+      const pending = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas pendientes' });
+      expect(pending.reply).toContain('• Luis — $10');
+      expect(pending.reply).toContain('• Carmen — $5');
+      expect(pending.reply).not.toContain('• Ana');
+
+      // Open: solo las que no han recibido ningun abono.
+      const open = await handle(service, { eventId: 'e2', text: 'cuáles son mis deudas sin saldar' });
+      expect(open.reply).toContain('• Luis — $10');
+      expect(open.reply).not.toContain('Carmen');
+      expect(open.reply).not.toContain('Ana');
+
+      // Paid: solo las saldadas.
+      const paid = await handle(service, { eventId: 'e3', text: 'cuáles son mis deudas saldadas' });
+      expect(paid.reply).toContain('• Ana — $5 (saldada)');
+      expect(paid.reply).not.toContain('Luis');
+      expect(paid.reply).not.toContain('Carmen');
+
+      // La direccion explicita separa lo que se debe de lo que me deben.
+      const receivable = await handle(service, {
+        eventId: 'e4',
+        text: 'cuánto me deben a Luis',
+      });
+      expect(receivable.reply).toContain('• Luis — $20');
+      expect(receivable.reply).not.toContain('• Luis — $10');
+      expect(luis.counterparty).toBe('Luis');
+    });
+
+    it('un id escrito en el mensaje manda sobre el filtro del modelo', async () => {
+      const luis = await seedDebt({ sourceKey: 'deuda-luis', counterparty: 'Luis', minor: 1000n });
+      await seedDebt({ sourceKey: 'deuda-carmen', counterparty: 'Carmen', minor: 800n });
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ counterparty: 'Carmen', status: 'pending' }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, {
+        eventId: 'e1',
+        text: `cuánto le debo a ${luis.id}`,
+      });
+
+      expect(query.reply).toContain('• Luis — $10');
+      expect(query.reply).not.toContain('Carmen');
+    });
+
+    it('un nombre con saltos se muestra en una sola fila', async () => {
+      await seedDebt({ sourceKey: 'deuda', counterparty: 'Luis\nPerez', minor: 500n });
+      const interpreter = new FakeInterpreter([
+        operation({ kind: 'debt_query', debt: debtData() }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'cuáles son mis deudas' });
+
+      expect(query.reply).toBe('Lo que debo:\n• Luis Perez — $5');
+    });
+
+    it('el detalle que no cabe se acorta sin partir el ultimo bloque', async () => {
+      for (let index = 0; index < 120; index += 1) {
+        await seedDebt({
+          sourceKey: `deuda-${String(index).padStart(3, '0')}`,
+          counterparty: `Persona de prueba ${String(index).padStart(3, '0')}`,
+          minor: 1000n,
+        });
+      }
+      const interpreter = new FakeInterpreter([
+        operation({
+          kind: 'debt_query',
+          debt: debtData({ queryDetail: true }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const query = await handle(service, { eventId: 'e1', text: 'desglósame mis deudas' });
+
+      expect(query.reply.length).toBeLessThanOrEqual(4096);
+      expect(query.reply).toContain('detalle omitido por el limite de Telegram');
+      expect(query.reply).toContain('Escribe una pregunta más concreta');
+      // El ultimo bloque visible esta completo: sus tres campos.
+      const visible = query.reply.split('... detalle omitido por el limite de Telegram.')[0] ?? '';
+      const blocks = visible.trim().split('\n\n');
+      const last = blocks[blocks.length - 1] ?? '';
+      expect(last).toContain('Monto inicial: $10');
+      expect(last).toContain('Le he pagado: $0');
+      expect(last).toContain('Me falta por pagar: $10');
     });
   });
 
@@ -2515,6 +2885,82 @@ describe('Captura de deudas (unidad 2)', () => {
       const request = interpreter.requests[0];
       expect(request?.debts).toHaveLength(20);
       expect(request?.debtsTruncated).toBe(true);
+    });
+  });
+
+  describe('cancelacion del borrador de deuda', () => {
+    it('descarta un borrador que espera detalles y le quita el texto y los datos de deuda', async () => {
+      const interpreter = new FakeInterpreter([
+        operation({ amount: '8.00', currency: 'USD', debt: debtData({ direction: 'payable' }) }),
+      ]);
+      const service = buildService(interpreter);
+
+      const pending = await handle(service, { eventId: 'e1', text: 'le debo 8$' });
+      expect(pending.captureState).toBe('awaiting_details');
+
+      const alive = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(alive.sourceText).not.toBeNull();
+      expect(alive.debtPayload).not.toBeNull();
+
+      const cancelled = await handle(service, { eventId: 'e2', text: '/cancel' });
+
+      expect(cancelled.captureState).toBe('cancelled');
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(after.state).toBe('cancelled');
+      expect(after.sourceText).toBeNull();
+      expect(after.debtPayload).toBeNull();
+      expect(await debtCount()).toBe(0);
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('descarta un borrador que espera confirmacion y le quita el texto y los datos de deuda', async () => {
+      const interpreter = new FakeInterpreter([
+        operation({
+          amount: '8.00',
+          currency: 'USD',
+          debt: debtData({ direction: 'payable', counterparty: 'Carmen' }),
+        }),
+      ]);
+      const service = buildService(interpreter);
+
+      const pending = await handle(service, { eventId: 'e1', text: 'le debo 8$ a Carmen' });
+      expect(pending.captureState).toBe('awaiting_confirmation');
+
+      const alive = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(alive.sourceText).not.toBeNull();
+      expect(alive.debtPayload).not.toBeNull();
+
+      const cancelled = await handle(service, { eventId: 'e2', text: '/cancel' });
+
+      expect(cancelled.captureState).toBe('cancelled');
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(after.state).toBe('cancelled');
+      expect(after.sourceText).toBeNull();
+      expect(after.debtPayload).toBeNull();
+      expect(await debtCount()).toBe(0);
+      expect(await movementCount()).toBe(0);
+    });
+
+    it('una interpretacion fallida cancela el borrador de deuda y le quita el texto y los datos', async () => {
+      const interpreter = new FakeInterpreter([
+        operation({
+          amount: '8.00',
+          currency: 'USD',
+          debt: debtData({ direction: 'payable', counterparty: 'Carmen' }),
+        }),
+        new InterpreterError('timeout', 'El proveedor no respondio a tiempo.'),
+      ]);
+      const service = buildService(interpreter);
+
+      await handle(service, { eventId: 'e1', text: 'le debo 8$ a Carmen' });
+      const failed = await handle(service, { eventId: 'e2', text: 'Era 10 dolares' });
+
+      expect(failed.reply).toContain('Vuelve a enviar el mensaje completo');
+      const after = await onlyRow(await db.dataSource.getRepository(Capture).find());
+      expect(after.state).toBe('cancelled');
+      expect(after.sourceText).toBeNull();
+      expect(after.debtPayload).toBeNull();
+      expect(await debtCount()).toBe(0);
     });
   });
 });

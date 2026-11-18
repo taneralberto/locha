@@ -161,3 +161,134 @@ export function formatDebtDetail(view: DebtView): string[] {
   }
   return lines;
 }
+
+/**
+ * Aviso de que la consulta se corto por el limite del mensaje. **Solo aparece cuando
+ * la respuesta no cabe**: el mensaje normal no lleva ningun pie.
+ */
+const DEBT_QUERY_TRUNCATION = 'Escribe una pregunta más concreta para ver menos deudas.';
+
+/** Como se presenta una consulta de deudas en lenguaje natural. */
+export interface DebtQueryOptions {
+  /** `true` si el usuario pide el detalle de la deuda, no el resumen. */
+  detail?: boolean;
+  /** Mensaje cuando no hay deudas que coincidan con la consulta. */
+  empty?: string;
+}
+
+/**
+ * Importe en lenguaje natural: el decimal **exacto** de la moneda (no se redondea), sin
+ * los ceros finales de la fraccion (los ceros enteros se conservan) y con la moneda como
+ * sufijo. El dollar es el de USD; VES y USDT van con su codigo.
+ */
+function formatDebtAmount(minor: bigint, currency: Currency): string {
+  const [whole = '0', fraction = ''] = formatAmount(minor, currency).split('.');
+  const trimmed = fraction.replace(/0+$/, '');
+  const exact = trimmed.length === 0 ? whole : `${whole}.${trimmed}`;
+  return currency === 'USD' ? `$${exact}` : `${exact} ${currency}`;
+}
+
+/**
+ * La contraparte como se muestra: los espacios y los saltos se colapsan en uno, para que
+ * un nombre con saltos no rompa la fila. **No** se normalizan los diacriticos ni se
+ * cambia lo guardado: la base sigue con el nombre tal cual.
+ */
+function displayCounterparty(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Una deuda de la lista breve: la persona y lo pendiente. El separador es visual (—) y
+ * no un dos puntos: el sanitizer de Telegram quita lo que va detras de un "clave:" o un
+ * "key:", asi que un nombre asi se quedaria sin persona ni importe.
+ *
+ * Una deuda **saldada** no tiene pendiente: se muestra lo que se saldo, no un cero.
+ */
+function debtBullet(row: DebtReportRow): string {
+  const settled = row.status === 'paid';
+  const amount = formatDebtAmount(settled ? row.paidMinor : row.outstandingMinor, row.currency);
+  const bullet = `• ${displayCounterparty(row.counterparty)} — ${amount}`;
+  return settled ? `${bullet} (saldada)` : bullet;
+}
+
+/**
+ * La lista breve: lo que debo y lo que me deben, con una linea en blanco entre los
+ * grupos. No lleva totales ni estados: solo la persona y el importe.
+ *
+ * Cada **unidad** es lo que no se parte al acortar: la cabecera de un grupo va con su
+ * primera viñeta, nunca sola.
+ */
+function debtSummaryUnits(rows: DebtReportRow[]): string[] {
+  const units: string[] = [];
+  const groups: Array<{ header: string; rows: DebtReportRow[] }> = [
+    { header: 'Lo que debo:', rows: rows.filter((row) => row.direction === 'payable') },
+    { header: 'Lo que me deben:', rows: rows.filter((row) => row.direction === 'receivable') },
+  ];
+  for (const group of groups) {
+    if (group.rows.length === 0) {
+      continue;
+    }
+    const bullets = group.rows.map(debtBullet);
+    const blank = units.length > 0 ? '\n' : '';
+    units.push(`${blank}${group.header}\n${bullets[0]}`);
+    units.push(...bullets.slice(1));
+  }
+  return units;
+}
+
+/** Las etiquetas del detalle, con el verbo de la direccion de la deuda. */
+function detailLabels(direction: DebtDirection): { paid: string; pending: string } {
+  return direction === 'payable'
+    ? { paid: 'Le he pagado', pending: 'Me falta por pagar' }
+    : { paid: 'Me ha pagado', pending: 'Me falta por cobrar' };
+}
+
+/**
+ * El detalle de cada deuda: el monto inicial, los abonos y lo que queda pendiente. Cada
+ * deuda va en su propio bloque y el bloque **no se parte** al acortar: si varias
+ * coinciden, **no se suman** ni se elige una.
+ */
+function debtDetailUnits(rows: DebtReportRow[]): string[] {
+  const units: string[] = [];
+  for (const row of rows) {
+    const labels = detailLabels(row.direction);
+    const block = [
+      `${displayCounterparty(row.counterparty)} (${directionText(row.direction)}, ${row.currency})`,
+      `  Monto inicial: ${formatDebtAmount(row.principalMinor, row.currency)}`,
+      `  ${labels.paid}: ${formatDebtAmount(row.paidMinor, row.currency)}`,
+      row.status === 'paid'
+        ? '  Esta deuda está saldada.'
+        : `  ${labels.pending}: ${formatDebtAmount(row.outstandingMinor, row.currency)}`,
+    ].join('\n');
+    units.push(units.length > 0 ? `\n${block}` : block);
+  }
+  return units;
+}
+
+/**
+ * Consulta de deudas en lenguaje natural: la lista breve de lo pendiente o, si el
+ * usuario pide el detalle, el monto inicial, los abonos y el pendiente de cada deuda.
+ *
+ * Es determinista y **sin ids, estados internos ni totales**: solo la persona y los
+ * importes. El pie de la CLI no aparece: el detalle se pide con una pregunta más
+ * concreta. Si la respuesta no cabe, se acorta por unidades enteras (una fila de la
+ * lista o un bloque del detalle) y avisa.
+ */
+export function formatDebtQuery(rows: DebtReportRow[], options: DebtQueryOptions = {}): string {
+  if (rows.length === 0) {
+    return options.empty ?? 'No hay deudas que coincidan con la consulta.';
+  }
+  const units = options.detail === true ? debtDetailUnits(rows) : debtSummaryUnits(rows);
+  return fitDebtQuery(units);
+}
+
+/**
+ * Acota la consulta al limite de Telegram: si no cabe, se omiten unidades enteras (una
+ * fila de la lista o un bloque completo del detalle) y avisa.
+ */
+function fitDebtQuery(units: string[]): string {
+  if (units.join('\n').length <= MAX_DEBT_REPORT_CHARS) {
+    return units.join('\n');
+  }
+  return boundedLines(units, MAX_DEBT_REPORT_CHARS, DEBT_QUERY_TRUNCATION);
+}

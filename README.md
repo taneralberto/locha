@@ -255,13 +255,14 @@ Migraciones: `InitialSchema1767225600000` (cuentas y movimientos),
 `Budgets1780617600000` (presupuestos B3) y
 `GoalsAndSavings1783209600000` (metas y reservas virtuales B4) y
 `Debts1785888000000` (deudas: `debt` y `debt_payment`) y
-`DebtCapture1788566400000` (borrador de deuda: columna `debtPayload` de `capture`).
+`DebtCapture1788566400000` (borrador de deuda: columna `debtPayload` de `capture`) y
+`TelegramHistory1791158400000` (tabla `telegram_history`: historial temporal del chat).
 
-Para actualizar una base ficticia A, B1, B2, B3, B4, B5 o B6 completa: **detén el backend**,
+Para actualizar una base ficticia A, B1, B2, B3, B4, B5, B6 o B7 completa: **detén el backend**,
 haz una copia de seguridad, actualiza/compila el código y ejecuta `npm run migration:run`
 antes de reiniciar. **No borres ni recrees la base**: B4 añade solo `goal` y `savings_entry`, la migración de deudas
-añade solo `debt` y `debt_payment` y la del borrador de deuda añade **una sola columna**,
-sin cambiar filas, IDs, claves ni esquemas previos.
+añade solo `debt` y `debt_payment`, la del borrador de deuda añade **una sola columna** y la
+del historial **una sola tabla**, sin cambiar filas, IDs, claves ni esquemas previos.
 La aplicación no aplica migraciones automáticamente.
 
 ## CLI
@@ -745,11 +746,30 @@ preparación para producción.
   debo a Carmen» se responden con los datos guardados, **sin llamar al modelo para la
   cuenta** y **sin tocar el borrador pendiente**: la fila del borrador queda byte por byte
   igual. Las consultas se atienden **antes** que cualquier conversión, operación múltiple
-  o descarte. `/debts` y `/debts [persona]` hacen lo mismo desde el comando, con el mismo
-  formateador (`src/debts/debt-format.ts`): separa lo que debo de lo que me deben, muestra
-  contraparte, original, pagado, pendiente y estado, y da totales **por dirección y
-  moneda, nunca compensados** entre direcciones ni entre monedas. La CLI añade el id de
-  cada fila; el bot no lo muestra.
+  o descarte. En lenguaje natural la respuesta es una **lista compacta**
+  (`formatDebtQuery`, en `src/debts/debt-format.ts`): lo que debo y lo que me deben, con
+  una viñeta por deuda y el importe exacto (`• Carmen — $7`), una línea en blanco entre los
+  grupos y **sin** ids, estados internos ni totales. `/debts` y `/debts [persona]` **no
+  cambian**: el comando conserva su salida (contraparte, original, pagado, pendiente,
+  estado y totales **por dirección y moneda, nunca compensados** entre direcciones ni
+  entre monedas). La CLI añade el id de cada fila; el bot no lo muestra.
+- **El detalle de una deuda es una lectura, no un pago.** Lo marca el modelo con
+  `debt.queryDetail` (`true` o `null`, obligatorio en el esquema estricto): basta con pedir
+  el **monto inicial** («y cuánto le debía inicialmente a Luis?»), los **abonos**
+  («cuánto le he pagado a Luis») o el **desglose** («desglósame la deuda con Luis»); pedir
+  el saldo actual o el resumen («cuánto le debo a Luis», «cuáles son mis deudas») lo deja
+  en `null`. Con detalle la respuesta muestra el monto inicial, los abonos y lo que queda
+  pendiente, con los verbos de la dirección (`Monto inicial: $8`, `Le he pagado: $3`,
+  `Me falta por pagar: $5`), y dice en lenguaje natural si la deuda ya está saldada. No
+  registra nada ni toca el borrador.
+- **Filtros y excepciones de la consulta.** El modelo puede filtrar por dirección,
+  contraparte, moneda y estado: `open`, `partial`, `paid` y **`pending`** (las que
+  **todavía no están saldadas**: `open` o `partial`), un valor que existe **solo en la
+  consulta** (`DebtOperationSchema.status`), no en el dominio ni en la CLI. Con estado
+  explícito manda ese estado; sin estado, el resumen deja fuera las saldadas y el detalle
+  las trae (la deuda preguntada puede estar ya saldada). Si varias deudas coinciden se
+  muestran por separado, **sin sumarlas** ni elegir una. Un **id escrito por el usuario**
+  manda sobre todos los filtros.
 - **Salvaguarda determinista.** Si el mensaje habla de una deuda («debo», «me debe»,
   «adeudo», «préstamo») pero el modelo lo clasifica como gasto o ingreso, **no se registra
   nada**: se pregunta qué quiso decir. Un gasto normal con un comercio no se confunde con
@@ -1199,6 +1219,120 @@ El ciclo tiene **tres pasos separados**: aceptar (durable), procesar y entregar.
 - El texto original se borra de la bandeja de entrada cuando la actualización queda
   procesada, y el texto de una respuesta descartada se vacía.
 
+### Historial temporal del chat
+
+- La tabla `telegram_history` guarda **una fila por texto**: el mensaje original del
+  usuario (`role = 'user'`) y la respuesta exacta que salió al chat (`role = 'bot'`).
+  La clave es `(updateId, role)`: un texto por actualizacion y rol, sin repeticiones
+  (un reintento de envio no duplica nada). Los tiempos se guardan en **epoch**
+  (milisegundos), no como texto.
+- El texto del usuario se guarda en la **transaccion de la aceptacion**, solo si el
+  chat y el usuario siguen autorizados y solo si la hora del mensaje sigue dentro de
+  la ventana. Se guarda **entero**: el tope de 4096 unidades UTF-16 es el de la
+  bandeja de entrada (la que va al interprete) y no el del historial.
+- La respuesta del bot se guarda **despues** de que el envio sale bien, en la **misma
+  transaccion** que marca la entrega en la bandeja de salida. Lo que nunca se entrega
+  no se guarda, y la llamada de red nunca esta dentro de la transaccion.
+- Si la entrega **salio** pero la escritura falla, el mensaje **no se reenvia**: la
+  confirmacion (el instante y el texto) se guarda en memoria y lo que se reintenta es
+  solo guardar la entrega y su respuesta. El chat espera a que la escritura cuadre
+  para no adelantarse. Esa cache es **del proceso**: si el proceso se cae entre la
+  confirmacion y el commit, al arrancar el mensaje se vuelve a enviar (la garantia de
+  "al menos una vez" de siempre).
+- La escritura de una entrega ya confirmada decide solo por **antiguedad**: si el reloj
+  retrocede un instante entre la confirmacion y el commit, la respuesta se guarda igual
+  (con su instante original) y no se pierde. La **lectura** si aplica el limite
+  superior (`<= ahora`), asi que esa fila queda oculta hasta que el reloj se recupere.
+- La ventana es **estricta y de una hora**, medida desde el instante de cada mensaje:
+  no es una hora de inactividad. La ventana es exactamente `[ahora - 1h, ahora]`: un
+  mensaje de hace mas de una hora queda fuera aunque el chat siga vivo, y un instante
+  futuro tambien. Una fecha **futura** (un desfase del reloj) se capea al instante
+  local de la aceptacion: el mensaje no se pierde y no retiene el historial mas de una
+  hora. La hora original del mensaje no se toca en ningun otro sitio.
+- La purga es **durable** y va **aparte** de la bandeja de entrada, la de salida y los
+  borradores: borra lo que se salio de la ventana y lo que pertenece a un chat o a un
+  usuario que ya no estan autorizados. Se hace en cada vuelta del ciclo (la primera,
+  al arrancar, tambien) y no toca los eventos, las capturas ni la contabilidad. Solo
+  borra por **edad** y por **autorizacion**: un reloj que retrocede no hace que se
+  borren filas que pueden volver a estar en ventana.
+- La lectura (`readHistory`) aplica el filtro de la ventana **al leer**, aunque la
+  purga no se haya podido hacer: devuelve solo lo del chat y del usuario pedidos y
+  solo lo anterior a la actualizacion en curso (la actual y las siguientes quedan
+  fuera, tambien las que ya estan en la bandeja de entrada). El orden es estable: el
+  tiempo real del mensaje y, a igualdad, la actualizacion y el rol.
+- La lectura exige el **par chat/usuario vigente**: con el bot apagado, con la
+  configuracion a medias o con otro par, no devuelve nada. Lo revocado no se lee
+  aunque todavia no se haya purgado.
+- **Limitacion**: con el bot apagado, la ventana se sigue aplicando al leer, pero el
+  borrado fisico de lo vencido ocurre en el siguiente arranque o vuelta del ciclo: no
+  se promete eliminacion al segundo.
+
+### Pregunta contextual (seguimiento de deudas)
+
+- Una pregunta que **depende de un turno anterior** ("¿y cuánto le debia
+  inicialmente?", "¿y Carmen?") se resuelve con una **llamada propia** al proveedor,
+  con su **propio prompt** y su **propio esquema estricto**: solo lectura, con los
+  filtros de una consulta de deudas (persona, direccion, moneda, estado y si pide el
+  detalle) y, para un **grupo por direccion**, sin persona. No hay importe, ni cuenta,
+  ni id de deuda, ni modo de pago, ni confirmacion en ese contrato: una respuesta con
+  esos campos no lo cumple y se rechaza.
+- La interpretacion normal **nunca** ve el historial. El mensaje se clasifica sin
+  contexto y, solo si el modelo lo marca como `debt_follow_up`, se hace la segunda
+  llamada. La **forma inequivoca** de la pregunta de seguimiento ("¿y cuánto le debia
+  inicialmente?") tambien va a esa segunda llamada cuando el clasificador la devuelve
+  como `debt_query`: esa forma **nunca** se atendia como una consulta general, asi que
+  un nombre que venga del modelo no se usa y no se listan las deudas. Una pregunta
+  **explícita y autosuficiente** ("¿qué le debo a Luis?") sigue
+  el camino de siempre (`debt_query`), sin tocar nada.
+- La ventana del chat viaja como **datos**: rol y texto, en orden, **entera** (no se
+  recorta ni se resume), en un JSON aparte del mensaje actual, que aparece una sola
+  vez. No se manda el borrador, ni las cuentas, ni la lista de deudas.
+- La respuesta la pone el backend con los datos **actuales** (`DebtCapture.query`): el
+  historial nunca aporta importes ni estados. Si la deuda cambio desde que se dijo,
+  el chat puede estar desactualizado y la respuesta no.
+- Si no hay ventana, o no se sabe de quien es la pregunta, se pide la **persona de
+  forma explicita** (sin listar todas las deudas): la via nueva no amplía la consulta
+  con un pronombre ambiguo y nunca elige una deuda. La peticion es **neutral**: se
+  puede volver con la persona o con la consulta completa del grupo.
+- Un **grupo por direccion** ("Lo que debo nada más", "de esas, solo las que tengo por
+  cobrar") es otro alcance de la misma via: no tiene persona (ni siquiera vacia) y la
+  direccion tiene que estar clara. El estado no se infiere del chat: si el mensaje no
+  lo pide, solo salen las pendientes (tambien en el detalle); si lo pide, manda. Es un
+  refinamiento elíptico de un listado anterior, asi que lo marca el clasificador normal
+  como `debt_follow_up` y lo resuelve la ventana del chat. Sin direccion clara, o con
+  una persona, se pide aclaracion: **nunca** se listan todas las deudas. En el grupo no
+  se usa ningun id escrito: un id podria devolver el lado contrario (la precedencia del
+  id se mantiene en la consulta nominal).
+- Si el mensaje actual **solo sustituye la persona** ("¿y Carmen?"), se usa esa persona
+  y se conservan el tipo de pregunta (detalle o resumen) y la dirección del **último
+  intercambio relevante**; si el mensaje actual cambia algo (otra persona, otro tipo de
+  pregunta u otra dirección), **manda el mensaje actual**. El estado (saldada, parcial)
+  no se infiere: solo se usa si la pregunta lo pide de forma explícita.
+- La rama es de **solo lectura**: no toca el borrador vivo, no registra nada y no
+  autoriza pagos. Un fallo del proveedor pide repetir la pregunta: no cancela el
+  borrador y no reintenta solo.
+- **Una pregunta de lectura no cancela el borrador aunque el clasificador falle.** La
+  forma que se reconoce es **gramatical** y conservadora: el mensaje entero tiene que
+  ser la pregunta de lo que se debia al principio ("¿y cuánto le debia inicialmente?",
+  con o sin tilde y con o sin signos). No admite clausulas extra, ni puntuacion
+  intermedia, ni un `/confirm` detras, y no se apoya en un "?" generico. Con esa
+  forma, si el clasificador esta apagado, se queda sin presupuesto o falla, la
+  respuesta se cierra **sin tocar el borrador** (el evento **nace** en `reading`, sin
+  paso previo por `processing`, asi que una interrupcion tampoco gasta ni cancela). Una
+  aclaracion posible ("¿y Carmen?"), una correccion genuina o cualquier otra forma
+  siguen el flujo de siempre: si la interpretacion falla, el borrador se cancela.
+- Si el proceso se cae con la consulta en curso, el evento queda en `reading` y al
+  arrancar se completa **sin volver a gastar** y sin tocar el borrador. La columna
+  `state` de `capture_event` es texto libre: **no hay migracion nueva**.
+- La llamada contextual desactiva la compresion "middle-out" del proveedor
+  (`plugins: [{ id: 'context-compression', enabled: false }]`): la ventana se manda
+  entera o no se manda. Ademas exige que el proveedor soporte **todos** los
+  parametros de la peticion (`provider: { require_parameters: true }`). Solo afecta a
+  esta llamada; la llamada normal no cambia.
+- El contrato de la llamada contextual limita la **moneda** a las soportadas por el
+  proyecto (`VES`, `USD`, `USDT`): una moneda distinta no cumple el esquema y la
+  respuesta se rechaza. El camino normal no cambia.
+
 ### Presentación (lo que ve el usuario)
 
 - **Ninguna respuesta lleva identificadores técnicos.** Las respuestas nuevas se escriben
@@ -1233,6 +1367,20 @@ El ciclo tiene **tres pasos separados**: aceptar (durable), procesar y entregar.
 - El token, el texto del usuario y las respuestas **no se registran nunca**.
 - En la base solo queda lo necesario: el texto del mensaje mientras el borrador o la
   actualización están vivos; después se borra.
+- El texto del chat tiene **dos** copias en la base: la de la bandeja de entrada (4096
+  unidades UTF-16, se borra al procesarse) y la de la tabla `telegram_history`, que es
+  **temporal** (una hora) y vive en la **misma base SQLite principal**. El borrador
+  (1000 caracteres) se rige por su propia política, y las respuestas de la bandeja de
+  salida y de `capture_event` **pueden persistir** para la entrega y la repetición
+  idempotente del evento.
+- La purga de `telegram_history` es por edad (una hora) y por autorización, pero **no es
+  un borrado seguro**: en un archivo SQLite el texto puede quedar en páginas libres
+  hasta que se reutilicen. Las **copias de seguridad** (`npm run backup`) pueden incluir
+  esos textos: trátalas como material sensible.
+- El texto del historial **solo se manda al proveedor cuando el mensaje es un
+  seguimiento** (una pregunta que depende de un turno anterior). Cualquier otro
+  mensaje se interpreta **sin historial**, y los comandos deterministas no llaman al
+  modelo.
 - Los errores que se guardan o se registran son un **motivo** (`timeout`, `network`, `http`),
   nunca el detalle.
 
@@ -1331,6 +1479,60 @@ ingreso, el efecto del pago en el resumen, el presupuesto y las reservas, el pen
 congelado que caduca cuando cambia por fuera, el veto a editar el movimiento de un pago (y la
 anulación que reabre la deuda) y la copia de seguridad con restauración.
 
+Del historial temporal del chat (`test/telegram-history.spec.ts` y
+`test/telegram-history-migration.spec.ts`): el texto del usuario guardado con la hora del
+mensaje de Telegram, la respuesta exacta que salió al chat, que no se guarde lo que nunca
+se entregó, que la misma actualización no se guarde dos veces (ni el texto ni la respuesta
+tras un reintento de envío), que el texto se guarde **entero** mientras la bandeja de
+entrada sigue con su tope, que no se guarde nada de un chat o de un usuario no autorizado,
+que el historial sobreviva a un reinicio sobre la misma base, que la revocación purgue el
+historial del chat revocado, que la purga del ciclo borre lo vencido, que la lectura
+excluya la actualización actual, las siguientes y otros chats, y que la lectura siga
+aplicando la ventana aunque la purga falle; que no se lea el historial de un par
+chat/usuario que ya no está autorizado (con la purga fallida) ni con el bot apagado; que
+una fecha futura se capee al instante de aceptación, que un mensaje de más de una hora no
+se guarde y que la lectura excluya un instante futuro; que una respuesta **entregada**
+no se reenvíe cuando lo que falla es la escritura (un trigger la bloquea): el chat espera,
+no se reenvía y, al levantar el bloqueo, la entrega y el texto se guardan exactamente; y
+que un retroceso del reloj entre la confirmación y el commit no haga perder la respuesta
+(queda guardada con su instante original, oculta en la lectura hasta que el reloj se
+recupere).
+Y la migración (tabla con clave `(updateId, role)`, índices, unicidad, prefijos A–B6 que
+migran de forma aditiva, B7 parcial rechazado y `down` que no toca las demás tablas).
+
+De la consulta de seguimiento (`test/debt-follow-up.spec.ts`,
+`test/openrouter.follow-up.spec.ts` y `test/e2e/debt-follow-up.e2e.spec.ts`): que la
+pregunta contextual se responda con los **datos actuales** (el pendiente real, no el que
+decía el chat) y que la ventana enviada contenga **solo los turnos anteriores**, con el
+mensaje actual una sola vez; que sin ventana no se llame al proveedor y se pida la
+persona; que una persona ambigua o una contraparte vacía **no amplíen** la consulta; que
+la pregunta no cambie el borrador vivo; que `/confirm` y un pago de deuda **no toquen**
+el historial ni gasten una segunda vez; que el fallo del proveedor, el presupuesto
+agotado y el historial ilegible **no cancelen** el borrador; que un evento interrumpido
+en `reading` se complete sin volver a gastar y sin tocar el borrador; que la pregunta
+de lectura aprobada ("¿y cuánto le debía inicialmente?", con y sin tilde y con y sin
+signos) **no cancele** el borrador si el clasificador falla, se queda sin presupuesto o
+esta apagado, y que un resultado transaccional inesperado para esa forma no se escriba;
+que esa misma forma, cuando el clasificador la devuelve como `debt_query`, **no se
+atienda como una consulta general** (pide la persona, no lista deudas ni abonos y no
+usa un nombre inventado por el modelo), que su fila **naciesca en `reading`** sin paso
+previo por `processing` (con un trigger de SQLite que prohibe esa transicion) y que una
+interrupcion posterior y su reintento **no clasifiquen ni gasten** otra vez; que una
+aclaracion posible ("¿y Carmen?"), una correccion genuina o una pregunta con
+algo detras sigan cancelando el borrador como antes; que el esquema de
+la llamada contextual sea estricto (rechaza importes, cuentas, ids de deuda, modo de
+pago, intencion de escribir y una moneda no soportada), que la ventana se mande **entera
+y ordenada** aunque sea más larga que el tope de contexto de la vía normal, sin
+herramientas y con la compresión del proveedor desactivada y con `require_parameters`;
+y el flujo completo con un Telegram simulado y horas de ahora:
+"¿qué le debo a Luis?", un pago por fuera del chat y "¿y cuánto le debía inicialmente?",
+"¿y Carmen?" (la persona se sustituye y conserva el detalle, sin Luis) y una pregunta
+sin intercambio con foco claro ("¿cuáles son mis deudas?" y un pronombre) que pide la
+persona sin listar ni seleccionar; y un refinamiento del listado ("¿cuáles son mis
+deudas?" y luego "Lo que debo nada más", y el mismo refinamiento en sentido contrario)
+que llega a la via contextual con la ventana y responde solo el lado pedido, con las
+pendientes y sin tocar el borrador.
+
 ## Límites conocidos de esta entrega
 
 - **Captura IA solo de ingresos y gastos.** Las transferencias/conversiones se registran
@@ -1366,7 +1568,9 @@ anulación que reabre la deuda) y la copia de seguridad con restauración.
 - **El límite de gasto es del operador.** El allowance local es conservador pero no es la
   factura: hay que fijar también el límite de gasto en la cuenta de OpenRouter.
 - **El texto del mensaje se conserva solo mientras hace falta**: 1000 caracteres en el borrador
-  de la captura y 4096 en la bandeja de entrada de Telegram; después se borra.
+  de la captura, 4096 unidades UTF-16 en la bandeja de entrada de Telegram (después se borra)
+  y el texto entero en el historial temporal del chat, que vive una hora y se purga en el
+  ciclo (con el bot apagado, el borrado físico ocurre al siguiente arranque).
 - **Sin copia de seguridad automática.** La copia es un comando manual (`npm run backup`).
 - **Las fotos y los documentos no se procesan.** El bot solo entiende texto.
 - **El bloqueo por chat vive en memoria.** Si el bot se reinicia con una actualización a
@@ -1377,7 +1581,11 @@ anulación que reabre la deuda) y la copia de seguridad con restauración.
   chat: no hay evidencia de que sea de este transporte.
 - **Una corrección fallida pide reenviar la operación completa.** El borrador anterior se
   cancela a propósito, para que un `/confirm` no pueda registrar algo que el usuario ya
-  había corregido.
+  había corregido. La pregunta de seguimiento **no** es una corrección: no cancela el
+  borrador aunque el proveedor falle.
+- **El seguimiento de deudas es de solo lectura y es la primera versión.** Resuelve una
+  pregunta que depende del turno anterior (persona, dirección y detalle) y la responde con
+  los datos actuales; no elige deudas, no registra pagos y no completa un borrador.
 - **La revocación se aplica al arrancar.** La lista de autorizados se lee al construir el
   bot y no cambia durante la ejecución: el trabajo pendiente de un chat revocado se limpia
   en el primer ciclo, no en caliente.

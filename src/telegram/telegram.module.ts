@@ -69,11 +69,12 @@ import { TelegramService } from './telegram.service';
     },
     {
       provide: TelegramService,
-      inject: [DataSource, TransactionRunner, TelegramCommands, TelegramClient, ConfigService],
+      inject: [DataSource, TransactionRunner, TelegramCommands, CaptureService, TelegramClient, ConfigService],
       useFactory: (
         dataSource: DataSource,
         transactions: TransactionRunner,
         commands: TelegramCommands,
+        capture: CaptureService,
         client: TelegramClient,
         config: ConfigService,
       ): TelegramService =>
@@ -81,6 +82,7 @@ import { TelegramService } from './telegram.service';
           dataSource,
           transactions,
           commands,
+          capture,
           client,
           config.getOrThrow<TelegramSettings>('telegram'),
         ),

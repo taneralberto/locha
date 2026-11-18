@@ -1,7 +1,15 @@
 import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
 import { CaptureState } from './capture.entity';
 
-export type CaptureEventState = 'processing' | 'completed' | 'uncertain';
+/**
+ * Estado del evento en la captura.
+ *
+ * - `processing`: la interpretacion esta en curso.
+ * - `reading`: la consulta de seguimiento esta leyendo el contexto del chat.
+ * - `completed`: la respuesta esta guardada y se reproduce identica.
+ * - `uncertain`: la interpretacion fallo y no se reintenta sola.
+ */
+export type CaptureEventState = 'processing' | 'reading' | 'completed' | 'uncertain';
 
 /**
  * Bandeja de entrada durable de los eventos del transporte. La identidad del evento la

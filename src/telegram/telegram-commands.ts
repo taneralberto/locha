@@ -1,17 +1,19 @@
 import { Injectable } from '@nestjs/common';
-import { Account } from '../accounts/account.entity';
+import { matchAccount } from '../accounts/account-match';
 import { AccountService } from '../accounts/account.service';
 import { BudgetService } from '../budgets/budget.service';
 import { debtReportRow, DEBT_CLI_FALLBACK, formatDebtReport } from '../debts/debt-format';
-import { canonicalName, DebtService } from '../debts/debt.service';
+import { DebtService } from '../debts/debt.service';
 import { SavingsService } from '../savings/savings.service';
 import { formatGoalStatus, formatSavingsStatus } from '../savings/savings-format';
 import { CaptureService } from '../capture/capture.service';
 import { DEFAULT_TIME_ZONE, InferenceBudgetService } from '../capture/inference-budget.service';
 import { AiLimits } from '../config/configuration';
+import { HistoryLoader } from '../interpreter/history-window';
 import { dateInTimeZone, parseDate, parseMonth } from '../domain/date';
 import { NotFoundError, ValidationError } from '../domain/errors';
 import { formatAmount, Currency } from '../domain/money';
+import { canonicalName } from '../domain/name';
 import { boundedLines } from '../domain/bounded-text';
 import { BalanceReconciliation } from '../financial/balance-reconciliation.entity';
 import { FinancialService, MovementHistory } from '../financial/financial.service';
@@ -65,6 +67,11 @@ export interface CommandRequest {
   chatId: string;
   text: string;
   receivedAt: string;
+  /**
+   * Carga **perezosa** del historial del chat. Solo la usa la captura cuando el
+   * mensaje necesita contexto: los comandos deterministas no la tocan.
+   */
+  history?: HistoryLoader | null;
 }
 
 interface ParsedCommand {
@@ -148,6 +155,9 @@ export class TelegramCommands {
       chatId: request.chatId,
       text: request.text,
       receivedAt: request.receivedAt,
+      // La ventana del chat viaja como carga perezosa: la captura la pide solo si el
+      // mensaje necesita contexto.
+      history: request.history ?? null,
     });
     const reply = outcome.reply;
     // Diagnostico actual de entrega; el resultado durable de captura no se modifica.
@@ -259,7 +269,7 @@ export class TelegramCommands {
     let rows: BalanceReconciliation[];
     try {
       if (asked.length > 0) {
-        const found = this.findAccount(asked, accounts);
+        const found = matchAccount(asked, accounts);
         if (found.ambiguous) {
           return `Hay varias cuentas con el nombre "${asked}". Indica el nombre exacto.`;
         }
@@ -477,26 +487,6 @@ export class TelegramCommands {
       parts.push(movement.description);
     }
     return parts.join(' | ');
-  }
-
-  /**
-   * La cuenta que nombra el usuario: por id (lo que se usaba antes) o por nombre
-   * canonico. Con dos cuentas del mismo nombre no se elige ninguna: se pregunta.
-   */
-  private findAccount(
-    asked: string,
-    accounts: Account[],
-  ): { account: Account | null; ambiguous: boolean } {
-    const byId = accounts.find((account) => account.id.toLowerCase() === asked.toLowerCase());
-    if (byId) {
-      return { account: byId, ambiguous: false };
-    }
-    const canonical = canonicalName(asked);
-    const matches = accounts.filter((account) => canonicalName(account.name) === canonical);
-    if (matches.length === 1) {
-      return { account: matches[0]!, ambiguous: false };
-    }
-    return { account: null, ambiguous: matches.length > 1 };
   }
 }
 

@@ -82,7 +82,8 @@ describe('Migracion y backups B4', () => {
   });
 
   it('fresh: importes TEXT canonicos positivos, UUID/clave unica, FK y down solo aditivo', async () => {
-    const db = await createTempDatabase();
+    // La base se queda en B6: las tres reversiones de esta prueba son las de B6, B5 y B4.
+    const db = await createTempDatabase(migrations.slice(0, 9));
     try {
       const account = await new AccountService(db.dataSource, db.transactions).add({ name: 'USDT', currency: 'USDT' });
       const goal = (await new GoalService(db.transactions).create({ sourceKey: 'goal', name: 'Fondo', currency: 'USDT', targetMinor: 9007199254740993123456n })).goal;

@@ -295,3 +295,28 @@ export function mentionsMultipleAmounts(text: string): boolean {
   const symbolic = text.match(AMOUNT_WITH_SYMBOL) ?? [];
   return written.length + symbolic.length > 1;
 }
+
+/**
+ * Las **formas** de una pregunta de consulta de deuda que no dependen de como se
+ * interprete el mensaje: una sola pregunta sobre lo que se debia al principio.
+ *
+ * Es una señal **pequeña y conservadora**, anclada al **mensaje entero**: el mensaje
+ * tiene que ser exactamente esa pregunta. No admite clausulas extra ("... y tambien
+ * ..."), ni puntuacion intermedia, ni un "/confirm" detras ("¿y cuánto le debia
+ * inicialmente? /confirm"), y no se apoya en un "?" generico.
+ *
+ * "¿y Carmen?" **no** es de esta forma: puede ser la aclaracion de un borrador que
+ * espera a quien, asi que no se protege.
+ */
+const READ_ONLY_DEBT_QUESTION = /^¿?\s*(?:y\s+)?cu[aá]nto\s+le\s+deb[ií]a\s+inicialmente\s*\??$/i;
+
+/**
+ * `true` si el mensaje es una pregunta de consulta de deuda **inequivocamente de
+ * lectura**: una sola pregunta sobre lo que se debia al principio, sin nada mas.
+ *
+ * La forma es grammatical, no de palabras clave: no depende de que el mensaje
+ * mencione una deuda, y no se recorta ni se reescribe.
+ */
+export function isReadOnlyDebtQuestion(text: string): boolean {
+  return READ_ONLY_DEBT_QUESTION.test(text.trim());
+}

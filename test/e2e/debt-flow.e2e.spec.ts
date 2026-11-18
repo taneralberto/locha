@@ -57,6 +57,7 @@ function debtData(overrides: Partial<NonNullable<Operation['debt']>> = {}) {
     debtId: null,
     settlementMode: null,
     status: null,
+    queryDetail: null,
     ...overrides,
   };
 }
@@ -125,7 +126,7 @@ describe('Flujo completo de deudas', () => {
       new SavingsService(transactions, financial, new GoalService(transactions)),
       new DebtService(transactions, financial),
     );
-    telegram = new TelegramService(dataSource, transactions, commands, client, SETTINGS);
+    telegram = new TelegramService(dataSource, transactions, commands, capture, client, SETTINGS);
   }
 
   function update(updateId: number, text: string): TelegramUpdate {

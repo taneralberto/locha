@@ -90,7 +90,9 @@ describe('Migracion y backups B5 (deudas)', () => {
     } finally { await db.cleanup(); }
   });
 
-  it('fresh: importes TEXT canonicos positivos, clave unica, movimiento unico, FK restrict y down solo aditivo', async () => {    const db = await createTempDatabase();
+  it('fresh: importes TEXT canonicos positivos, clave unica, movimiento unico, FK restrict y down solo aditivo', async () => {
+    // La base se queda en B6: las dos reversiones de esta prueba son las de B6 y B5.
+    const db = await createTempDatabase(migrations.slice(0, 9));
     try {
       const account = await new AccountService(db.dataSource, db.transactions).add({ name: 'Efectivo', currency: 'USD' });
       const financial = new FinancialService(db.transactions);
@@ -217,7 +219,8 @@ describe('Migracion y backups B6 (borrador de deuda)', () => {
   });
 
   it('el down quita la columna y no toca las demas tablas', async () => {
-    const db = await createTempDatabase();
+    // La base se queda en B6: la unica reversion de esta prueba es la de B6.
+    const db = await createTempDatabase(migrations.slice(0, 9));
     try {
       const tables = (
         await db.dataSource.query<{ name: string }[]>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN ('migrations', 'sqlite_sequence')`)

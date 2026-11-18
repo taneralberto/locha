@@ -123,6 +123,7 @@ describe('OpenRouterInterpreter', () => {
           debtId: null,
           settlementMode: 'partial',
           status: null,
+          queryDetail: null,
         },
       }),
     );
@@ -165,6 +166,92 @@ describe('OpenRouterInterpreter', () => {
     expect(system).toContain('Crear una deuda NO es un gasto ni un ingreso');
   });
 
+  it('recibe el flag de detalle de la consulta y exige que venga en el objeto de deuda', async () => {
+    fetchMock.mockResolvedValue(
+      providerResponse({
+        ...VALID_OPERATION,
+        kind: 'debt_query',
+        debt: {
+          direction: 'payable',
+          counterparty: 'Luis',
+          debtId: null,
+          settlementMode: null,
+          status: null,
+          queryDetail: true,
+        },
+      }),
+    );
+    const interpreter = new OpenRouterInterpreter(config());
+
+    const operation = await interpreter.interpret(REQUEST);
+    expect(operation.kind).toBe('debt_query');
+    expect(operation.debt?.queryDetail).toBe(true);
+    expect(operation.debt?.counterparty).toBe('Luis');
+
+    // Sin el flag, el objeto de deuda no cumple el esquema estricto.
+    fetchMock.mockResolvedValue(
+      providerResponse({
+        ...VALID_OPERATION,
+        kind: 'debt_query',
+        debt: {
+          direction: 'payable',
+          counterparty: 'Luis',
+          debtId: null,
+          settlementMode: null,
+          status: null,
+        },
+      }),
+    );
+    await expect(interpreter.interpret(REQUEST)).rejects.toMatchObject({ reason: 'invalid' });
+  });
+
+  it('recibe el filtro de estado pending de la consulta', async () => {
+    fetchMock.mockResolvedValue(
+      providerResponse({
+        ...VALID_OPERATION,
+        kind: 'debt_query',
+        debt: {
+          direction: 'payable',
+          counterparty: 'Luis',
+          debtId: null,
+          settlementMode: null,
+          status: 'pending',
+          queryDetail: true,
+        },
+      }),
+    );
+    const interpreter = new OpenRouterInterpreter(config());
+
+    const operation = await interpreter.interpret(REQUEST);
+    expect(operation.debt?.status).toBe('pending');
+    expect(operation.debt?.queryDetail).toBe(true);
+  });
+
+  it('el prompt explica el detalle de la consulta como una lectura, no un pago', async () => {
+    fetchMock.mockResolvedValue(providerResponse(VALID_OPERATION));
+    const interpreter = new OpenRouterInterpreter(config());
+
+    await interpreter.interpret(REQUEST);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    void url;
+    const body = JSON.parse(String(init.body)) as { messages: { role: string; content: string }[] };
+    const system = body.messages[0]?.content ?? '';
+    expect(system).toContain('debt.queryDetail');
+    expect(system).toContain('Es una LECTURA, no un pago');
+    expect(system).toContain('Basta con pedir el monto inicial');
+    expect(system).toContain(
+      '"y cuánto le debía inicialmente a Luis?" -> kind "debt_query", debt.queryDetail true, debt.counterparty "Luis", debt.direction "payable"',
+    );
+    expect(system).toContain(
+      '"¿Cuánto me debía Luis inicialmente?" -> kind "debt_query", debt.queryDetail true, debt.counterparty "Luis", debt.direction "receivable"',
+    );
+    expect(system).toContain('"cuánto le he pagado a Luis" -> kind "debt_query", debt.queryDetail true');
+    expect(system).toContain('"cuánto me han pagado de la deuda" -> kind "debt_query", debt.queryDetail true');
+    expect(system).toContain('debt.queryDetail: null si el usuario pregunta por el saldo actual o pide el resumen');
+    expect(system).toContain('"pending" si pide las deudas que todavía no están saldadas');
+  });
+
   it('el prompt lleva las deudas candidatas, avisa si la lista se corta y no recorta el mensaje', async () => {
     fetchMock.mockResolvedValue(providerResponse(VALID_OPERATION));
     const interpreter = new OpenRouterInterpreter(config());
@@ -196,6 +283,103 @@ describe('OpenRouterInterpreter', () => {
     expect(user).toContain('le pagué 3 dólares a Carmen');
     // El mensaje del usuario va entero y al final.
     expect(user.endsWith('le pagué 3 dólares a Carmen')).toBe(true);
+  });
+
+  it('el prompt enruta las preguntas contextuales y las separa de las independientes', async () => {
+    fetchMock.mockResolvedValue(providerResponse(VALID_OPERATION));
+    const interpreter = new OpenRouterInterpreter(config());
+
+    await interpreter.interpret(REQUEST);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    void url;
+    const body = JSON.parse(String(init.body)) as { messages: { role: string; content: string }[] };
+    const system = body.messages[0]?.content ?? '';
+    expect(system).toContain('kind "debt_follow_up"');
+    expect(system).toContain('¿y cuánto le debía inicialmente?');
+    expect(system).toContain('¿y Carmen?');
+    // La pregunta con la persona nombrada sigue siendo una consulta normal.
+    expect(system).toContain('NO lo uses si la pregunta es independiente y completa');
+    expect(system).toContain('¿qué le debo a Luis?');
+    // Y una correccion o un pago no son una pregunta de seguimiento.
+    expect(system).toContain('NO lo uses si el mensaje corrige algo o paga');
+    expect(system).toContain('ya le pagué 5 a Luis');
+  });
+
+  it('el prompt enruta los refinamientos del listado y separa las consultas completas', async () => {
+    fetchMock.mockResolvedValue(providerResponse(VALID_OPERATION));
+    const interpreter = new OpenRouterInterpreter(config());
+
+    await interpreter.interpret(REQUEST);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    void url;
+    const body = JSON.parse(String(init.body)) as { messages: { role: string; content: string }[] };
+    const system = body.messages[0]?.content ?? '';
+    // Un refinamiento del listado es elíptico: no necesita signos de interrogación.
+    expect(system).toContain('refina un listado anterior');
+    expect(system).toContain('"Lo que debo nada más"');
+    expect(system).toContain('"de esas, solo las que tengo por cobrar"');
+    expect(system).toContain('"Lo que debo nada más" (después de un listado de deudas) -> kind "debt_follow_up"');
+    // Una consulta por dirección que no nombra a nadie es autosuficiente.
+    expect(system).toContain('NO lo uses si la consulta es autosuficiente');
+    expect(system).toContain(
+      '"muéstrame mis deudas por pagar" -> kind "debt_query", debt.direction "payable", debt.counterparty null',
+    );
+    // Y un imperativo de consulta no es una corrección ni un pago.
+    expect(system).toContain('Un imperativo de consulta');
+  });
+
+  it('el borrador no presupone que todo mensaje es una aclaracion', async () => {
+    fetchMock.mockResolvedValue(providerResponse(VALID_OPERATION));
+    const interpreter = new OpenRouterInterpreter(config());
+
+    await interpreter.interpret({
+      ...REQUEST,
+      pending: {
+        kind: 'expense',
+        amount: '2.00',
+        currency: 'USD',
+        accountId: 'cuenta-1',
+        occurredOn: '2026-11-10',
+        description: 'Helado',
+        sourceText: 'Helado 2 dolares',
+      },
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    void url;
+    const body = JSON.parse(String(init.body)) as { messages: { role: string; content: string }[] };
+    const user = body.messages[1]?.content ?? '';
+    expect(user).toContain(
+      'El mensaje siguiente puede ser una aclaracion, una correccion o una pregunta nueva',
+    );
+    expect(user).not.toContain('El mensaje siguiente es la aclaracion del usuario');
+  });
+
+  it('la llamada normal no desactiva la compresion del proveedor', async () => {
+    fetchMock.mockResolvedValue(providerResponse(VALID_OPERATION));
+    const interpreter = new OpenRouterInterpreter(config());
+
+    await interpreter.interpret(REQUEST);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    void url;
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    // El ajuste de compresion es solo de la consulta de seguimiento.
+    expect(body.plugins).toBeUndefined();
+  });
+
+  it('la operacion normal no restringe la moneda (no cambia con el contrato de seguimiento)', async () => {
+    fetchMock.mockResolvedValue(
+      providerResponse({ ...VALID_OPERATION, currency: 'EUR' }),
+    );
+    const interpreter = new OpenRouterInterpreter(config());
+
+    // El camino normal sigue aceptando la moneda como texto: el cambio del enum es
+    // solo del contrato de la consulta de seguimiento.
+    const operation = await interpreter.interpret(REQUEST);
+    expect(operation.currency).toBe('EUR');
   });
 
   it('acota el contexto: muchas deudas no hacen crecer el prompt sin limite', async () => {

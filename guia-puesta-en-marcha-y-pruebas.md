@@ -127,6 +127,16 @@ Después comprueba:
 - Una transferencia por texto sigue rechazándose sin registrarla como gasto: B1 solo
   permite escribir aperturas/transferencias mediante CLI determinista.
 
+**Historial temporal del chat (nuevo).** Además de la bandeja de entrada, el bot guarda
+en la tabla `telegram_history` el texto original de tus mensajes y la respuesta exacta
+que te envió, con su hora. Es una ventana **estricta de una hora** (no una hora de
+inactividad): lo que se salga de la ventana se borra en la vuelta siguiente del ciclo (y
+al arrancar). Con el backend detenido puedes mirarlo:
+
+```bash
+sqlite3 data/locha.sqlite 'SELECT updateId, role, sentAt, substr(text, 1, 40) FROM telegram_history ORDER BY sentAt'
+```
+
 **Usa únicamente datos ficticios por ahora.** Para añadir cuentas, migrar o hacer backups, detén primero el backend. Estos pasos están contrastados con el `README.md`, `.env.example` y los comandos actuales del proyecto.
 
 ## 5. Probar solo B1 (sin IA)
@@ -382,6 +392,7 @@ Con el bot y un modelo real, escribe en el chat:
 | `cuáles son mis deudas` | Lista las deudas pendientes, separando lo que debo de lo que me deben; no toca el borrador pendiente |
 | `le pagué 3 dólares a Carmen` | Presenta el resumen del pago, con el pendiente congelado del momento |
 | `/confirm` | Registra **un gasto** por 3 USD ligado a la deuda y la describe (persona, importe); no muestra ids |
+| `cuánto le he pagado a Carmen` | Detalle de la deuda: monto inicial, abonos (lo ya confirmado) y pendiente; si está saldada, lo dice |
 | `Carmen me pagó` | Presenta el resumen de un pago **parcial**; si no dice el importe, pregunta cuánto se pagó |
 | `/confirm` | Registra un **ingreso** por el importe indicado y deja la deuda pagada |
 | `ya le pagué todo a Carmen` | Presenta el resumen de un pago **total** (lo autoriza el texto del usuario) |
@@ -516,3 +527,58 @@ preparación para producción. La base operativa real **no** se ha tocado: todo 
 sobre rutas temporales o ficticias. Toda copia anterior completa (A/B1/B2/B3/B4/B5) se
 puede restaurar en una ruta nueva y migrar después; solo se rechazan marcadores o tablas
 parciales.
+
+## 11. Despliegue manual de la consulta de seguimiento (no hay migración nueva)
+
+Esta unidad **no añade migración**: el estado nuevo del evento (`reading`, la consulta de
+seguimiento en curso) va en la columna `state` de `capture_event`, que es texto libre. No
+se toca ninguna tabla, fila, id ni clave, y **no hay nada que ejecutar** contra la base
+para que funcione. El despliegue es el de siempre, y **manual**:
+
+1. **Detén el backend** (el bot y el `npm start`).
+2. Copia de seguridad de la base actual:
+   `npm run backup -- --to data/copia-antes-seguimiento.sqlite`.
+3. Actualiza el código y compila: `npm run build`.
+4. Aplica las migraciones pendientes (esta unidad **no** añade ninguna):
+   `npm run migration:run`.
+5. Arranca de nuevo y comprueba con `/help` y `/debts`.
+
+Sobre una **base de pruebas** (nunca la real mientras se revisa):
+
+```bash
+npm run backup -- --to data/copia-antes-seguimiento.sqlite
+npm run restore -- --from data/copia-antes-seguimiento.sqlite --to data/pruebas-seguimiento.sqlite
+# Con DATABASE_PATH apuntando a la ruta nueva:
+npm run migration:run
+```
+
+Y la comprobación en el chat (con un modelo real), dentro de la ventana de **una hora**
+del historial:
+
+| Mensaje | Resultado esperado |
+|---|---|
+| `¿qué le debo a Luis?` | Lista la deuda de Luis con su pendiente |
+| `¿y cuánto le debía inicialmente?` | Detalle de la deuda de Luis: monto inicial, abonos y pendiente **actual** |
+| `¿y Carmen?` | Si solo cambia la persona, responde con **esa persona** y el mismo tipo de pregunta (tras el detalle de Luis: el detalle de Carmen, sin Luis) |
+| `¿cuáles son mis deudas?` y luego un pronombre (`¿y cuánto le debo?`) | Como el intercambio anterior no tiene un foco claro, **pregunta la persona** y no lista ni selecciona ninguna deuda |
+
+Tres cosas que conviene comprobar a mano:
+
+- El importe que responde es el **de la base de datos**: si le pagaste a Luis después de
+  que el chat lo dijera, la respuesta muestra el pendiente nuevo.
+- Un `/confirm` o un pago **no** gastan una segunda llamada ni cargan el historial.
+- Si el proveedor falla, el bot **pide repetir la pregunta** y **no** cancela el
+  borrador pendiente.
+- Con el modelo apagado o sin presupuesto, la pregunta `¿y cuánto le debía inicialmente?`
+  **tampoco** cancela el borrador pendiente (es una consulta, no una corrección); con
+  `¿y Carmen?` o con una corrección, el flujo es el de siempre y el borrador se cancela.
+
+```bash
+npm run typecheck
+npm test -- --runInBand test/debt-follow-up.spec.ts test/openrouter.follow-up.spec.ts test/telegram-history.spec.ts
+npm run test:e2e -- --runInBand
+```
+
+Ninguna de estas pruebas hace llamadas externas, no migra la base configurada y usa un
+Telegram y un interpretador simulados. El detalle del contrato y los límites están en el
+`README.md` (secciones «Pregunta contextual (seguimiento de deudas)» y «Privacidad»).

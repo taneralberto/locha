@@ -3,6 +3,7 @@ import {
   amountsInText,
   completePaymentForm,
   fullPaymentIntent,
+  isReadOnlyDebtQuestion,
   mentionsConversion,
   mentionsDebt,
   mentionsFullPayment,
@@ -225,6 +226,35 @@ describe('Senales del texto', () => {
       expect(amountsInText('le pagué 5 dólares a Carmen')).toEqual(['5']);
       expect(amountsInText('le pagué 10,50 dólares')).toEqual(['10.50']);
       expect(amountsInText('le pagué cinco dólares')).toEqual([]);
+    });
+  });
+
+  describe('isReadOnlyDebtQuestion', () => {
+    it('reconoce la forma de consulta de deuda, con y sin tilde y con y sin signos', () => {
+      expect(isReadOnlyDebtQuestion('¿y cuánto le debía inicialmente?')).toBe(true);
+      expect(isReadOnlyDebtQuestion('¿y cuánto le debia inicialmente?')).toBe(true);
+      expect(isReadOnlyDebtQuestion('y cuánto le debía inicialmente')).toBe(true);
+      expect(isReadOnlyDebtQuestion('¿y cuánto le debia inicialmente')).toBe(true);
+      expect(isReadOnlyDebtQuestion('¿cuánto le debía inicialmente?')).toBe(true);
+      expect(isReadOnlyDebtQuestion('  ¿y cuánto le debía inicialmente?  ')).toBe(true);
+    });
+
+    it('no admite clausulas extra ni puntuacion intermedia', () => {
+      expect(isReadOnlyDebtQuestion('¿y cuánto le debía inicialmente? y Carmen')).toBe(false);
+      expect(isReadOnlyDebtQuestion('¿y cuánto le debía inicialmente? /confirm')).toBe(false);
+      expect(isReadOnlyDebtQuestion('¿y cuánto, le debía inicialmente?')).toBe(false);
+      expect(isReadOnlyDebtQuestion('¿y cuánto le debía inicialmente? ¿y Carmen?')).toBe(false);
+      expect(isReadOnlyDebtQuestion('pregunta: ¿y cuánto le debía inicialmente?')).toBe(false);
+    });
+
+    it('no trata como de lectura una aclaracion posible ni una correccion', () => {
+      // Puede ser la aclaracion de un borrador que espera a quien.
+      expect(isReadOnlyDebtQuestion('¿y Carmen?')).toBe(false);
+      expect(isReadOnlyDebtQuestion('¿cuánto le he pagado?')).toBe(false);
+      expect(isReadOnlyDebtQuestion('no eran 8, eran 10')).toBe(false);
+      expect(isReadOnlyDebtQuestion('le pagué 5 a Luis')).toBe(false);
+      expect(isReadOnlyDebtQuestion('¿?')).toBe(false);
+      expect(isReadOnlyDebtQuestion('')).toBe(false);
     });
   });
 });

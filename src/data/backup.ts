@@ -12,6 +12,7 @@ import { Budgets1780617600000 } from './migrations/1780617600000-Budgets';
 import { GoalsAndSavings1783209600000 } from './migrations/1783209600000-GoalsAndSavings';
 import { Debts1785888000000 } from './migrations/1785888000000-Debts';
 import { DebtCapture1788566400000 } from './migrations/1788566400000-DebtCapture';
+import { TelegramHistory1791158400000 } from './migrations/1791158400000-TelegramHistory';
 
 /** Tablas que debe tener una base valida del proyecto. */
 const EXPECTED_TABLES = [
@@ -188,6 +189,13 @@ export function validateDatabase(path: string): void {
     if (hasDebtPayload !== hasB6 || (hasB6 && !hasB5)) {
       throw new Error(
         `La base "${path}" no tiene el esquema esperado B6: la columna debtPayload del borrador y su migracion requieren B5, B4, B3, B2 y B1.`,
+      );
+    }
+    // La tabla del historial de Telegram va junto a su migracion: B7 exige B6.
+    const hasB7 = appliedNames.includes(new TelegramHistory1791158400000().name);
+    if (names.includes('telegram_history') !== hasB7 || (hasB7 && !hasB6)) {
+      throw new Error(
+        `La base "${path}" no tiene el esquema esperado B7: la tabla telegram_history y su migracion requieren B6, B5, B4, B3, B2 y B1.`,
       );
     }
     const pending = EXPECTED_MIGRATIONS.filter((migration) => !appliedNames.includes(migration));
