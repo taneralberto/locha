@@ -27,6 +27,15 @@ export class TelegramInbox {
   @Column({ type: 'text', nullable: true })
   text!: string | null;
 
+  /**
+   * La pulsacion de boton, en JSON. `null` si la actualizacion no es una pulsacion.
+   *
+   * Viaja **aparte** del texto: una pulsacion no es un mensaje del usuario, no entra
+   * al historial y no se interpreta como texto.
+   */
+  @Column({ type: 'text', nullable: true })
+  callback!: string | null;
+
   /** Marca de tiempo del mensaje (ISO). Es la fecha por defecto de la operacion. */
   @Column({ type: 'varchar' })
   receivedAt!: string;

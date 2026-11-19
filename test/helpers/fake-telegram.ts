@@ -1,4 +1,5 @@
 import { TelegramClient, TelegramError } from '../../src/telegram/telegram-client';
+import { TelegramButtonRows } from '../../src/telegram/telegram-buttons';
 import { TelegramUpdate } from '../../src/telegram/telegram-update';
 
 /**
@@ -8,7 +9,9 @@ import { TelegramUpdate } from '../../src/telegram/telegram-update';
  */
 export class FakeTelegramClient extends TelegramClient {
   /** Mensajes entregados al usuario. */
-  readonly sent: { chatId: string; text: string }[] = [];
+  readonly sent: { chatId: string; text: string; buttons: TelegramButtonRows }[] = [];
+  /** Confirmaciones de pulsaciones (el `answerCallbackQuery`). */
+  readonly acks: { callbackId: string; text: string | null; showAlert: boolean }[] = [];
   /** Instantes de cada intento de envio (para comprobar los retardos). */
   readonly sendAttempts: number[] = [];
   /** Offsets consultados, en orden. */
@@ -19,9 +22,14 @@ export class FakeTelegramClient extends TelegramClient {
   hangOnSend = false;
   /** `true` si el envio colgado recibio la cancelacion. */
   sendAborted = false;
+  /** Fallos de confirmacion de pulsacion que quedan por simular. */
+  pendingAckFailures = 0;
+  /** Se llama justo antes de registrar cada confirmacion (para observar el estado). */
+  onAck?: (() => void | Promise<void>) | undefined;
 
   private readonly queue: TelegramUpdate[] = [];
   private waiting: (() => void) | null = null;
+  private nextMessageId = 1_000;
 
   /** Encola una actualizacion para el siguiente sondeo. */
   enqueue(update: TelegramUpdate): void {
@@ -44,19 +52,23 @@ export class FakeTelegramClient extends TelegramClient {
     return this.take(offset);
   }
 
-  async sendMessage(chatId: string, text: string, signal?: AbortSignal): Promise<void> {
+  async sendMessage(
+    chatId: string,
+    text: string,
+    options?: { buttons?: TelegramButtonRows; signal?: AbortSignal },
+  ): Promise<number> {
     this.sendAttempts.push(Date.now());
     if (this.hangOnSend) {
       await new Promise<void>((resolve) => {
         const finish = (): void => {
-          this.sendAborted = signal?.aborted === true;
+          this.sendAborted = options?.signal?.aborted === true;
           resolve();
         };
-        if (signal?.aborted) {
+        if (options?.signal?.aborted) {
           finish();
           return;
         }
-        signal?.addEventListener('abort', finish, { once: true });
+        options?.signal?.addEventListener('abort', finish, { once: true });
       });
       throw new TelegramError('cancelled', 'Envio cancelado.');
     }
@@ -64,11 +76,32 @@ export class FakeTelegramClient extends TelegramClient {
       this.pendingSendFailures -= 1;
       throw new TelegramError('network', 'Fallo de envio simulado.');
     }
-    this.sent.push({ chatId, text });
+    this.sent.push({ chatId, text, buttons: options?.buttons ?? [] });
+    this.nextMessageId += 1;
+    return this.nextMessageId;
+  }
+
+  async answerCallbackQuery(
+    callbackId: string,
+    text: string | null,
+    showAlert: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted === true) {
+      throw new TelegramError('cancelled', 'Confirmacion cancelada.');
+    }
+    if (this.pendingAckFailures > 0) {
+      this.pendingAckFailures -= 1;
+      throw new TelegramError('network', 'Fallo de confirmacion simulado.');
+    }
+    if (this.onAck) {
+      await this.onAck();
+    }
+    this.acks.push({ callbackId, text, showAlert });
   }
 
   /** Ultimo mensaje enviado, o `undefined` si todavia no se envio ninguno. */
-  get lastSent(): { chatId: string; text: string } | undefined {
+  get lastSent(): { chatId: string; text: string; buttons: TelegramButtonRows } | undefined {
     return this.sent[this.sent.length - 1];
   }
 

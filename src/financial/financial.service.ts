@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { EntityManager, LessThanOrEqual } from 'typeorm';
 import { Account } from '../accounts/account.entity';
 import { DebtPayment } from '../debts/debt-payment.entity';
@@ -17,12 +17,12 @@ const MAX_SOURCE_KEY_LENGTH = 200;
 const MAX_DESCRIPTION_LENGTH = 280;
 const DEFAULT_RECENT_LIMIT = 20;
 const MAX_RECENT_LIMIT = 200;
-/** Motivo por defecto de la correccion de un gasto. */
-const DEFAULT_CORRECTION_REASON = 'Correccion de gasto';
-/** Sufijo de la clave de la revision que anula el gasto original. */
-const CORRECTION_VOID_SUFFIX = 'void';
-/** Sufijo de la clave del movimiento que se registra en el medio destino. */
-const CORRECTION_MOVEMENT_SUFFIX = 'expense';
+/** Motivo de auditoria de toda correccion de gasto: no lo elige el llamador. */
+const CORRECTION_REASON = 'Correccion de gasto';
+/** Prefijo de la clave de la revision de una correccion. */
+const CORRECTION_REVISION_PREFIX = 'correccion:rev:';
+/** Prefijo de la clave del movimiento de reemplazo de una correccion. */
+const CORRECTION_MOVEMENT_PREFIX = 'correccion:mov:';
 
 export interface RegisterInput {
   sourceKey: string;
@@ -154,12 +154,6 @@ export interface ExpenseCorrectionInput {
   accountId: string;
   /** Moneda del gasto corregido; debe ser la que opera la cuenta. */
   currency: Currency;
-  /** Fecha del gasto corregido; si se omite, se conserva la del original. */
-  occurredOn?: string | undefined;
-  /** Descripcion del gasto corregido; si se omite, se conserva la del original. */
-  description?: string | undefined;
-  /** Motivo auditable de la correccion. */
-  reason?: string | undefined;
 }
 
 export interface ExpenseCorrectionResult {
@@ -178,8 +172,6 @@ export interface ExpenseCorrectionPreview {
   current: ExpenseCorrectionSide;
   /** Medio e importe del gasto despues de la correccion. */
   target: ExpenseCorrectionSide;
-  /** Clave del movimiento que se registraria al cambiar de medio. */
-  replacementSourceKey: string | null;
 }
 
 type RevisionPayload = Omit<MovementRevision, 'id' | 'createdAt' | 'revision'>;
@@ -190,39 +182,42 @@ interface NormalizedExpenseCorrection {
   amountMinor: bigint;
   accountId: string;
   currency: Currency;
-  occurredOn: string | undefined;
-  description: string | undefined;
-  reason: string;
 }
 
-interface CorrectionBase {
+/**
+ * Plan de una correccion: el gasto original, el medio destino y los dos artefactos
+ * que deja (la revision y, si el medio cambia, el movimiento de reemplazo).
+ */
+interface CorrectionPlan {
   history: MovementHistory;
-  effective: EffectiveMovement;
+  mode: ExpenseCorrectionMode;
+  /** Medio e importe actuales del gasto. */
   current: ExpenseCorrectionSide;
+  /** Medio e importe del gasto corregido. */
   target: ExpenseCorrectionSide;
-  /** Categoria vigente del gasto: la guardan las revisiones, no el movimiento. */
-  category: string | null;
-}
-
-interface EditCorrectionPlan extends CorrectionBase {
-  mode: 'edit';
-  /** Revision que deja el gasto corregido en su propio medio. */
+  /** Clave de la revision de la correccion: propia y la misma en ambos modos. */
+  revisionKey: string;
+  /** Payload de la revision de la correccion. */
   revision: RevisionPayload;
+  /** Clave del movimiento de reemplazo; distinta de la de la revision. */
+  replacementKey: string;
+  /** Payload del movimiento de reemplazo; `null` cuando el medio no cambia. */
+  replacement: NormalizedInput | null;
 }
 
-interface ReplaceCorrectionPlan extends CorrectionBase {
-  mode: 'replace';
-  /** Clave de la revision que anula el gasto original. */
-  voidSourceKey: string;
-  /** Payload de la revision que anula el gasto original. */
-  voidRevision: RevisionPayload;
-  /** Clave del movimiento que se registra en el medio destino. */
-  replacementSourceKey: string;
-  /** Payload del movimiento que se registra en el medio destino. */
-  replacement: NormalizedInput;
+/**
+ * Artefactos que una correccion deja en la base: su revision canonica y su
+ * movimiento de reemplazo. Se leen una sola vez y sirven para el preflight, el
+ * replay y la deteccion de una clave que pertenece a otro gasto.
+ */
+interface CorrectionArtifacts {
+  revisionKey: string;
+  replacementKey: string;
+  /** Revision con la clave derivada de la correccion; `null` si la clave esta libre. */
+  revision: MovementRevision | null;
+  /** Movimiento con la clave derivada del reemplazo; `null` si la clave esta libre. */
+  replacement: Movement | null;
 }
-
-type CorrectionPlan = EditCorrectionPlan | ReplaceCorrectionPlan;
 
 interface NormalizedOperation {
   sourceKey: string;
@@ -300,21 +295,20 @@ export class FinancialService {
   /**
    * Describe la correccion de un gasto confirmado sin escribir nada.
    *
-   * Aplica las mismas reglas que `correctExpense`: el importe tiene que ser un entero
-   * positivo, la cuenta destino tiene que estar activa y operar en la moneda indicada,
-   * y el gasto no puede estar anulado, revisado, atado a una deuda ni ser una comision.
+   * Comparte el preflight real de `correctExpense`: el gasto tiene que ser un gasto
+   * ordinario sin revisar, las dos cuentas tienen que estar activas y en su moneda, y
+   * las claves de la correccion tienen que estar libres.
    */
   async previewExpenseCorrection(input: ExpenseCorrectionInput, manager?: EntityManager): Promise<ExpenseCorrectionPreview> {
     const normalized = normalizeExpenseCorrection(input);
     const read = async (em: EntityManager): Promise<ExpenseCorrectionPreview> => {
-      const plan = await this.correctionPlan(em, normalized);
-      await this.requireCorrectableExpense(em, plan);
+      const { plan, artifacts } = await this.prepareCorrection(em, normalized);
+      await this.preflightCorrection(em, plan, artifacts);
       return {
         movementId: normalized.movementId,
         mode: plan.mode,
         current: plan.current,
         target: plan.target,
-        replacementSourceKey: plan.mode === 'replace' ? plan.replacementSourceKey : null,
       };
     };
     return manager ? read(manager) : this.transactions.run(read);
@@ -330,36 +324,37 @@ export class FinancialService {
    * exito parcial.
    *
    * Repetir la `sourceKey` con el mismo payload devuelve el resultado original sin
-   * duplicar nada; con otro payload, la correccion entra en conflicto.
+   * duplicar nada; con otro payload, otro objetivo u otro modo, la correccion entra
+   * en conflicto y no escribe nada.
    */
   async correctExpense(input: ExpenseCorrectionInput, manager?: EntityManager): Promise<ExpenseCorrectionResult> {
     const normalized = normalizeExpenseCorrection(input);
     const work = async (em: EntityManager): Promise<ExpenseCorrectionResult> => {
-      const plan = await this.correctionPlan(em, normalized);
-      const replay = await this.replayCorrection(em, normalized, plan);
+      const { plan, artifacts } = await this.prepareCorrection(em, normalized);
+      const replay = this.replayCorrection(normalized, plan, artifacts);
       if (replay !== null) return replay;
-      await this.requireCorrectableExpense(em, plan);
-      if (plan.mode === 'edit') {
+      await this.preflightCorrection(em, plan, artifacts);
+      if (plan.replacement === null) {
         const edited = await this.editMovement({
-          sourceKey: normalized.sourceKey,
+          sourceKey: plan.revisionKey,
           movementId: normalized.movementId,
           expectedRevision: 0,
           amountMinor: plan.target.amountMinor,
           occurredOn: plan.target.occurredOn,
-          reason: normalized.reason,
+          reason: CORRECTION_REASON,
           description: plan.target.description ?? undefined,
-          category: plan.category ?? undefined,
+          category: undefined,
         }, em);
         return { movementId: normalized.movementId, created: edited.created, mode: 'edit' };
       }
       await this.voidMovement({
-        sourceKey: plan.voidSourceKey,
+        sourceKey: plan.revisionKey,
         movementId: normalized.movementId,
         expectedRevision: 0,
-        reason: normalized.reason,
+        reason: CORRECTION_REASON,
       }, em);
       const registered = await this.register({
-        sourceKey: plan.replacementSourceKey,
+        sourceKey: plan.replacementKey,
         accountId: plan.replacement.accountId,
         kind: plan.replacement.kind,
         money: { currency: plan.replacement.currency, minor: plan.replacement.minor },
@@ -367,7 +362,7 @@ export class FinancialService {
         ...(plan.replacement.description === null ? {} : { description: plan.replacement.description }),
       }, em);
       if (!registered.created) {
-        throw new ConflictError(`La clave "${plan.replacementSourceKey}" ya existe con otro contenido.`);
+        throw new ConflictError(`La clave "${plan.replacementKey}" ya existe con otro contenido.`);
       }
       return { movementId: registered.movement.id, created: true, mode: 'replace' };
     };
@@ -376,17 +371,51 @@ export class FinancialService {
     return manager ? manager.transaction(work) : this.transactions.run(work);
   }
 
+  /**
+   * Prepara la correccion: lee sus dos artefactos, rechaza una clave que pertenece
+   * a otro gasto y aplica el veto de gasto ordinario. No escribe nada.
+   */
+  private async prepareCorrection(
+    em: EntityManager,
+    normalized: NormalizedExpenseCorrection,
+  ): Promise<{ plan: CorrectionPlan; artifacts: CorrectionArtifacts }> {
+    const artifacts = await this.correctionArtifacts(em, normalized);
+    // La revision canonica pertenece a otro gasto: conflicto antes de cargar el objetivo.
+    if (artifacts.revision !== null && artifacts.revision.movementId !== normalized.movementId) {
+      throw new ConflictError(`La clave "${normalized.sourceKey}" ya existe para otro movimiento.`);
+    }
+    const plan = await this.correctionPlan(em, normalized, artifacts);
+    await this.requireOrdinaryExpense(em, plan);
+    return { plan, artifacts };
+  }
+
+  /** Lee los dos artefactos de la correccion: su revision canonica y su reemplazo. */
+  private async correctionArtifacts(em: EntityManager, normalized: NormalizedExpenseCorrection): Promise<CorrectionArtifacts> {
+    const { revisionKey, replacementKey } = correctionKeys(normalized.sourceKey);
+    return {
+      revisionKey,
+      replacementKey,
+      revision: await em.getRepository(MovementRevision).findOneBy({ sourceKey: revisionKey }),
+      replacement: await em.getRepository(Movement).findOneBy({ sourceKey: replacementKey }),
+    };
+  }
+
   /** Lee el gasto y arma el plan de la correccion, sin aplicar ni validar el estado. */
-  private async correctionPlan(em: EntityManager, normalized: NormalizedExpenseCorrection): Promise<CorrectionPlan> {
+  private async correctionPlan(
+    em: EntityManager,
+    normalized: NormalizedExpenseCorrection,
+    artifacts: CorrectionArtifacts,
+  ): Promise<CorrectionPlan> {
     const history = await this.movementHistory(normalized.movementId, em);
     const original = history.original;
     const effective = history.effective;
+    // La correccion no cambia la fecha ni la descripcion: se toma la del original.
     const target: ExpenseCorrectionSide = {
       accountId: normalized.accountId,
       currency: normalized.currency,
       amountMinor: normalized.amountMinor,
-      occurredOn: normalized.occurredOn ?? effective.occurredOn,
-      description: normalized.description ?? effective.description,
+      occurredOn: original.occurredOn,
+      description: original.description,
     };
     const current: ExpenseCorrectionSide = {
       accountId: original.accountId,
@@ -395,101 +424,108 @@ export class FinancialService {
       occurredOn: effective.occurredOn,
       description: effective.description,
     };
-    const base: CorrectionBase = { history, effective, current, target, category: effective.category };
     const sameMedium = original.accountId === normalized.accountId && original.currency === normalized.currency;
-    if (sameMedium) {
-      return {
-        ...base,
-        mode: 'edit',
-        revision: {
-          sourceKey: normalized.sourceKey,
-          movementId: normalized.movementId,
-          expectedRevision: 0,
-          kind: 'edit',
-          reason: normalized.reason,
-          amountMinor: target.amountMinor,
-          occurredOn: target.occurredOn,
-          description: target.description,
-          category: effective.category,
-        },
+    const revision: RevisionPayload = sameMedium
+      ? {
+        sourceKey: artifacts.revisionKey, movementId: normalized.movementId, expectedRevision: 0, kind: 'edit',
+        reason: CORRECTION_REASON, amountMinor: target.amountMinor, occurredOn: target.occurredOn,
+        description: target.description, category: null,
+      }
+      : {
+        sourceKey: artifacts.revisionKey, movementId: normalized.movementId, expectedRevision: 0, kind: 'void',
+        reason: CORRECTION_REASON, amountMinor: null, occurredOn: null, description: null, category: null,
       };
-    }
-    const voidSourceKey = derivedKey(normalized.sourceKey, CORRECTION_VOID_SUFFIX);
-    const replacementSourceKey = derivedKey(normalized.sourceKey, CORRECTION_MOVEMENT_SUFFIX);
+    const replacement: NormalizedInput | null = sameMedium
+      ? null
+      : {
+        sourceKey: artifacts.replacementKey, accountId: target.accountId, kind: 'expense', currency: target.currency,
+        minor: target.amountMinor, occurredOn: target.occurredOn, description: target.description,
+      };
     return {
-      ...base,
-      mode: 'replace',
-      voidSourceKey,
-      voidRevision: {
-        sourceKey: voidSourceKey,
-        movementId: normalized.movementId,
-        expectedRevision: 0,
-        kind: 'void',
-        reason: normalized.reason,
-        amountMinor: null,
-        occurredOn: null,
-        description: null,
-        category: null,
-      },
-      replacementSourceKey,
-      replacement: {
-        sourceKey: replacementSourceKey,
-        accountId: target.accountId,
-        kind: 'expense',
-        currency: target.currency,
-        minor: target.amountMinor,
-        occurredOn: target.occurredOn,
-        description: target.description,
-      },
+      history,
+      mode: sameMedium ? 'edit' : 'replace',
+      current,
+      target,
+      revisionKey: artifacts.revisionKey,
+      revision,
+      replacementKey: artifacts.replacementKey,
+      replacement,
     };
   }
 
-  /** Un gasto se corrige una sola vez y solo si es un gasto ordinario sin revisar. */
-  private async requireCorrectableExpense(em: EntityManager, plan: CorrectionPlan): Promise<void> {
-    if (plan.history.original.kind !== 'expense') {
+  /**
+   * Veto de gasto ordinario: tipo, deuda y comision. Se aplica antes de devolver un
+   * replay, para que un artefacto planted sobre una comision no parezca una
+   * correccion ya aplicada.
+   */
+  private async requireOrdinaryExpense(em: EntityManager, plan: CorrectionPlan): Promise<void> {
+    const original = plan.history.original;
+    if (original.kind !== 'expense') {
       throw new ValidationError('Solo un gasto se corrige con esta operacion.');
     }
-    if (plan.effective.voided) {
-      throw new ConflictError('El gasto esta anulado; la anulacion es terminal.');
-    }
-    if (plan.effective.revision !== 0) {
-      throw new ConflictError('El gasto ya fue revisado; la correccion exige la revision 0.');
-    }
-    if (await isDebtPayment(em, plan.history.original.id)) {
+    if (await isDebtPayment(em, original.id)) {
       throw new ConflictError('El pago de una deuda no se corrige como gasto ordinario.');
     }
     if (plan.history.feeOwner !== null) {
       throw new ConflictError('La comision de una transferencia no se corrige como gasto ordinario.');
     }
+  }
+
+  /**
+   * Preflight real de la correccion: el gasto sin revisar, las dos cuentas activas
+   * y en su moneda, y las dos claves de la correccion libres. No escribe nada.
+   */
+  private async preflightCorrection(
+    em: EntityManager,
+    plan: CorrectionPlan,
+    artifacts: CorrectionArtifacts,
+  ): Promise<void> {
+    if (plan.history.effective.voided) {
+      throw new ConflictError('El gasto esta anulado; la anulacion es terminal.');
+    }
+    if (plan.history.effective.revision !== 0) {
+      throw new ConflictError('El gasto ya fue revisado; la correccion exige la revision 0.');
+    }
+    // La cuenta de origen sigue siendo la del gasto: tiene que estar activa.
+    await requireOperationAccount(em, plan.history.original.accountId, plan.history.original.currency);
     await requireOperationAccount(em, plan.target.accountId, plan.target.currency);
+    if (artifacts.revision !== null) {
+      throw new ConflictError(`La clave de la correccion "${artifacts.revisionKey}" ya esta usada.`);
+    }
+    if (artifacts.replacement !== null) {
+      throw new ConflictError(`La clave del reemplazo "${artifacts.replacementKey}" ya esta usada.`);
+    }
   }
 
   /**
    * Una correccion repetida con la misma clave y el mismo payload devuelve el
-   * resultado original; con otro payload, conflicto. Se resuelve antes de mirar el
-   * estado del gasto, que la propia correccion ya cambio.
+   * resultado original; con otro payload, otro objetivo u otro modo, conflicto. Tambien
+   * rechaza una ocupacion parcial: un artefacto sin su pareja. Se resuelve antes de
+   * mirar el estado del gasto, que la propia correccion ya cambio.
    */
-  private async replayCorrection(
-    em: EntityManager,
+  private replayCorrection(
     normalized: NormalizedExpenseCorrection,
     plan: CorrectionPlan,
-  ): Promise<ExpenseCorrectionResult | null> {
-    if (plan.mode === 'edit') {
-      const existing = await em.getRepository(MovementRevision).findOneBy({ sourceKey: normalized.sourceKey });
-      if (!existing) return null;
-      if (!sameRevision(existing, plan.revision)) {
-        throw new ConflictError(`La clave "${normalized.sourceKey}" ya existe con otro contenido.`);
+    artifacts: CorrectionArtifacts,
+  ): ExpenseCorrectionResult | null {
+    const { revision, replacement } = artifacts;
+    if (plan.replacement === null) {
+      // El modo edit no usa la clave de reemplazo: si esta ocupada, no hay replay ni escritura.
+      if (replacement !== null) {
+        throw new ConflictError(`La clave de reemplazo de "${normalized.sourceKey}" ya esta usada.`);
+      }
+      if (!revision) return null;
+      if (!sameRevision(revision, plan.revision)) {
+        throw new ConflictError(`La clave "${normalized.sourceKey}" ya existe con otra correccion.`);
       }
       return { movementId: normalized.movementId, created: false, mode: 'edit' };
     }
-    const voidRevision = await em.getRepository(MovementRevision).findOneBy({ sourceKey: plan.voidSourceKey });
-    const replacement = await em.getRepository(Movement).findOneBy({ sourceKey: plan.replacementSourceKey });
-    if (!voidRevision && !replacement) return null;
-    if (!voidRevision || !replacement) {
-      throw new ConflictError(`La correccion "${normalized.sourceKey}" esta incompleta; no se aplica de nuevo.`);
+    if (!revision && !replacement) return null;
+    if (!revision || !replacement) {
+      throw new ConflictError(`La correccion "${normalized.sourceKey}" esta a medias; no se aplica de nuevo.`);
     }
-    if (!sameRevision(voidRevision, plan.voidRevision) || !samePayload(replacement, plan.replacement)) {
-      throw new ConflictError(`La clave "${normalized.sourceKey}" ya existe con otro contenido.`);
+    if (!sameRevision(revision, plan.revision) || !samePayload(replacement, plan.replacement)) {
+      throw new ConflictError(`La clave "${normalized.sourceKey}" ya existe con otra correccion.`);
     }
     return { movementId: replacement.id, created: false, mode: 'replace' };
   }
@@ -913,28 +949,26 @@ function normalizeExpenseCorrection(input: ExpenseCorrectionInput): NormalizedEx
   if (!isCurrency(currency)) {
     throw new ValidationError(`Moneda no soportada "${String(currency)}".`);
   }
-  if (input.occurredOn !== undefined && typeof input.occurredOn !== 'string') {
-    throw new ValidationError('La fecha de la operacion es obligatoria.');
-  }
   return {
     sourceKey: requireText(input.sourceKey, 'sourceKey', MAX_SOURCE_KEY_LENGTH),
     movementId: requireText(input.movementId, 'movementId', 36),
     amountMinor: input.amountMinor,
     accountId: requireText(input.accountId, 'accountId', 36),
     currency,
-    occurredOn: input.occurredOn === undefined ? undefined : parseDate(input.occurredOn),
-    description: input.description === undefined ? undefined : requireText(input.description, 'description', MAX_DESCRIPTION_LENGTH),
-    reason: input.reason === undefined ? DEFAULT_CORRECTION_REASON : requireText(input.reason, 'reason', MAX_DESCRIPTION_LENGTH),
   };
 }
 
-/** Clave propia de una correccion, derivada de su clave y de su sufijo. */
-function derivedKey(sourceKey: string, suffix: string): string {
-  const key = `${sourceKey}:${suffix}`;
-  if (key.length > MAX_SOURCE_KEY_LENGTH) {
-    throw new ValidationError(`La clave "${sourceKey}" no admite la clave derivada "${suffix}".`);
-  }
-  return key;
+/**
+ * Claves propias de una correccion: prefijo propio y hash acotado de su clave.
+ * La revision usa una clave y el movimiento de reemplazo otra, y ninguna de las dos
+ * comparte espacio con las claves que usa la CLI.
+ */
+function correctionKeys(sourceKey: string): { revisionKey: string; replacementKey: string } {
+  const digest = createHash('sha256').update(sourceKey).digest('hex').slice(0, 32);
+  return {
+    revisionKey: `${CORRECTION_REVISION_PREFIX}${digest}`,
+    replacementKey: `${CORRECTION_MOVEMENT_PREFIX}${digest}`,
+  };
 }
 
 function samePayload(movement: Movement, input: NormalizedInput): boolean {

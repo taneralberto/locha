@@ -20,6 +20,9 @@ import { FinancialService, MovementHistory } from '../financial/financial.servic
 import { Movement } from '../financial/movement.entity';
 import { MovementRevision } from '../financial/movement-revision.entity';
 import { sanitizeTelegramText } from './bot-text';
+import { correctionActionOf } from '../capture/correction';
+import { telegramEventId } from './telegram-update';
+import { TelegramButtonRows } from './telegram-buttons';
 
 /** Limite de Telegram para un mensaje de texto. */
 export const MAX_REPLY_LENGTH = 4096;
@@ -56,6 +59,8 @@ const HELP_TEXT = [
   '  /usage           Consumo reservado de inferencia del dia',
   '  /confirm         Registra la operacion que te mostre',
   '  /cancel          Descarta la operacion pendiente',
+  '  Para corregir un gasto ya registrado, pulsa "Corregir este gasto"',
+  '  en su aviso: te pido el importe y te muestro el antes y el despues.',
   '',
   'Tambien puedes escribir un gasto o un ingreso en palabras:',
   'el bot te muestra un resumen y tu lo confirmas con /confirm.',
@@ -72,6 +77,43 @@ export interface CommandRequest {
    * mensaje necesita contexto: los comandos deterministas no la tocan.
    */
   history?: HistoryLoader | null;
+}
+
+/** La respuesta a entregar: su texto y, si los hay, sus botones inline. */
+export interface DeliveryAnswer {
+  /** Texto de la respuesta (el mismo que sale siempre). */
+  text: string;
+  /** Botones inline por filas. Vacio si la respuesta no lleva botones. */
+  buttons: TelegramButtonRows;
+}
+
+/**
+ * Una pulsacion de boton ya **verificada** por el transporte: el boton pulsado es
+ * exactamente uno de una entrega ya enviada a ese chat y ese usuario.
+ */
+export interface CallbackRequest {
+  /** Datos del boton pulsado. */
+  data: string;
+  /** Conversacion donde se pulso. */
+  chatId: string;
+  /** Usuario autorizado que pulso. */
+  userId: string;
+  /** Actualizacion de la pulsacion. */
+  updateId: number;
+  /** Actualizacion de la entrega a la que pertenece el boton. */
+  deliveryUpdateId: number;
+  /** Id del mensaje del bot pulsado (unico dentro del chat). */
+  messageId: number;
+}
+
+/** Lo que contesta el bot a una pulsacion. */
+export interface CallbackAnswer {
+  /** Texto de la respuesta al chat. `undefined` si no hay respuesta. */
+  text?: string | undefined;
+  /** Botones de la respuesta. `undefined` si no hay. */
+  buttons?: TelegramButtonRows | undefined;
+  /** Texto de la alerta de Telegram. `undefined` si no hay. */
+  notice?: string | undefined;
 }
 
 interface ParsedCommand {
@@ -105,6 +147,43 @@ export class TelegramCommands {
   /** Responde a un mensaje autorizado. */
   async answer(request: CommandRequest): Promise<string> {
     return sanitizeTelegramText(await this.reply(request));
+  }
+
+  /**
+   * La entrega de una respuesta: su texto y sus botones inline.
+   *
+   * Por defecto **delega en `answer`**: el texto es exactamente el de siempre y la
+   * respuesta no lleva botones. Los botones salen de los **metadatos del evento** (lo
+   * que la captura ofrecio con el), no del texto: al chat no le viajan identificadores.
+   */
+  async answerDelivery(request: CommandRequest): Promise<DeliveryAnswer> {
+    const text = await this.answer(request);
+    const buttons = await this.capture.deliveryButtons(request.eventId, request.chatId);
+    return { text, buttons };
+  }
+
+  /**
+   * La respuesta a una pulsacion de boton.
+   *
+   * La pulsacion ya viene **verificada** por el transporte (es un boton exacto de una
+   * entrega enviada a ese chat y ese usuario). Aqui se traduce a la accion de la
+   * correccion y se la lleva a la captura, que es quien sabe que hacer con ella.
+   *
+   * Nada de lo que llega por texto llega aqui: solo el boton.
+   */
+  async answerCallback(request: CallbackRequest): Promise<CallbackAnswer> {
+    const action = correctionActionOf(request.data);
+    if (action === null) {
+      return { notice: 'Ese boton ya no esta disponible.' };
+    }
+    const result = await this.capture.applyCorrectionAction({
+      originEventId: telegramEventId(request.deliveryUpdateId),
+      eventId: telegramEventId(request.updateId),
+      chatId: request.chatId,
+      userId: request.userId,
+      action,
+    });
+    return { text: result.reply ?? undefined, buttons: result.buttons, notice: result.notice ?? undefined };
   }
 
   private async reply(request: CommandRequest): Promise<string> {

@@ -28,6 +28,21 @@ export class TelegramOutbox {
   @Column({ type: 'text' })
   text!: string;
 
+  /**
+   * Teclado inline de la respuesta, en JSON. `null` si la respuesta no lleva
+   * botones. Viaja con el texto: lo que sale al chat es el texto **y** su teclado.
+   */
+  @Column({ type: 'text', nullable: true })
+  markup!: string | null;
+
+  /**
+   * Id del mensaje creado en Telegram. Es unico **dentro del chat**: junto con el
+   * chat identifica la entrega exacta de un boton pulsado. `null` mientras no se ha
+   * enviado.
+   */
+  @Column({ type: 'integer', nullable: true })
+  messageId!: number | null;
+
   /** `pending` si aun no se envio; `sent` si ya salio; `discarded` si ya no se puede enviar. */
   @Column({ type: 'varchar' })
   state!: TelegramOutboxState;

@@ -1,8 +1,18 @@
 import { TelegramSettings } from '../config/configuration';
 import { boundedFetch, BoundedFetchError, BoundedFetchOptions } from '../http/bounded-fetch';
+import { inlineKeyboard, TelegramButtonRows } from './telegram-buttons';
 import { parseTelegramUpdate, TelegramUpdate } from './telegram-update';
 
 const TELEGRAM_API_BASE_URL = 'https://api.telegram.org';
+
+/** Tipos de actualizacion que el bot pide a Telegram. */
+const ALLOWED_UPDATES = ['message', 'callback_query'] as const;
+
+/**
+ * Plazo propio de la confirmacion de una pulsacion: es una llamada corta y no debe
+ * esperar como el sondeo largo.
+ */
+const ACK_TIMEOUT_MS = 2_000;
 
 export type TelegramFailure = 'timeout' | 'network' | 'http' | 'invalid' | 'cancelled';
 
@@ -37,8 +47,27 @@ export abstract class TelegramClient {
     signal?: AbortSignal,
   ): Promise<TelegramUpdate[]>;
 
-  /** Envia un mensaje de texto a un chat. */
-  abstract sendMessage(chatId: string, text: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Envia un mensaje de texto a un chat y devuelve el **id del mensaje** que creo
+   * Telegram. Ese id es unico dentro del chat: es la evidencia de que una pulsacion
+   * viene de este mensaje y no de otro.
+   */
+  abstract sendMessage(
+    chatId: string,
+    text: string,
+    options?: { buttons?: TelegramButtonRows; signal?: AbortSignal },
+  ): Promise<number>;
+
+  /**
+   * Confirma una pulsacion de boton. Es una alerta breve de Telegram: **no** envia
+   * ningun texto al chat.
+   */
+  abstract answerCallbackQuery(
+    callbackId: string,
+    text: string | null,
+    showAlert: boolean,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 /**
@@ -60,7 +89,13 @@ export class TelegramApiClient extends TelegramClient {
   ): Promise<TelegramUpdate[]> {
     const envelope = await this.call(
       'getUpdates',
-      { offset: String(offset), timeout: String(timeoutSeconds) },
+      {
+        offset: String(offset),
+        timeout: String(timeoutSeconds),
+        // Solo se piden los dos tipos de actualizacion que el bot entiende: mensajes y
+        // pulsaciones de boton.
+        allowed_updates: JSON.stringify(ALLOWED_UPDATES),
+      },
       undefined,
       signal,
     );
@@ -79,12 +114,21 @@ export class TelegramApiClient extends TelegramClient {
     return updates;
   }
 
-  async sendMessage(chatId: string, text: string, signal?: AbortSignal): Promise<void> {
+  async sendMessage(
+    chatId: string,
+    text: string,
+    options?: { buttons?: TelegramButtonRows; signal?: AbortSignal },
+  ): Promise<number> {
+    const buttons = options?.buttons ?? [];
+    const body: Record<string, unknown> = { chat_id: chatIdForApi(chatId), text };
+    if (buttons.length > 0) {
+      body['reply_markup'] = inlineKeyboard(buttons);
+    }
     const envelope = await this.call(
       'sendMessage',
       undefined,
-      JSON.stringify({ chat_id: chatIdForApi(chatId), text }),
-      signal,
+      JSON.stringify(body),
+      options?.signal,
     );
     // La API responde 200 incluso cuando no envia: hay que comprobar el sobre.
     const result = envelope.result;
@@ -95,6 +139,31 @@ export class TelegramApiClient extends TelegramClient {
     if (typeof messageId !== 'number' || !Number.isInteger(messageId)) {
       throw new TelegramError('invalid', 'Telegram no confirmo el envio del mensaje.');
     }
+    return messageId;
+  }
+
+  async answerCallbackQuery(
+    callbackId: string,
+    text: string | null,
+    showAlert: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const envelope = await this.call(
+      'answerCallbackQuery',
+      {
+        callback_query_id: callbackId,
+        ...(text === null ? {} : { text }),
+        show_alert: showAlert ? 'true' : 'false',
+      },
+      undefined,
+      signal,
+      // La confirmacion de una pulsacion tiene su propio plazo corto: no espera
+      // como el sondeo.
+      ACK_TIMEOUT_MS,
+    );
+    if (envelope.result !== true) {
+      throw new TelegramError('invalid', 'Telegram no confirmo la pulsacion.');
+    }
   }
 
   private async call(
@@ -102,6 +171,7 @@ export class TelegramApiClient extends TelegramClient {
     query?: Record<string, string>,
     body?: string,
     signal?: AbortSignal,
+    timeoutMs?: number,
   ): Promise<{ ok: boolean; result?: unknown }> {
     const url = new URL(`${this.baseUrl}/bot${this.settings.botToken}/${method}`);
     for (const [key, value] of Object.entries(query ?? {})) {
@@ -111,7 +181,7 @@ export class TelegramApiClient extends TelegramClient {
       const options: BoundedFetchOptions = {
         url: url.toString(),
         method: body === undefined ? 'GET' : 'POST',
-        timeoutMs: this.effectiveTimeoutMs(),
+        timeoutMs: timeoutMs ?? this.effectiveTimeoutMs(),
         maxResponseBytes: this.settings.maxResponseBytes,
       };
       if (body !== undefined) {

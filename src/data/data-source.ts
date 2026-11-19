@@ -28,6 +28,8 @@ import { LedgerOperations1775260800000 } from './migrations/1775260800000-Ledger
 import { MovementCorrections1777939200000 } from './migrations/1777939200000-MovementCorrections';
 import { Budgets1780617600000 } from './migrations/1780617600000-Budgets';
 import { TelegramHistory1791158400000 } from './migrations/1791158400000-TelegramHistory';
+import { ExpenseCorrection1792000000000 } from './migrations/1792000000000-ExpenseCorrection';
+import { TelegramButtons1793000000000 } from './migrations/1793000000000-TelegramButtons';
 
 /**
  * Opciones de conexion compartidas por la aplicacion NestJS, la CLI y las pruebas.
@@ -67,6 +69,8 @@ export function buildDataSourceOptions(databasePath: string): DataSourceOptions 
       Debts1785888000000,
       DebtCapture1788566400000,
       TelegramHistory1791158400000,
+      ExpenseCorrection1792000000000,
+      TelegramButtons1793000000000,
     ],
     synchronize: false,
     migrationsRun: false,

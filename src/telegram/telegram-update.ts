@@ -21,9 +21,30 @@ const TelegramMessageSchema = z.object({
   text: z.string().optional(),
 });
 
+/**
+ * El mensaje del bot al que pertenece una pulsacion. Solo se usa su `message_id`
+ * (unico dentro del chat) y su chat: el texto no viaja. El id tiene que ser
+ * positivo: un id invalido no identifica ninguna entrega.
+ */
+const TelegramCallbackMessageSchema = z.object({
+  message_id: z.number().int().positive(),
+  date: z.number().int().optional(),
+  chat: TelegramChatSchema,
+  from: TelegramUserSchema.optional(),
+});
+
+const TelegramCallbackQuerySchema = z.object({
+  id: z.string(),
+  from: TelegramUserSchema,
+  message: TelegramCallbackMessageSchema.optional(),
+  inline_message_id: z.string().optional(),
+  data: z.string(),
+});
+
 const TelegramUpdateSchema = z.object({
   update_id: z.number().int().nonnegative(),
   message: TelegramMessageSchema.optional(),
+  callback_query: TelegramCallbackQuerySchema.optional(),
 });
 
 export interface TelegramMessage {
@@ -43,6 +64,39 @@ export interface TelegramUpdate {
   updateId: number;
   /** Mensaje de la actualizacion. `null` si no es un mensaje (editado, canal, ...). */
   message: TelegramMessage | null;
+  /**
+   * Pulsacion de un boton. `null` si la actualizacion no es una pulsacion. No la
+   * decide el texto: es una estructura propia, con su id de mensaje.
+   */
+  callback?: TelegramCallback | null;
+}
+
+/**
+ * Una pulsacion de boton. Solo se acepta si viene de un **mensaje accesible** del
+ * bot (no de un mensaje inline): sin mensaje no hay entrega que comprobar.
+ */
+export interface TelegramCallback {
+  /** Identificador de la pulsacion: sirve para confirmarla. */
+  callbackId: string;
+  /** Datos del boton pulsado. */
+  data: string;
+  /** Conversacion donde se pulso. */
+  chatId: string;
+  chatType: string;
+  /** Usuario que pulso. `null` si la pulsacion no tiene autor. */
+  userId: string | null;
+  /** `true` si la pulsacion viene de un bot. */
+  isBot: boolean;
+  /** Id del mensaje del bot. Es unico **dentro del chat**, no global. */
+  messageId: number | null;
+  /**
+   * `true` si la pulsacion no viene de un mensaje accesible: un mensaje inline, un
+   * mensaje sin id o un mensaje con una fecha imposible (`date: 0`). Sin mensaje
+   * accesible no hay entrega que comprobar y la pulsacion no se enruta.
+   */
+  inline: boolean;
+  /** Marca de tiempo de la pulsacion en ISO. */
+  receivedAt: string;
 }
 
 /**
@@ -62,6 +116,35 @@ export function parseTelegramUpdate(raw: unknown, now: Date = new Date()): Teleg
   const parsed = TelegramUpdateSchema.safeParse(raw);
   if (!parsed.success) {
     return null;
+  }
+  const callback = parsed.data.callback_query;
+  if (callback) {
+    const message = callback.message;
+    const date = message?.date;
+    const receivedAt = toIsoInstant(date, now);
+    if (receivedAt === null) {
+      // Una fecha fuera de rango no invalida el resto del lote: se salta esta entrada.
+      return null;
+    }
+    const chat = message?.chat;
+    // Un mensaje inline, sin id o con una fecha imposible (`date: 0`) no es un
+    // mensaje accesible: la pulsacion no se puede enrutar a ninguna entrega.
+    const accessible = message !== undefined && (date === undefined || date > 0);
+    return {
+      updateId: parsed.data.update_id,
+      message: null,
+      callback: {
+        callbackId: callback.id,
+        data: callback.data,
+        chatId: chat ? String(chat.id) : '',
+        chatType: chat?.type ?? '',
+        userId: callback.from ? String(callback.from.id) : null,
+        isBot: callback.from.is_bot === true,
+        messageId: message?.message_id ?? null,
+        inline: callback.inline_message_id !== undefined || !accessible,
+        receivedAt,
+      },
+    };
   }
   const message = parsed.data.message;
   if (!message) {

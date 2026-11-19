@@ -94,6 +94,171 @@ export const BROKEN_DEBT_DRAFT_REPLY =
   'No se pudo leer el borrador pendiente de deuda. Vuelve a enviar el mensaje completo (importe, moneda, contraparte y cuenta si es un pago). No se registro nada.';
 
 /**
+ * Una correccion explicita ("Mentira, fue 2 USDT") sin gasto al que aplicarse: no se
+ * busca un movimiento parecido ni se infiere el objetivo. Se pide la correccion otra
+ * vez, justo despues de confirmar el gasto.
+ */
+export const CORRECTION_NO_TARGET_REPLY = [
+  'No se a que gasto se refiere esa correccion.',
+  'Escribe la correccion justo despues de confirmar el gasto que quieres corregir.',
+  'No se registro nada.',
+].join('\n');
+
+/**
+ * Un `/confirm` sin el resumen entregado que lo respalde: no se aplica ninguna
+ * propuesta. El `/confirm` solo aplica un resumen que el usuario ya vio.
+ */
+export const CORRECTION_NO_EVIDENCE_REPLY = [
+  'No tengo el resumen de la correccion que confirmaste.',
+  'Envia otra vez la correccion y, cuando veas el resumen, responde /confirm.',
+  'No se registro nada.',
+].join('\n');
+
+/**
+ * Hay una operacion pendiente (normal o de deuda) y el usuario manda una correccion.
+ * Primero se resuelve la pendiente: la correccion no la pisa ni la infiere.
+ */
+export const CORRECTION_PENDING_OPERATION_REPLY = [
+  'Primero confirma o descarta la operacion pendiente.',
+  'Para corregirla, reenvia la operacion completa (importe, moneda y cuenta).',
+  'No se registro nada.',
+].join('\n');
+
+/** Faltan datos para aplicar la correccion. */
+export const CORRECTION_DETAILS_TITLE = 'Faltan datos para aplicar la correccion:';
+
+/** Como se reenvia la correccion completa, con su cuenta. */
+export const CORRECTION_DETAILS_FOOTER =
+  'Reenvia la frase completa con la cuenta, por ejemplo: "Mentira, fue 2 USDT en Binance".';
+
+/**
+ * No se puede certificar que propuesta se vio: no se da una version nueva
+ * confirmable. Se dice con honestidad lo que si se puede hacer.
+ */
+export const CORRECTION_NO_PROMPT_REPLY = [
+  'No se que correccion confirmar todavia.',
+  'Responde /cancel para descartarla y haz el cambio a mano si sigue haciendo falta.',
+  'No se registro nada.',
+].join('\n');
+
+/**
+ * La correccion no se entiende: se pide la frase completa y no se prepara nada
+ * confirmable.
+ */
+export function correctionInvalidReply(problem: string): string {
+  return [
+    `No se entiende la correccion: ${problem}.`,
+    'Reenvia la frase completa, por ejemplo: "Mentira, fue 2 USDT en Binance".',
+    'No se registro nada.',
+  ].join('\n');
+}
+
+/**
+ * El resumen de la correccion: el gasto como esta y como quedaria. No lleva
+ * identificadores: el usuario ve nombres, importes y fechas.
+ */
+export function correctionSummaryReply(
+  current: { amount: string; currency: string; accountName: string; occurredOn: string; description: string | null },
+  target: { amount: string; currency: string; accountName: string },
+): string {
+  return [
+    'Entendi esta correccion del gasto:',
+    `  - antes: ${current.amount} ${current.currency} | ${current.accountName} | ${current.occurredOn} | ${current.description ?? '(sin descripcion)'}`,
+    `  - despues: ${target.amount} ${target.currency} | ${target.accountName}`,
+    '  - la fecha y la descripcion se conservan',
+    '',
+    'Responde /confirm para aplicarla o /cancel para descartarla.',
+  ].join('\n');
+}
+
+/** La correccion aplicada: el gasto queda como se pidio. */
+export function correctionRegisteredReply(
+  target: { amount: string; currency: string; accountName: string },
+): string {
+  return `Correccion aplicada: gasto de ${target.amount} ${target.currency} en la cuenta ${target.accountName}.`;
+}
+
+/**
+ * El prompt de la correccion: el usuario responde con el importe y la moneda. No se
+ * infiere nada y no se acepta un valor a medias.
+ */
+export const CORRECTION_AMOUNT_REPLY = [
+  '¿Cuanto fue realmente?',
+  'Escribe el importe y la moneda (por ejemplo: 2$ por USDT).',
+  'La fecha y la descripcion del gasto no cambian.',
+].join('\n');
+
+/** Hay varias cuentas compatibles: el usuario elige con botones. */
+export const CORRECTION_ACCOUNTS_REPLY = [
+  '¿En que cuenta estaba?',
+  'Elige una cuenta de la lista.',
+].join('\n');
+
+/** La correccion aplicada: el gasto queda como se pidio. */
+export const CORRECTION_APPLIED_REPLY = 'Correccion aplicada: el gasto ya esta corregido.';
+
+/** La correccion descartada: no se toco nada. */
+export const CORRECTION_CANCELLED_REPLY = 'Correccion descartada. No se cambio nada.';
+
+/** El boton ya no sirve: no se cambia nada. */
+export const CORRECTION_UNAVAILABLE_REPLY = 'Ese boton ya no esta disponible. No se cambio nada.';
+
+/**
+ * Un `/confirm` sobre un borrador correctivo no aplica nada: la correccion se
+ * aplica con su boton, en el resumen que el usuario ya vio.
+ */
+export const CORRECTION_CONFIRM_INERT_REPLY = [
+  'La correccion se aplica con su boton, en el resumen que te mostre.',
+  'Responde /cancel si quieres descartarla.',
+  'No se cambio nada.',
+].join('\n');
+
+/** El resumen de la correccion: el antes y el despues, con sus cuentas. */
+export function correctionReviewReply(
+  review: { before: string; after: string },
+  detail: { occurredOn: string; description: string | null },
+): string {
+  return [
+    'Esta es la correccion:',
+    `  - antes: ${review.before}`,
+    `  - despues: ${review.after}`,
+    `  - fecha ${detail.occurredOn} y descripcion "${detail.description ?? '(sin descripcion)'}": no cambian`,
+    '',
+    'Aplicala con el boton o descartala.',
+  ].join('\n');
+}
+
+/**
+ * El texto llega en otra fase (la de cuentas o la de revision): no se fabrica un
+ * menu ni una version nueva. Se pide el boton del mensaje anterior.
+ */
+export const CORRECTION_USE_BUTTONS_REPLY = [
+  'Usa los botones del mensaje anterior para elegir o aplicar.',
+  'Responde /cancel si quieres descartarlo.',
+  'No se cambio nada.',
+].join('\n');
+
+/** El prompt vigente, cuando el usuario no escribio un valor valido. */
+export function correctionPromptReply(prompt: { kind: string }): string {
+  switch (prompt.kind) {
+    case 'accounts':
+      return CORRECTION_ACCOUNTS_REPLY;
+    case 'review':
+      return CORRECTION_CONFIRM_INERT_REPLY;
+    default:
+      return CORRECTION_AMOUNT_REPLY;
+  }
+}
+
+/** El motivo por el que no se entendio el valor. */
+export function correctionProblemReply(problem: string): string {
+  return [
+    `No se entiende ese valor: ${problem}.`,
+    'Escribe el importe y la moneda (por ejemplo: 2$ por USDT).',
+  ].join('\n');
+}
+
+/**
  * Los datos que faltan y las cuentas que hay. El orden de los problemas es el del
  * backend: primero lo que el modelo no dio, despues la cuenta.
  */

@@ -4,12 +4,13 @@ import { Account } from '../accounts/account.entity';
 import { isUniqueViolation } from '../data/unique-violation';
 import { TransactionRunner } from '../data/transaction.runner';
 import { dateInTimeZone } from '../domain/date';
-import { ValidationError } from '../domain/errors';
-import { Currency, isCurrency, parseAmount } from '../domain/money';
+import { ConflictError, FinancialError, ValidationError } from '../domain/errors';
+import { Currency, formatAmount, isCurrency, parseAmount } from '../domain/money';
 import { DebtDirection } from '../debts/debt.entity';
 import { DebtService } from '../debts/debt.service';
 import { FinancialService } from '../financial/financial.service';
 import { MovementKind } from '../financial/movement.entity';
+
 import { AccountOption, InterpreterError, OperationInterpreter } from '../interpreter/interpreter';
 import {
   DebtFollowUp,
@@ -26,7 +27,15 @@ import {
   CANCELLED_REPLY,
   confirmationReply,
   CONVERSION_REPLY,
-  debtCreatedReply,
+  CORRECTION_ACCOUNTS_REPLY,
+  CORRECTION_AMOUNT_REPLY,
+  CORRECTION_APPLIED_REPLY,
+  CORRECTION_CANCELLED_REPLY,
+  CORRECTION_CONFIRM_INERT_REPLY,
+  CORRECTION_UNAVAILABLE_REPLY,
+  CORRECTION_USE_BUTTONS_REPLY,
+  correctionProblemReply,
+  correctionReviewReply,  debtCreatedReply,
   debtSettledReply,
   DEBT_CLARIFY_REPLY,
   detailsReply,
@@ -66,6 +75,14 @@ import {
 } from './draft';
 import { BudgetExhaustedError, DEFAULT_TIME_ZONE, InferenceBudgetService } from './inference-budget.service';
 import { sourceKeyFor } from './source-key';
+import { TelegramButtonRows } from '../telegram/telegram-buttons';
+import {
+  CorrectionAction,
+  CorrectionMetadata,
+  correctionButtons,
+  parseCorrectionValue,
+} from './correction';
+import { encodeMetadata, decodeMetadata } from './correction-metadata';
 import {
   isReadOnlyDebtQuestion,
   mentionsConversion,
@@ -96,6 +113,67 @@ export interface CaptureRequest {
    * la piden. Sin historial, la pregunta se responde pidiendo la persona.
    */
   history?: HistoryLoader | null;
+}
+
+/** Una pulsacion de boton de correccion, ya verificada por el transporte. */
+export interface CorrectionActionRequest {
+  /** Evento que emitio el prompt pulsado (la entrega del boton). */
+  originEventId: string;
+  /** Evento nuevo de esta pulsacion. */
+  eventId: string;
+  chatId: string;
+  userId: string;
+  action: CorrectionAction;
+}
+
+/** Lo que responde el backend a una pulsacion de correccion. */
+export interface CorrectionActionResult {
+  /** Respuesta al usuario; `null` si no hay. */
+  reply: string | null;
+  /** Botones de la respuesta. */
+  buttons: TelegramButtonRows;
+  /** Aviso breve de Telegram; `null` si no hay. */
+  notice: string | null;
+}
+
+/**
+ * El resultado de una transicion de correccion: su respuesta, sus botones y el estado
+ * del borrador despues de ella.
+ */
+interface CorrectionTransition {
+  reply: string;
+  buttons: TelegramButtonRows;
+  captureState: CaptureState | null;
+  notice: null;
+}
+
+/** El origen de una correccion: el evento que la ofrecio y su gasto. */
+interface CorrectionOrigin {
+  /** Evento de captura que ofrecio la correccion. */
+  eventId: string;
+  /** Movimiento que se quiere corregir. */
+  movementId: string;
+  /** Clave del origen (`sourceKeyFor` del evento que la ofrecio). */
+  sourceKey: string;
+}
+
+/**
+ * Lo que una transicion de correccion relee dentro de su transaccion: el borrador
+ * **de esa version**, el prompt vigente de este chat y el ancla de este chat.
+ */
+interface CorrectionContext {
+  /** El borrador correctivo vivo, con la version del prompt pulsado. */
+  draft: Capture;
+  /** El evento del prompt pulsado (completo, mismo chat). */
+  prompt: CaptureEvent;
+  /** Los metadatos del prompt, validos para la fase. */
+  metadata: CorrectionMetadata;
+  /** El evento de origen (la oferta), en el mismo chat. */
+  origin: CaptureEvent;
+  /** El gasto que se corrige. */
+  movementId: string;
+  /** La clave del origen (`sourceKeyFor` del evento que ofrecio la correccion). */
+  originKey: string;
 }
 
 export interface CaptureOutcome {
@@ -197,7 +275,24 @@ export class CaptureService {
    * mismo que cancelar por id: hay un unico borrador vivo por conversacion.
    */
   async cancelPending(chatId: string, manager: EntityManager): Promise<void> {
-    await manager.getRepository(Capture).update(
+    const repository = manager.getRepository(Capture);
+    // El borrador correctivo se limpia entero: sin su ancla y sin su propuesta no se
+    // puede confirmar ni volver a aplicar.
+    await repository.update(
+      { chatId, kind: 'expense_correction', state: In(['awaiting_details', 'awaiting_confirmation']) },
+      {
+        state: 'cancelled',
+        sourceText: null,
+        debtPayload: null,
+        correctionTargetEventId: null,
+        amount: null,
+        currency: null,
+        accountId: null,
+        occurredOn: null,
+        description: null,
+      },
+    );
+    await repository.update(
       { chatId, state: In(['awaiting_details', 'awaiting_confirmation']) },
       { state: 'cancelled', sourceText: null, debtPayload: null },
     );
@@ -224,6 +319,24 @@ export class CaptureService {
       return replay(existing);
     }
 
+    const command = detectCommand(input.text);
+    const pending = await this.findPendingCapture(input.chatId);
+
+    // Un borrador correctivo vivo: el texto del usuario es el valor de la
+    // correccion, no una operacion nueva. No se infiere nada para corregir.
+    //
+    // La transicion crea su evento **en la misma transaccion** que el borrador: si
+    // el guardado falla, no queda evento a medias ni se pierde la propuesta, y el
+    // reintento con el mismo id vuelve a emitirla.
+    if (
+      command === null &&
+      pending?.kind === 'expense_correction' &&
+      !readOnlyQuestion &&
+      input.text.trim().length > 0
+    ) {
+      return this.correctionValue(input, pending);
+    }
+
     let event: CaptureEvent;
     try {
       event = await this.createEvent(input, readOnlyQuestion ? 'reading' : 'processing');
@@ -245,7 +358,6 @@ export class CaptureService {
       return replay(winner);
     }
 
-    const command = detectCommand(input.text);
     if (command === 'confirm') {
       return this.confirm(event, input);
     }
@@ -256,16 +368,17 @@ export class CaptureService {
       return this.complete(event, input, null, EMPTY_MESSAGE_REPLY);
     }
 
-    const pending = await this.findPendingCapture(input.chatId);
-    const pendingDraft = pending === null ? null : this.pendingOf(pending);
+    // Un borrador correctivo no se pasa al modelo ni se mezcla con uno normal.
+    const modelPending = pending !== null && pending.kind === 'expense_correction' ? null : pending;
+    const pendingDraft = modelPending === null ? null : this.pendingOf(modelPending);
 
     // Una eleccion de la lista de deudas se resuelve **antes** del modelo: el numero
     // es la fuente de verdad (el id guardado es el que se paga) y asi no se gasta
     // inferencia en un mensaje que ya esta dicho.
-    if (pending !== null && pendingDraft !== null) {
+    if (modelPending !== null && pendingDraft !== null) {
       const choice = choiceIndex(input.text, pendingDraft.draft.debt?.choices ?? []);
       if (choice !== null) {
-        return this.debtChoice(event, input, pending, pendingDraft, choice);
+        return this.debtChoice(event, input, modelPending, pendingDraft, choice);
       }
     }
 
@@ -291,7 +404,7 @@ export class CaptureService {
         text: input.text,
         accounts,
         defaultDate,
-        pending: pending ? toPendingOperation(pending) : null,
+        pending: modelPending ? toPendingOperation(modelPending) : null,
         debts: candidates.debts,
         debtsTruncated: candidates.truncated,
       });
@@ -576,11 +689,683 @@ export class CaptureService {
     return this.saveDraft(event, input, pending, prepared);
   }
 
-  /** Confirma el borrador vivo y registra el movimiento. */
+  /**
+  /**
+   * Los botones de una entrega: salen de los metadatos del evento, que se guardaron
+   * con su respuesta. Si el evento no ofrece nada, no hay botones.
+   */
+  async deliveryButtons(eventId: string, chatId: string): Promise<TelegramButtonRows> {
+    const event = await this.findEvent(eventId, chatId);
+    return correctionButtons(decodeMetadata(event?.metadata ?? null));
+  }
+
+  /**
+   * Una pulsacion de boton de correccion, **ya verificada por el transporte**: el
+   * boton pulsado es exactamente uno de una entrega enviada a ese chat y ese usuario.
+   *
+   * Aqui se comprueba que la pulsacion pertenece a la **version vigente** de la
+   * correccion (la clave del borrador es la del prompt pulsado), que el prompt es
+   * de este chat y de la fase esperada, y que el ancla es de este chat. Un boton viejo
+   * o de otra correccion no cambia nada.
+   *
+   * Cada transicion ocurre en **una sola transaccion**: relee el borrador, el prompt y
+   * el ancla, escribe el resultado y cierra el evento.
+   */
+  async applyCorrectionAction(request: CorrectionActionRequest): Promise<CorrectionActionResult> {
+    try {
+      return await this.transactions.run(async (manager) => {
+        const event = await this.findOrCreateEvent(manager, request.eventId, request.chatId);
+        if (event.state === 'completed') {
+          // La pulsacion ya se atendio: se reproduce su respuesta, sin repetir nada.
+          return {
+            reply: event.reply,
+            buttons: correctionButtons(decodeMetadata(event.metadata)),
+            notice: null,
+          };
+        }
+        switch (request.action.type) {
+          case 'start':
+            return await this.startCorrection(manager, event, request);
+          case 'cancel':
+            return await this.cancelCorrection(manager, event, request);
+          case 'amount':
+            return await this.editCorrectionAmount(manager, event, request);
+          case 'account':
+            return await this.chooseCorrectionAccount(manager, event, request, request.action.index);
+          case 'apply':
+            return await this.applyCorrection(manager, event, request);
+        }
+      });
+    } catch (error) {
+      if (error instanceof FinancialError) {
+        // Un rechazo de dominio es una respuesta **terminal**: reintentarla no
+        // cambiaria nada. Se guarda durable en el evento, asi que el mismo evento
+        // reproduce la misma respuesta y el transporte cierra la pulsacion.
+        return await this.recordCorrectionFailure(request, error);
+      }
+      // Un fallo de infraestructura **no** es una respuesta: se propaga. La
+      // transaccion se ha revertido (no queda ni el `void` ni el `register` a
+      // medias, ni el borrador movido) y el transporte reintenta la pulsacion
+      // pendiente, sin confirmarla: el mismo evento la completa cuando la base
+      // vuelva a responder, y se escribe una sola vez.
+      throw error;
+    }
+  }
+
+  /**
+   * La respuesta terminal de un rechazo de dominio: queda **guardada** en el evento,
+   * de modo que el mismo evento la reproduce y no se reintenta nada.
+   */
+  private async recordCorrectionFailure(
+    request: CorrectionActionRequest,
+    error: unknown,
+  ): Promise<CorrectionActionResult> {
+    const message = safeErrorMessage(error);
+    const reply = `No se pudo aplicar la correccion: ${message}`;
+    await this.transactions.run(async (manager) => {
+      const event = await this.findOrCreateEvent(manager, request.eventId, request.chatId);
+      await manager.getRepository(CaptureEvent).update(
+        { id: event.id },
+        { state: 'completed', reply, captureState: null, movementId: null, metadata: null },
+      );
+    });
+    return { reply, buttons: [], notice: null };
+  }
+
+  /**
+   * El boton de inicio: el boton `Corregir este gasto` del aviso de gasto
+   * registrado. Se comprueba que el origen sea un gasto ordinario, sin revisar, y que
+   * no haya ningun borrador vivo que pisar.
+   */
+  private async startCorrection(
+    manager: EntityManager,
+    event: CaptureEvent,
+    request: CorrectionActionRequest,
+  ): Promise<CorrectionActionResult> {
+    const offer = await manager.getRepository(CaptureEvent).findOneBy({
+      eventId: request.originEventId,
+      chatId: request.chatId,
+      state: 'completed',
+    });
+    const metadata = decodeMetadata(offer?.metadata ?? null);
+    if (offer === null || offer.movementId === null || metadata === null || metadata.kind !== 'offer') {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const history = await this.financial.movementHistory(offer.movementId, manager).catch(() => null);
+    const effective = history?.effective;
+    if (
+      effective === undefined ||
+      effective.kind !== 'expense' ||
+      effective.voided ||
+      effective.revision !== 0
+    ) {
+      return this.closeEvent(manager, event, 'Ese gasto ya no se puede corregir.', null);
+    }
+    const pending = await manager.getRepository(Capture).findOneBy({
+      chatId: request.chatId,
+      state: In(['awaiting_details', 'awaiting_confirmation']),
+    });
+    if (pending !== null) {
+      return this.closeEvent(
+        manager,
+        event,
+        'Ya tienes una operacion pendiente: confirmala o descartala antes de corregir.',
+        null,
+      );
+    }
+    const origin = sourceKeyFor(request.chatId, offer.eventId);
+    const prompt: CorrectionMetadata = { kind: 'amount', origin };
+    const reply = CORRECTION_AMOUNT_REPLY;
+    await manager.getRepository(Capture).save(
+      manager.getRepository(Capture).create({
+        chatId: request.chatId,
+        // La version de la correccion es la del prompt que la emitio.
+        sourceKey: sourceKeyFor(request.chatId, event.eventId),
+        state: 'awaiting_details',
+        kind: 'expense_correction',
+        amount: null,
+        currency: null,
+        accountId: null,
+        occurredOn: null,
+        description: null,
+        debtPayload: null,
+        // El evento que ancla la correccion (B8): la oferta original.
+        correctionTargetEventId: offer.id,
+        sourceText: null,
+      }),
+    );
+    await this.closeEvent(manager, event, reply, encodeMetadata(prompt), 'awaiting_details');
+    return { reply, buttons: correctionButtons(prompt), notice: null };
+  }
+
+  /**
+   * El valor que responde el usuario tras el boton. Solo en la **fase de importe**:
+   * es un valor exacto, sin inferencia y sin conversiones.
+   *
+   * El evento se crea **en la misma transaccion** que el borrador: si el guardado
+   * falla, no queda evento a medias ni se pierde la propuesta; el reintento con el
+   * mismo id vuelve a emitirla.
+   */
+  private async correctionValue(
+    input: NormalizedRequest,
+    pending: Capture,
+  ): Promise<CaptureOutcome> {
+    const outcome = await this.transactions.run(async (manager) => {
+      const event = await this.findOrCreateEvent(manager, input.eventId, input.chatId);
+      if (event.state === 'completed') {
+        // El evento ya se atendio: se reproduce su respuesta, sin repetir nada.
+        return {
+          reply: event.reply ?? '',
+          buttons: correctionButtons(decodeMetadata(event.metadata)),
+          captureState: event.captureState,
+          replayed: true,
+          eventId: event.eventId,
+        };
+      }
+      // El borrador se relee dentro de la transaccion: solo vale el que sigue vivo.
+      const draft = await manager.getRepository(Capture).findOneBy({
+        id: pending.id,
+        chatId: input.chatId,
+        kind: 'expense_correction',
+        state: In(['awaiting_details', 'awaiting_confirmation']),
+      });
+      if (draft === null) {
+        const reply = CORRECTION_UNAVAILABLE_REPLY;
+        await this.closeEvent(manager, event, reply, null);
+        return { reply, buttons: [], captureState: null, replayed: false, eventId: event.eventId };
+      }
+      const result = await this.applyCorrectionValue(manager, event, draft, input.text);
+      return { ...result, replayed: false, eventId: event.eventId };
+    });
+    return {
+      eventId: outcome.eventId,
+      chatId: input.chatId,
+      captureState: outcome.captureState,
+      reply: outcome.reply,
+      replayed: outcome.replayed,
+      movementId: null,
+    };
+  }
+
+  /** El valor leido y la fase siguiente, en la misma transaccion del evento. */
+  private async applyCorrectionValue(
+    manager: EntityManager,
+    event: CaptureEvent,
+    draft: Capture,
+    text: string,
+  ): Promise<{
+    reply: string;
+    buttons: TelegramButtonRows;
+    captureState: CaptureState | null;
+    notice: null;
+  }> {
+    if (draft.amount !== null) {
+      // El texto llega en la fase de cuentas o en la de revision: no se fabrica un
+      // menu ni una version nueva. Se pide el boton del mensaje anterior.
+      const reply = CORRECTION_USE_BUTTONS_REPLY;
+      const captureState = draft.state;
+      await this.closeEvent(manager, event, reply, null, captureState);
+      return { reply, buttons: [], captureState, notice: null };
+    }
+    const origin = await this.correctionOrigin(manager, draft);
+    if (origin === null) {
+      const reply = CORRECTION_UNAVAILABLE_REPLY;
+      await this.closeEvent(manager, event, reply, null);
+      return { reply, buttons: [], captureState: null, notice: null };
+    }
+    const parsed = parseCorrectionValue(text);
+    if (parsed.kind === 'invalid') {
+      // Un valor invalido no fabrica una version confirmable: se vuelve a pedir el
+      // importe, que es la fase vigente.
+      return this.repromptAmount(manager, event, draft, correctionProblemReply(parsed.problem), origin.sourceKey);
+    }
+    const history = await this.financial.movementHistory(origin.movementId, manager).catch(() => null);
+    const current = history?.effective;
+    if (current === undefined) {
+      const reply = CORRECTION_UNAVAILABLE_REPLY;
+      await this.closeEvent(manager, event, reply, null);
+      return { reply, buttons: [], captureState: null, notice: null };
+    }
+    const currency = parsed.value.currency ?? current.currency;
+    try {
+      parseAmount(parsed.value.amount, currency);
+    } catch (error) {
+      const problem = error instanceof Error ? error.message : 'el importe no es valido';
+      return this.repromptAmount(manager, event, draft, correctionProblemReply(problem), origin.sourceKey);
+    }
+    const accounts = (await this.activeAccounts(manager)).filter((account) => account.currency === currency);
+    if (accounts.length === 0) {
+      // Sin cuenta compatible no se toca el ledger: se pide otro dato.
+      return this.repromptAmount(
+        manager,
+        event,
+        draft,
+        correctionProblemReply(`no hay ninguna cuenta activa en ${currency}`),
+        origin.sourceKey,
+      );
+    }
+    if (accounts.length > 1) {
+      // Varias cuentas: el usuario elige con botones, sobre una lista guardada.
+      const list = accounts.map((account) => ({ id: account.id, label: `${account.name} (${account.currency})` }));
+      const prompt: CorrectionMetadata = { kind: 'accounts', origin: origin.sourceKey, accounts: list };
+      const reply = CORRECTION_ACCOUNTS_REPLY;
+      await this.bumpDraft(manager, draft, {
+        amount: parsed.value.amount,
+        currency,
+        accountId: null,
+        state: 'awaiting_details',
+        sourceKey: sourceKeyFor(draft.chatId, event.eventId),
+      });
+      await this.closeEvent(manager, event, reply, encodeMetadata(prompt), 'awaiting_details');
+      return { reply, buttons: correctionButtons(prompt), captureState: 'awaiting_details', notice: null };
+    }
+    // Una sola cuenta compatible: se avanza a la revision.
+    return this.prepareCorrectionReview(manager, event, draft, {
+      amount: parsed.value.amount,
+      currency,
+      accountId: accounts[0]!.id,
+      origin: {
+        eventId: origin.eventId,
+        movementId: origin.movementId,
+        sourceKey: origin.sourceKey,
+      },
+    });
+  }
+
+  /**
+   * Vuelve a pedir el importe: el prompt de importe se emite **de nuevo** en el evento
+   * actual y el borrador pasa a esa version. El menu del mensaje nuevo es el vigente y
+   * el del mensaje anterior, viejo.
+   */
+  private async repromptAmount(
+    manager: EntityManager,
+    event: CaptureEvent,
+    draft: Capture,
+    reply: string,
+    origin: string,
+  ): Promise<CorrectionTransition> {
+    const prompt: CorrectionMetadata = { kind: 'amount', origin };
+    await this.bumpDraft(manager, draft, {
+      amount: null,
+      currency: null,
+      accountId: null,
+      state: 'awaiting_details',
+      sourceKey: sourceKeyFor(draft.chatId, event.eventId),
+    });
+    await this.closeEvent(manager, event, reply, encodeMetadata(prompt), 'awaiting_details');
+    return { reply, buttons: correctionButtons(prompt), captureState: 'awaiting_details', notice: null };
+  }
+
+  /**
+   * El boton de cuenta: la opcion se elige **por indice** contra la lista que se
+   * guardo con el prompt, y la cuenta se vuelve a validar (activa y con su moneda).
+   */
+  private async chooseCorrectionAccount(
+    manager: EntityManager,
+    event: CaptureEvent,
+    request: CorrectionActionRequest,
+    index: number,
+  ): Promise<CorrectionActionResult> {
+    const context = await this.correctionContext(manager, request, 'accounts');
+    if (context === null) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const chosen = context.metadata.accounts?.[index];
+    if (chosen === undefined) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const account = (await this.activeAccounts(manager)).find((candidate) => candidate.id === chosen.id);
+    if (account === undefined || account.currency !== context.draft.currency) {
+      // La cuenta ya no sirve: se vuelve al importe, sin emitir un teclado fantasma.
+      const prompt: CorrectionMetadata = { kind: 'amount', origin: context.originKey };
+      const reply = correctionProblemReply('la cuenta ya no esta disponible');
+      await this.bumpDraft(manager, context.draft, {
+        amount: null,
+        currency: null,
+        accountId: null,
+        state: 'awaiting_details',
+        sourceKey: sourceKeyFor(context.draft.chatId, event.eventId),
+      });
+      await this.closeEvent(manager, event, reply, encodeMetadata(prompt), 'awaiting_details');
+      return { reply, buttons: correctionButtons(prompt), notice: null };
+    }
+    return this.prepareCorrectionReview(manager, event, context.draft, {
+      amount: context.draft.amount as string,
+      currency: context.draft.currency as Currency,
+      accountId: account.id,
+      origin: {
+        eventId: context.origin.eventId,
+        movementId: context.movementId,
+        sourceKey: context.originKey,
+      },
+    });
+  }
+
+  /** Editar el importe antes de aplicar: se vuelve a la fase de importe. */
+  private async editCorrectionAmount(
+    manager: EntityManager,
+    event: CaptureEvent,
+    request: CorrectionActionRequest,
+  ): Promise<CorrectionActionResult> {
+    const context = await this.correctionContext(manager, request, 'review');
+    if (context === null) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const prompt: CorrectionMetadata = { kind: 'amount', origin: context.originKey };
+    const reply = CORRECTION_AMOUNT_REPLY;
+    await this.bumpDraft(manager, context.draft, {
+      amount: null,
+      currency: null,
+      accountId: null,
+      state: 'awaiting_details',
+      sourceKey: sourceKeyFor(context.draft.chatId, event.eventId),
+    });
+    await this.closeEvent(manager, event, reply, encodeMetadata(prompt), 'awaiting_details');
+    return { reply, buttons: correctionButtons(prompt), notice: null };
+  }
+
+  /**
+   * La revision: el antes y el despues, con la cuenta ya elegida. La vista previa es
+   * del dominio (no escribe) y su resumen es la unica forma de aplicar.
+   */
+  private async prepareCorrectionReview(
+    manager: EntityManager,
+    event: CaptureEvent,
+    draft: Capture,
+    target: { amount: string; currency: Currency; accountId: string; origin: CorrectionOrigin },
+  ): Promise<CorrectionTransition> {
+    const sourceKey = sourceKeyFor(draft.chatId, event.eventId);
+    let review: { before: string; after: string };
+    let detail: { occurredOn: string; description: string | null } = { occurredOn: '', description: null };
+    try {
+      const preview = await this.financial.previewExpenseCorrection(
+        {
+          sourceKey,
+          movementId: target.origin.movementId,
+          accountId: target.accountId,
+          currency: target.currency,
+          amountMinor: parseAmount(target.amount, target.currency),
+        },
+        manager,
+      );
+      const names = await this.accountNames(manager);
+      review = {
+        before: `${formatAmount(preview.current.amountMinor, preview.current.currency)} ${preview.current.currency} en ${names.get(preview.current.accountId) ?? '(sin cuenta)'}`,
+        after: `${formatAmount(preview.target.amountMinor, preview.target.currency)} ${preview.target.currency} en ${names.get(preview.target.accountId) ?? '(sin cuenta)'}`,
+      };
+      detail = {
+        occurredOn: preview.current.occurredOn,
+        description: preview.current.description,
+      };
+    } catch (error) {
+      if (!(error instanceof FinancialError)) {
+        // Un fallo que no es de dominio no se responde: la transaccion se revierte,
+        // el borrador sigue como estaba y el mismo evento se puede reintentar.
+        throw error;
+      }
+      const message = safeErrorMessage(error);
+      const reply = `No se pudo preparar la correccion: ${message}`;
+      await this.closeEvent(manager, event, reply, null);
+      return { reply, buttons: [], captureState: null, notice: null };
+    }
+    const prompt: CorrectionMetadata = { kind: 'review', origin: target.origin.sourceKey, review };
+    const reply = correctionReviewReply(review, {
+      occurredOn: detail.occurredOn,
+      description: detail.description,
+    });
+    await this.bumpDraft(manager, draft, {
+      amount: target.amount,
+      currency: target.currency,
+      accountId: target.accountId,
+      state: 'awaiting_confirmation',
+      sourceKey,
+    });
+    await this.closeEvent(manager, event, reply, encodeMetadata(prompt), 'awaiting_confirmation');
+    return { reply, buttons: correctionButtons(prompt), captureState: 'awaiting_confirmation', notice: null };
+  }
+
+  /**
+   * Aplicar la correccion: el dominio escribe, y el borrador y el evento se cierran en
+   * la **misma transaccion**. Si algo falla, no queda ni `void` ni `register` a medias.
+   */
+  private async applyCorrection(
+    manager: EntityManager,
+    event: CaptureEvent,
+    request: CorrectionActionRequest,
+  ): Promise<CorrectionActionResult> {
+    const context = await this.correctionContext(manager, request, 'review');
+    if (context === null) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const draft = context.draft;
+    const amount = draft.amount;
+    const currency = draft.currency;
+    const accountId = draft.accountId;
+    if (amount === null || currency === null || accountId === null || !isCurrency(currency)) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    // El resumen tiene que ser coherente con **esta** version: el importe exacto y la
+    // cuenta elegida.
+    try {
+      parseAmount(amount, currency);
+    } catch {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const account = (await this.activeAccounts(manager)).find((candidate) => candidate.id === accountId);
+    if (account === undefined || account.currency !== currency) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const result = await this.financial.correctExpense(
+      {
+        // La clave del resumen: la version vigente.
+        sourceKey: draft.sourceKey,
+        movementId: context.movementId,
+        accountId,
+        currency,
+        amountMinor: parseAmount(amount, currency),
+      },
+      manager,
+    );
+    const closed = await manager.getRepository(Capture).update(
+      { id: draft.id, state: 'awaiting_confirmation', sourceKey: draft.sourceKey },
+      {
+        state: 'registered',
+        sourceText: null,
+        correctionTargetEventId: null,
+        amount: null,
+        currency: null,
+        accountId: null,
+        occurredOn: null,
+        description: null,
+      },
+    );
+    if (closed.affected !== 1) {
+      throw new ConflictError('La correccion pendiente ya no esta vigente.');
+    }
+    const reply = CORRECTION_APPLIED_REPLY;
+    await this.closeEvent(manager, event, reply, null, 'registered', result.movementId);
+    return { reply, buttons: [], notice: null };
+  }
+
+  /** Cancelar la correccion: el borrador se descarta y no se toca el ledger. */
+  private async cancelCorrection(
+    manager: EntityManager,
+    event: CaptureEvent,
+    request: CorrectionActionRequest,
+  ): Promise<CorrectionActionResult> {
+    const context = await this.correctionContext(manager, request, null);
+    if (context === null) {
+      return this.closeEvent(manager, event, CORRECTION_UNAVAILABLE_REPLY, null);
+    }
+    const closed = await manager.getRepository(Capture).update(
+      { id: context.draft.id, state: context.draft.state, sourceKey: context.draft.sourceKey },
+      {
+        state: 'cancelled',
+        sourceText: null,
+        debtPayload: null,
+        correctionTargetEventId: null,
+        amount: null,
+        currency: null,
+        accountId: null,
+        occurredOn: null,
+        description: null,
+      },
+    );
+    if (closed.affected !== 1) {
+      throw new ConflictError('La correccion pendiente ya no esta vigente.');
+    }
+    const reply = CORRECTION_CANCELLED_REPLY;
+    await this.closeEvent(manager, event, reply, null, 'cancelled');
+    return { reply, buttons: [], notice: null };
+  }
+
+  /**
+   * El contexto de una pulsacion: el borrador **de esa version**, el prompt vigente
+   * de este chat y el ancla de este chat. `null` si algo no encaja: el boton es viejo
+   * o no es de esta correccion, y no se toca nada.
+   */
+  private async correctionContext(
+    manager: EntityManager,
+    request: CorrectionActionRequest,
+    phase: 'amount' | 'accounts' | 'review' | null,
+  ): Promise<CorrectionContext | null> {
+    const prompt = await manager.getRepository(CaptureEvent).findOneBy({
+      eventId: request.originEventId,
+      chatId: request.chatId,
+      state: 'completed',
+    });
+    if (prompt === null) {
+      return null;
+    }
+    const metadata = decodeMetadata(prompt.metadata);
+    if (metadata === null || (phase !== null && metadata.kind !== phase)) {
+      return null;
+    }
+    const draft = await manager.getRepository(Capture).findOneBy({
+      chatId: request.chatId,
+      kind: 'expense_correction',
+      // Solo el borrador vivo: uno ya aplicado o descartado no admite pulsaciones.
+      state: In(['awaiting_details', 'awaiting_confirmation']),
+      // La version vigente: la del prompt pulsado.
+      sourceKey: sourceKeyFor(request.chatId, request.originEventId),
+    });
+    if (draft === null) {
+      return null;
+    }
+    const origin = await this.correctionOrigin(manager, draft);
+    if (origin === null || origin.sourceKey !== metadata.origin) {
+      return null;
+    }
+    return { draft, prompt, metadata, origin: origin.event, movementId: origin.movementId, originKey: origin.sourceKey };
+  }
+
+  /** El origen de la correccion: el evento que la ofrecio y su gasto. */
+  private async correctionOrigin(
+    manager: EntityManager,
+    draft: Capture,
+  ): Promise<(CorrectionOrigin & { event: CaptureEvent }) | null> {
+    if (draft.correctionTargetEventId === null) {
+      return null;
+    }
+    const event = await manager.getRepository(CaptureEvent).findOneBy({
+      id: draft.correctionTargetEventId,
+      chatId: draft.chatId,
+      state: 'completed',
+    });
+    if (event === null || event.movementId === null) {
+      return null;
+    }
+    return {
+      event,
+      eventId: event.eventId,
+      movementId: event.movementId,
+      sourceKey: sourceKeyFor(draft.chatId, event.eventId),
+    };
+  }
+
+  /**
+   * Actualiza el borrador a una **nueva version**: su `sourceKey` es el del evento que
+   * emite el prompt. El guardado es condicional: si el borrador cambio entre la
+   * lectura y aqui, no se guarda nada.
+   */
+  private async bumpDraft(
+    manager: EntityManager,
+    draft: Capture,
+    values: {
+      amount: string | null;
+      currency: Currency | null;
+      accountId: string | null;
+      state: CaptureState;
+      sourceKey: string;
+    },
+  ): Promise<void> {
+    const updated = await manager.getRepository(Capture).update(
+      { id: draft.id, state: draft.state, sourceKey: draft.sourceKey },
+      { ...values, kind: 'expense_correction' },
+    );
+    if (updated.affected !== 1) {
+      throw new ConflictError('La correccion pendiente ya no esta vigente.');
+    }
+  }
+
+  /** Los nombres de las cuentas, para el resumen (nunca identificadores). */
+  private async accountNames(manager: EntityManager): Promise<Map<string, string>> {
+    const accounts = await manager.getRepository(Account).find();
+    return new Map(accounts.map((account) => [account.id, account.name]));
+  }
+
+  /** Cierra el evento de una transicion (o de una pulsacion que no cambia nada). */
+  private async closeEvent(
+    manager: EntityManager,
+    event: CaptureEvent,
+    reply: string,
+    metadata: string | null,
+    captureState: CaptureState | null = null,
+    movementId: string | null = null,
+  ): Promise<CorrectionActionResult> {
+    await manager.getRepository(CaptureEvent).update(
+      { id: event.id },
+      { state: 'completed', reply, captureState, movementId, metadata },
+    );
+    return { reply, buttons: correctionButtons(decodeMetadata(metadata)), notice: null };
+  }
+
+  /** El evento de la pulsacion: se busca y, si no existe, se crea en la transaccion. */
+  private async findOrCreateEvent(
+    manager: EntityManager,
+    eventId: string,
+    chatId: string,
+  ): Promise<CaptureEvent> {
+    const repository = manager.getRepository(CaptureEvent);
+    const existing = await repository.findOneBy({
+      eventId,
+      chatId,
+    });
+    if (existing) {
+      return existing;
+    }
+    return repository.save(
+      repository.create({
+        eventId,
+        chatId,
+        state: 'processing',
+        reply: null,
+        captureState: null,
+        movementId: null,
+        metadata: null,
+      }),
+    );
+  }
+
   private async confirm(event: CaptureEvent, input: NormalizedRequest): Promise<CaptureOutcome> {
     const pending = await this.findPendingCapture(input.chatId);
     if (!pending) {
       return this.complete(event, input, null, NOTHING_TO_CONFIRM_REPLY);
+    }
+    if (pending.kind === 'expense_correction') {
+      // Un `/confirm` sobre un borrador correctivo no aplica nada: la correccion se
+      // aplica con su boton, en el resumen que el usuario ya vio.
+      return this.confirmCorrection(event, input, pending);
     }
     if (pending.state !== 'awaiting_confirmation') {
       // El borrador no tiene un resumen vigente: hay que volver a enviarlo para verlo.
@@ -625,7 +1410,20 @@ export class CaptureService {
         const message = registeredReply(draft, account);
         await manager.getRepository(CaptureEvent).update(
           { id: event.id },
-          { state: 'completed', reply: message, captureState: 'registered', movementId: result.movement.id },
+          {
+            state: 'completed',
+            reply: message,
+            captureState: 'registered',
+            movementId: result.movement.id,
+            // Solo un gasto ordinario ofrece correccion: un ingreso o un pago de deuda
+            // no se corrigen asi. La oferta va **con la respuesta**, en esta misma
+            // transaccion.
+            metadata: encodeMetadata(
+              pending.kind === 'expense'
+                ? { kind: 'offer', origin: sourceKeyFor(pending.chatId, event.eventId) }
+                : null,
+            ),
+          },
         );
         return { message, movementId: result.movement.id };
       });
@@ -652,9 +1450,19 @@ export class CaptureService {
   }
 
   /**
-   * Confirma un borrador de deuda. La escritura del dominio y el cierre del borrador
-   * ocurren en la **misma transaccion**: o se guardan los dos, o no se guarda ninguno.
+  /**
+   * Un `/confirm` sobre un borrador correctivo **no aplica nada**: la correccion se
+   * aplica con su boton, en el resumen que el usuario vio. Aqui solo se explica.
    */
+  private async confirmCorrection(
+    event: CaptureEvent,
+    input: NormalizedRequest,
+    pending: Capture,
+  ): Promise<CaptureOutcome> {
+    return this.complete(event, input, pending.state, CORRECTION_CONFIRM_INERT_REPLY);
+  }
+
+
   private async confirmDebt(
     event: CaptureEvent,
     input: NormalizedRequest,
@@ -808,6 +1616,8 @@ export class CaptureService {
         occurredOn: draft.occurredOn,
         description: draft.description,
         debtPayload: draft.debt === null ? null : serializeDebtDraft(draft.debt),
+        // Un borrador normal no ancla ninguna correccion.
+        correctionTargetEventId: null,
       };
       if (pending) {
         await repository.update({ id: pending.id }, values);
@@ -1001,8 +1811,11 @@ export class CaptureService {
     return { draft: draftOf(pending), state: pending.state };
   }
 
-  private async activeAccounts(): Promise<AccountOption[]> {
-    const accounts = await this.dataSource.getRepository(Account).find({
+  private async activeAccounts(manager?: EntityManager): Promise<AccountOption[]> {
+    const repository = manager
+      ? manager.getRepository(Account)
+      : this.dataSource.getRepository(Account);
+    const accounts = await repository.find({
       where: { active: true },
       order: { name: 'ASC' },
     });

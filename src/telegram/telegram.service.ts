@@ -6,6 +6,7 @@ import { TelegramSettings } from '../config/configuration';
 import { TransactionRunner } from '../data/transaction.runner';
 import { TelegramClient, TelegramError } from './telegram-client';
 import { TelegramCommands } from './telegram-commands';
+import { parseButtons, serializeButtons, isValidCallbackData } from './telegram-buttons';
 import { sanitizeTelegramText } from './bot-text';
 import { POLLING_CURSOR_ID, TelegramCursor } from './telegram-cursor.entity';
 import {
@@ -16,7 +17,7 @@ import {
 } from './telegram-history.store';
 import { TelegramInbox } from './telegram-inbox.entity';
 import { TelegramOutbox } from './telegram-outbox.entity';
-import { TelegramUpdate, telegramEventId } from './telegram-update';
+import { TelegramCallback, TelegramUpdate, telegramEventId } from './telegram-update';
 
 /** Espera minima entre sondeos cuando no llega nada (evita un bucle rapido). */
 const POLL_IDLE_MS = 1_000;
@@ -36,6 +37,20 @@ interface AcceptedMessage {
   userId: string;
   text: string;
   receivedAt: string;
+}
+
+/** Una pulsacion de boton que ya supero la autorizacion. */
+interface AcceptedCallback {
+  chatId: string;
+  userId: string;
+  callback: TelegramCallback;
+}
+
+/** Lo que se guarda de una pulsacion en la bandeja de entrada. */
+interface CallbackPayload {
+  callbackId: string;
+  data: string;
+  messageId: number;
 }
 
 /**
@@ -65,6 +80,8 @@ interface ConfirmedDelivery {
   userId: string;
   /** Texto exacto que salio al chat. */
   text: string;
+  /** Id del mensaje creado en Telegram (unico dentro del chat). */
+  messageId: number;
   /** Instante de la entrega, en milisegundos desde epoch. */
   sentAt: number;
   /** Intentos de escritura ya realizados. */
@@ -305,7 +322,12 @@ export class TelegramService implements OnModuleDestroy {
           if (this.isAllowed(row.chatId, row.userId)) {
             continue;
           }
-          await inbox.update({ updateId: row.updateId }, { state: 'discarded', text: null });
+          // La carga se borra (el texto o la pulsacion): la fila se conserva con su
+          // contexto para poder saber que habia trabajo ahi.
+          await inbox.update(
+            { updateId: row.updateId },
+            { state: 'discarded', text: null, callback: null },
+          );
         }
 
         const pending = await outbox.find({ where: { state: 'pending' } });
@@ -315,7 +337,14 @@ export class TelegramService implements OnModuleDestroy {
           }
           await outbox.update(
             { id: row.id },
-            { state: 'discarded', text: '', lastError: 'not_allowed', nextAttemptAt: 0 },
+            {
+              state: 'discarded',
+              text: '',
+              // El teclado se va con el texto: una entrega descartada no deja botones.
+              markup: null,
+              lastError: 'not_allowed',
+              nextAttemptAt: 0,
+            },
           );
           // Si esta entrega ya habia salido al chat, su confirmacion se suelta: lo
           // revocado no se guarda y no se reenvia.
@@ -419,6 +448,16 @@ export class TelegramService implements OnModuleDestroy {
    * pendiente, para que el orden durable se respete siempre.
    */
   private async handle(update: TelegramUpdate): Promise<void> {
+    if (update.callback) {
+      const acceptedCallback = this.authorizeCallback(update);
+      if (!acceptedCallback) {
+        await this.advanceCursor(update.updateId);
+        return;
+      }
+      // La aceptacion es durable: si falla, el lote se corta y el cursor no avanza.
+      await this.acceptCallback(update.updateId, acceptedCallback);
+      return;
+    }
     const accepted = this.authorize(update);
     if (!accepted) {
       await this.advanceCursor(update.updateId);
@@ -426,6 +465,65 @@ export class TelegramService implements OnModuleDestroy {
     }
     // La aceptacion es durable: si falla, el lote se corta y el cursor no avanza.
     await this.accept(update.updateId, accepted);
+  }
+
+  /**
+   * Autorizacion de una pulsacion: mensaje **accesible** del bot (no inline), chat
+   * privado, chat y usuario autorizados, y un usuario que no sea un bot.
+   *
+   * Se decide antes de guardar nada, antes de enrutar y antes de responder: una
+   * pulsacion que no pasa por aqui no llega a ningun sitio.
+   */
+  private authorizeCallback(update: TelegramUpdate): AcceptedCallback | null {
+    const callback = update.callback;
+    if (!callback) {
+      return null;
+    }
+    if (callback.inline || callback.messageId === null) {
+      // Un mensaje inline no es accesible: no hay entrega que comprobar.
+      return null;
+    }
+    if (callback.chatType !== 'private') {
+      return null;
+    }
+    if (!callback.userId || !this.isAllowed(callback.chatId, callback.userId)) {
+      return null;
+    }
+    if (callback.isBot) {
+      return null;
+    }
+    if (callback.data.length === 0) {
+      return null;
+    }
+    return { chatId: callback.chatId, userId: callback.userId, callback };
+  }
+
+  /** Guarda la pulsacion aceptada y avanza el cursor, en una sola transaccion. */
+  private async acceptCallback(updateId: number, accepted: AcceptedCallback): Promise<void> {
+    await this.transactions.run(async (manager) => {
+      const inbox = manager.getRepository(TelegramInbox);
+      const existing = await inbox.findOneBy({ updateId });
+      if (!existing) {
+        await inbox.save(
+          inbox.create({
+            updateId,
+            chatId: accepted.chatId,
+            userId: accepted.userId,
+            // Una pulsacion **no** es texto de usuario: no guarda texto ni entra al
+            // historial.
+            text: null,
+            callback: JSON.stringify({
+              callbackId: accepted.callback.callbackId,
+              data: accepted.callback.data,
+              messageId: accepted.callback.messageId as number,
+            } satisfies CallbackPayload),
+            receivedAt: accepted.callback.receivedAt,
+            state: 'accepted',
+          }),
+        );
+      }
+      await this.advanceCursorWith(manager, updateId);
+    });
   }
 
   /**
@@ -555,19 +653,29 @@ export class TelegramService implements OnModuleDestroy {
    * arrancar se vuelve a procesar: la captura es idempotente, asi que no se duplica
    * ningun movimiento.
    */
-  private async process(updateId: number): Promise<void> {
+  private async process(updateId: number): Promise<boolean> {
     const inbox = this.dataSource.getRepository(TelegramInbox);
     const row = await inbox.findOneBy({ updateId });
     if (!row || row.state !== 'accepted') {
-      return;
+      return true;
     }
     if (!this.isAllowed(row.chatId, row.userId)) {
       // La lista vigente ya no autoriza a ese chat o a ese usuario: el mensaje se
       // borra sin interpretarlo y sin responder.
-      await inbox.update({ updateId }, { state: 'discarded', text: null });
-      return;
+      await inbox.update({ updateId }, { state: 'discarded', text: null, callback: null });
+      return true;
     }
-    const reply = await this.commands.answer({
+    if (row.callback !== null) {
+      // Una fila con pulsacion **nunca** entra por el camino de texto, ni siquiera si
+      // su carga esta rota: se descarta.
+      const callback = parseCallbackPayload(row.callback);
+      if (callback === null) {
+        await this.discardCallback(row);
+        return true;
+      }
+      return this.processCallback(row, callback);
+    }
+    const reply = await this.commands.answerDelivery({
       eventId: telegramEventId(updateId),
       chatId: row.chatId,
       text: row.text ?? '',
@@ -593,7 +701,11 @@ export class TelegramService implements OnModuleDestroy {
             updateId,
             chatId: row.chatId,
             userId: row.userId,
-            text: reply,
+            text: reply.text,
+            // El teclado viaja con el texto: lo que sale al chat es el texto y su
+            // teclado, y lo que se guarda es lo mismo.
+            markup: serializeButtons(reply.buttons),
+            messageId: null,
             state: 'pending',
             attempts: 0,
             nextAttemptAt: 0,
@@ -601,8 +713,151 @@ export class TelegramService implements OnModuleDestroy {
           }),
         );
       }
-      await manager.getRepository(TelegramInbox).update({ updateId }, { state: 'done', text: null });
+      await manager.getRepository(TelegramInbox).update({ updateId }, { state: 'done', text: null, callback: null });
     });
+    return true;
+  }
+
+  /**
+   * Procesa una pulsacion de boton.
+   *
+   * Antes de enrutar nada se comprueba que la pulsacion corresponde a un boton
+   * **exacto** de una entrega ya enviada a ese chat y ese usuario: el `messageId` que
+   * devolvio la API tiene que ser el del mensaje pulsado y sus datos tienen que ser
+   * los de un boton de ese teclado. Los datos del boton **no** son la autoridad: son
+   * la pregunta, y la respuesta la tiene la entrega.
+   *
+   * Si la entrega **todavia no esta guardada** (Telegram ya la confirmo pero su
+   * escritura aun no ha salido), la pulsacion **espera**: no se cierra la fila, no se
+   * enruta y no se confirma. El reintento de entrega ya existente la guardara y la
+   * pulsacion se procesara en la vuelta siguiente, sin reenviar el mensaje.
+   *
+   * Devuelve `false` cuando la pulsacion quedo diferida (el chat espera su turno).
+   */
+  private async processCallback(row: TelegramInbox, callback: CallbackPayload): Promise<boolean> {
+    const delivery = await this.resolveDelivery(row, callback);
+    if (delivery === null) {
+      if (this.isPendingDelivery(row.chatId, row.userId, callback.messageId)) {
+        // La entrega ya salio pero aun no esta guardada: se espera su escritura.
+        return false;
+      }
+      await this.discardCallback(row);
+      await this.ackCallback(callback.callbackId, 'Este boton ya no esta disponible.');
+      return true;
+    }
+    const answer = await this.commands.answerCallback({
+      data: callback.data,
+      chatId: row.chatId,
+      userId: row.userId,
+      updateId: row.updateId,
+      deliveryUpdateId: delivery.updateId,
+      messageId: delivery.messageId as number,
+    });
+    const text = answer.text;
+    if (text !== undefined && text !== null && text.length > 0) {
+      await this.transactions.run(async (manager) => {
+        const outbox = manager.getRepository(TelegramOutbox);
+        const existing = await outbox.findOneBy({ updateId: row.updateId });
+        if (!existing) {
+          await outbox.save(
+            outbox.create({
+              updateId: row.updateId,
+              chatId: row.chatId,
+              userId: row.userId,
+              text,
+              markup: serializeButtons(answer.buttons ?? []),
+              messageId: null,
+              state: 'pending',
+              attempts: 0,
+              nextAttemptAt: 0,
+              lastError: null,
+            }),
+          );
+        }
+        await manager.getRepository(TelegramInbox).update(
+          { updateId: row.updateId },
+          { state: 'done', text: null, callback: null },
+        );
+      });
+    } else {
+      await this.discardCallback(row);
+    }
+    await this.ackCallback(callback.callbackId, answer.notice ?? null);
+    return true;
+  }
+
+  /**
+   * La entrega a la que pertenece una pulsacion: una entrega **enviada** (`sent`) de
+   * ese chat y ese usuario cuyo `messageId` es el del mensaje pulsado y cuyo teclado
+   * tiene **ese** boton. `null` si no hay evidencia exacta.
+   *
+   * El `messageId` es unico dentro del chat, no global: por eso la busqueda va
+   * **dentro** del chat y del usuario. La consulta trae como mucho dos filas: si
+   * hubiera mas de una entrega con el mismo id, no hay entrega inequivoca y la
+   * pulsacion no se enruta.
+   */
+  private async resolveDelivery(
+    row: TelegramInbox,
+    callback: CallbackPayload,
+  ): Promise<TelegramOutbox | null> {
+    const rows = await this.dataSource.getRepository(TelegramOutbox).find({
+      where: {
+        chatId: row.chatId,
+        userId: row.userId,
+        state: 'sent',
+        messageId: callback.messageId,
+      },
+      take: 2,
+    });
+    if (rows.length !== 1) {
+      // Ninguna o mas de una: no hay una entrega inequivoca.
+      return null;
+    }
+    const delivery = rows[0]!;
+    const buttons = parseButtons(delivery.markup);
+    if (buttons === null) {
+      return null;
+    }
+    const exact = buttons.some((line) => line.some((button) => button.data === callback.data));
+    return exact ? delivery : null;
+  }
+
+  /**
+   * `true` si Telegram **ya confirmo** el envio de esa entrega pero su escritura aun
+   * no ha salido. La pulsacion espera a que la entrega se guarde.
+   */
+  private isPendingDelivery(chatId: string, userId: string, messageId: number): boolean {
+    for (const entry of this.confirmed.values()) {
+      if (entry.chatId === chatId && entry.userId === userId && entry.messageId === messageId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Descarta la pulsacion: la fila se conserva (con su contexto) y su carga se borra.
+   * Va en una transaccion: el cierre se escribe antes de confirmar la pulsacion.
+   */
+  private async discardCallback(row: TelegramInbox): Promise<void> {
+    await this.transactions.run(async (manager) => {
+      await manager.getRepository(TelegramInbox).update(
+        { updateId: row.updateId },
+        { state: 'done', text: null, callback: null },
+      );
+    });
+  }
+
+  /**
+   * Confirma la pulsacion. Es **best effort**: si falla, el ciclo sigue y no se
+   * rompe ninguna cola. No envia ningun texto al chat.
+   */
+  private async ackCallback(callbackId: string, notice: string | null): Promise<void> {
+    try {
+      await this.client.answerCallbackQuery(callbackId, notice, notice !== null, this.abort?.signal);
+    } catch (error) {
+      this.logger.warn(`No se pudo confirmar una pulsacion de boton (${reasonOf(error)}).`);
+    }
   }
 
   /**
@@ -620,7 +875,12 @@ export class TelegramService implements OnModuleDestroy {
       return false;
     }
     try {
-      await this.process(updateId);
+      const processed = await this.process(updateId);
+      if (!processed) {
+        // El trabajo quedo diferido (una entrega aun sin guardar): el chat espera su
+        // turno y no se cuenta como fallo.
+        return false;
+      }
       this.backoff.delete(chatId);
       return true;
     } catch (error) {
@@ -675,7 +935,14 @@ export class TelegramService implements OnModuleDestroy {
           // su texto no se queda pendiente.
           await outbox.update(
             { id: row.id },
-            { state: 'discarded', text: '', lastError: 'not_allowed', nextAttemptAt: 0 },
+            {
+              state: 'discarded',
+              text: '',
+              // El teclado se va con el texto: una entrega descartada no deja botones.
+              markup: null,
+              lastError: 'not_allowed',
+              nextAttemptAt: 0,
+            },
           );
           this.confirmed.delete(row.id);
           continue;
@@ -702,7 +969,11 @@ export class TelegramService implements OnModuleDestroy {
           // El texto que sale se calcula **una vez**: el que se envia es exactamente
           // el que se guarda en el historial.
           const delivered = sanitizeTelegramText(row.text);
-          await this.client.sendMessage(row.chatId, delivered, this.abort?.signal);
+          const buttons = parseButtons(row.markup) ?? [];
+          const messageId = await this.client.sendMessage(row.chatId, delivered, {
+            buttons,
+            ...(this.abort?.signal ? { signal: this.abort.signal } : {}),
+          });
           // Telegram ya confirmo: desde aqui el mensaje **no** se reenvia. Lo que
           // queda es escribirlo, y esa escritura se reintenta sola si falla.
           const confirmation: ConfirmedDelivery = {
@@ -711,6 +982,9 @@ export class TelegramService implements OnModuleDestroy {
             chatId: row.chatId,
             userId: row.userId,
             text: delivered,
+            // El id del mensaje viaja con la entrega confirmada: si la escritura falla
+            // y se reintenta, no se vuelve a enviar.
+            messageId,
             sentAt: Date.now(),
             persistAttempts: 0,
             persistNextAttemptAt: 0,
@@ -737,8 +1011,9 @@ export class TelegramService implements OnModuleDestroy {
             { id: row.id },
             {
               state: permanent ? 'discarded' : 'pending',
-              // Un discarded ya no guarda la respuesta: el texto se vacia.
+              // Un discarded ya no guarda la respuesta: el texto y su teclado se vacian.
               text: permanent ? '' : row.text,
+              markup: permanent ? null : row.markup,
               attempts,
               lastError: reasonOf(error),
               nextAttemptAt: Date.now() + backoffMs(attempts),
@@ -785,7 +1060,9 @@ export class TelegramService implements OnModuleDestroy {
       }
       await outbox.update(
         { id: entry.outboxId },
-        { state: 'sent', lastError: null, nextAttemptAt: 0 },
+        // El id del mensaje se guarda **junto** al estado `sent` y al historial, en la
+        // misma transaccion: es la evidencia de que entrega es esa.
+        { state: 'sent', messageId: entry.messageId, lastError: null, nextAttemptAt: 0 },
       );
       if (!isOlderThanHistoryWindow(entry.sentAt, Date.now())) {
         await this.history.recordBot(manager, {
@@ -875,6 +1152,47 @@ function epochMs(instant: string): number | null {
 /** Motivo del fallo, sin detalle: nunca contiene la credencial ni el mensaje. */
 function reasonOf(error: unknown): string {
   return error instanceof TelegramError ? error.reason : 'error';
+}
+
+/**
+ * Lee la pulsacion guardada. `null` si la carga esta rota: una pulsacion ilegible
+ * **no** se enruta y nunca entra por el camino de texto.
+ *
+ * Los campos se validan al decodificar: la pulsacion tiene que tener id, datos
+ * validos (1..64 bytes) y un id de mensaje positivo y seguro.
+ */
+function parseCallbackPayload(payload: string | null): CallbackPayload | null {
+  if (payload === null || payload.length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return null;
+  }
+  const candidate = parsed as Partial<CallbackPayload>;
+  if (typeof candidate.callbackId !== 'string' || candidate.callbackId.length === 0) {
+    return null;
+  }
+  if (!isValidCallbackData(candidate.data)) {
+    return null;
+  }
+  if (
+    typeof candidate.messageId !== 'number' ||
+    !Number.isSafeInteger(candidate.messageId) ||
+    candidate.messageId <= 0
+  ) {
+    return null;
+  }
+  return {
+    callbackId: candidate.callbackId,
+    data: candidate.data,
+    messageId: candidate.messageId,
+  };
 }
 
 /**

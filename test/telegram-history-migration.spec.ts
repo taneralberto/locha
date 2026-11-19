@@ -11,6 +11,15 @@ import { createTempDatabase, openDatabase } from './helpers/temp-database';
 const migrations = buildDataSourceOptions(':memory:').migrations as Function[];
 
 /**
+ * El prefijo B7: todo hasta la migracion del historial, buscada por su nombre (no
+ * por su posicion, que cambia con cada migracion nueva).
+ */
+const hastaB7 = migrations.slice(
+  0,
+  migrations.findIndex((migration) => new (migration as new () => { name: string })().name === new TelegramHistory1791158400000().name) + 1,
+);
+
+/**
  * Unidad 1: la tabla del historial de Telegram. La migracion es **aditiva**: crea una
  * tabla nueva y no reescribe ni una fila de las que ya existian.
  */
@@ -142,7 +151,8 @@ describe('Migracion del historial de Telegram', () => {
   });
 
   it('el down quita la tabla y no toca las demas', async () => {
-    const db = await createTempDatabase();
+    // El down historico es el de B7: la base se abre en ese prefijo, no en el ultimo.
+    const db = await createTempDatabase(hastaB7);
     try {
       const tables = (
         await db.dataSource.query<{ name: string }[]>(

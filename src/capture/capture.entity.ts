@@ -9,7 +9,7 @@ export type CaptureState =
   | 'unsupported';
 
 /** Tipo de operacion del borrador: ademas de gasto e ingreso, las deudas. */
-export type CaptureKind = 'income' | 'expense' | 'debt_create' | 'debt_settle';
+export type CaptureKind = 'income' | 'expense' | 'debt_create' | 'debt_settle' | 'expense_correction';
 
 /**
  * Borrador durable de una operacion por conversacion. Solo hay un borrador vivo
@@ -26,7 +26,13 @@ export class Capture {
   @Column({ type: 'varchar' })
   chatId!: string;
 
-  /** Clave idempotente del movimiento que se registrara al confirmar. */
+  /**
+   * Clave idempotente del movimiento que se registrara al confirmar.
+   *
+   * En un borrador **correctivo** es la **version** del prompt vigente: vale
+   * `sourceKeyFor(chatId, eventId)` del evento que emitio el ultimo prompt. Una
+   * pulsacion solo se aplica si su prompt es el de esa version.
+   */
   @Column({ type: 'varchar' })
   sourceKey!: string;
 
@@ -58,6 +64,14 @@ export class Capture {
    */
   @Column({ type: 'text', nullable: true })
   debtPayload!: string | null;
+
+  /**
+   * Evento que ancla una correccion de gasto: la entrega anterior, ya confirmada.
+   * Es la **PK interna** de `capture_event` (no la del transporte) y solo se usa en
+   * los borradores de correccion; en los demas queda en `null`.
+   */
+  @Column({ type: 'varchar', nullable: true })
+  correctionTargetEventId!: string | null;
 
   /** Texto original del mensaje: solo se conserva mientras el borrador esta vivo. */
   @Column({ type: 'text', nullable: true })

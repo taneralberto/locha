@@ -44,6 +44,16 @@ export class CaptureEvent {
   @Column({ type: 'varchar', nullable: true })
   movementId!: string | null;
 
+  /**
+   * Metadatos del evento, en JSON: que se puede hacer con el y desde donde.
+   *
+   * Van **con la respuesta**: se guardan en la misma transaccion, para que el menu
+   * de una fase se pueda reproducir tal cual estaba, sin reconstruirlo con los datos
+   * de ahora. `null` si el evento no ofrece nada.
+   */
+  @Column({ type: 'text', nullable: true })
+  metadata!: string | null;
+
   @CreateDateColumn({ type: 'datetime' })
   createdAt!: Date;
 

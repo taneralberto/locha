@@ -88,7 +88,7 @@ function stubCommands(
   shouldFail: (eventId: string) => boolean,
   processed: string[],
 ): TelegramCommands {
-  return {
+  const commands = {
     answer: async (request: { eventId: string }): Promise<string> => {
       if (shouldFail(request.eventId)) {
         throw new Error('fallo de procesamiento simulado');
@@ -96,7 +96,13 @@ function stubCommands(
       processed.push(request.eventId);
       return 'respuesta simulada';
     },
-  } as unknown as TelegramCommands;
+    // La entrega delega en el texto de siempre: aqui no hay botones.
+    answerDelivery: async (request: { eventId: string }): Promise<{ text: string; buttons: [] }> => ({
+      text: await commands.answer(request),
+      buttons: [],
+    }),
+  };
+  return commands as unknown as TelegramCommands;
 }
 
 /** Espera a que la entrega de una actualizacion llegue al estado indicado. */
@@ -597,6 +603,10 @@ describe('TelegramService', () => {
         database.transactions,
         {
           answer: async (): Promise<string> => {
+            attempts.push(Date.now());
+            throw new Error('fallo de procesamiento simulado');
+          },
+          answerDelivery: async (): Promise<{ text: string; buttons: [] }> => {
             attempts.push(Date.now());
             throw new Error('fallo de procesamiento simulado');
           },

@@ -63,6 +63,10 @@ describe('TelegramApiClient', () => {
     expect(url).toContain('getUpdates');
     expect(url).toContain('offset=5');
     expect(url).toContain('timeout=25');
+    // Solo se piden mensajes y pulsaciones de boton.
+    expect(url).toContain(
+      `allowed_updates=${encodeURIComponent(JSON.stringify(['message', 'callback_query']))}`,
+    );
     expect(init.method).toBe('GET');
   });
 
@@ -71,12 +75,61 @@ describe('TelegramApiClient', () => {
       new Response(JSON.stringify({ ok: true, result: { message_id: 9 } }), { status: 200 }),
     );
 
-    await client().sendMessage('111', 'Registrado');
+    const messageId = await client().sendMessage('111', 'Registrado');
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toContain('sendMessage');
     expect(init.method).toBe('POST');
     expect(JSON.parse(String(init.body))).toEqual({ chat_id: 111, text: 'Registrado' });
+    // El id del mensaje es la evidencia de la entrega.
+    expect(messageId).toBe(9);
+  });
+
+  it('envia el teclado inline como reply_markup y devuelve el id del mensaje', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, result: { message_id: 42 } }), { status: 200 }),
+    );
+
+    const messageId = await client().sendMessage('111', 'Elige', {
+      buttons: [
+        [{ text: 'Si', data: 'accion:si' }],
+        [{ text: 'No', data: 'accion:no' }],
+      ],
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('sendMessage');
+    expect(JSON.parse(String(init.body))).toEqual({
+      chat_id: 111,
+      text: 'Elige',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Si', callback_data: 'accion:si' }],
+          [{ text: 'No', callback_data: 'accion:no' }],
+        ],
+      },
+    });
+    expect(messageId).toBe(42);
+  });
+
+  it('confirma la pulsacion sin mandar texto al chat', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await client().answerCallbackQuery('cb-1', 'Este boton ya no esta disponible.', true);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('answerCallbackQuery');
+    expect(url).toContain('callback_query_id=cb-1');
+    expect(url).toContain('show_alert=true');
+    expect(init.method).toBe('GET');
+  });
+
+  it('una confirmacion que no devuelve true es un fallo', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true, result: 'algo' }), { status: 200 }));
+
+    await expect(client().answerCallbackQuery('cb-1', null, false)).rejects.toMatchObject({
+      reason: 'invalid',
+    });
   });
 
   it('rechaza un envio que no devuelve el sobre de la API', async () => {

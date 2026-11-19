@@ -256,14 +256,24 @@ Migraciones: `InitialSchema1767225600000` (cuentas y movimientos),
 `GoalsAndSavings1783209600000` (metas y reservas virtuales B4) y
 `Debts1785888000000` (deudas: `debt` y `debt_payment`) y
 `DebtCapture1788566400000` (borrador de deuda: columna `debtPayload` de `capture`) y
-`TelegramHistory1791158400000` (tabla `telegram_history`: historial temporal del chat).
+`TelegramHistory1791158400000` (tabla `telegram_history`: historial temporal del chat) y
+`ExpenseCorrection1792000000000` (corrección de gasto: columna `correctionTargetEventId` de
+`capture` y columna `metadata` de `capture_event`) y
+`TelegramButtons1793000000000` (botones inline: columna `markup` y `messageId` de
+`telegram_outbox` y columna `callback` de `telegram_inbox`).
 
-Para actualizar una base ficticia A, B1, B2, B3, B4, B5, B6 o B7 completa: **detén el backend**,
+Para actualizar una base ficticia A, B1, B2, B3, B4, B5, B6, B7, B8 o B9 completa: **detén el backend**,
 haz una copia de seguridad, actualiza/compila el código y ejecuta `npm run migration:run`
 antes de reiniciar. **No borres ni recrees la base**: B4 añade solo `goal` y `savings_entry`, la migración de deudas
 añade solo `debt` y `debt_payment`, la del borrador de deuda añade **una sola columna** y la
 del historial **una sola tabla**, sin cambiar filas, IDs, claves ni esquemas previos.
 La aplicación no aplica migraciones automáticamente.
+
+Las dos ultimas migraciones (B8 y B9) son **aditivas**: B8 añade dos columnas nullable
+(`capture.correctionTargetEventId` y `capture_event.metadata`) y B9 añade tres
+(`telegram_outbox.markup`, `telegram_outbox.messageId` y `telegram_inbox.callback`).
+El `down` de B8 cancela los borradores correctivos vivos y el de B9 descarta las pulsaciones
+pendientes: ninguno de los dos toca los movimientos ya registrados.
 
 ## CLI
 
@@ -1151,6 +1161,50 @@ estados terminales se borra.
 
 `src/telegram/` contiene el bot. El transporte es la **API oficial de Telegram por HTTPS**
 (`getUpdates` y `sendMessage`), con el token solo en la URL y **nunca en un log**.
+
+### Corrección de un gasto con botones
+
+Hay **una sola ruta visible** para corregir un gasto ya confirmado:
+
+1. El aviso de gasto registrado trae el botón `Corregir este gasto`.
+2. Al pulsarlo, el bot pide el importe y la moneda (por ejemplo `2$ por USDT`). **No se
+   infiere nada**: el valor se lee con un parser estricto (positivo y exacto, sin
+   negativos, importes agrupados, dos símbolos, monedas en conflicto, varios importes ni
+   colas; un decimal suelto conserva la moneda del original y un `$` aislado pide el
+   código).
+3. Si hay **varias** cuentas compatibles, el bot muestra un botón por cuenta, tomado de
+   la lista que se guardó con el prompt (no de una consulta del momento). Con una sola
+   cuenta compatible se avanza solo.
+4. El bot muestra el **antes** y el **después** y ofrece `Aplicar correccion` y `Cancelar`.
+
+Solo ese resumen aplica el cambio: se llama a `FinancialService.correctExpense` con el
+gestor de la misma transacción en la que se cierra el borrador y el evento. La fecha y la
+descripción del gasto **no cambian**, y el gasto corregido no se suma dos veces (el
+original queda anulado y el nuevo lo reemplaza). Un `/confirm` sobre un borrador
+correctivo **no aplica nada** y `/cancel` lo descarta.
+
+Las pulsaciones se verifican **antes** de enrutar: tienen que ser un botón exacto de una
+entrega ya enviada al mismo chat y usuario, con el `message_id` que devolvió la API. Los
+botones viejos o de otra corrección quedan **inertes**: no cambian nada. No hay comando
+de texto para corregir ni para aplicar, y el borrador de corrección nunca llega al modelo.
+
+Los metadatos de cada prompt (la fase, la clave del origen y la lista de cuentas) van
+**con la respuesta del evento**, en la misma transacción (`capture_event.metadata`), para
+que un menú se pueda reproducir tal cual estaba. Un metadato ilegible o de otra fase se
+trata como si no hubiera: no se renderiza ningún botón y no se modifica nada.
+
+Cada prompt es una **versión**: el borrador apunta al prompt vigente con
+`sourceKeyFor(chatId, eventId)`, y una pulsación solo vale si su prompt es el vigente y es
+de la fase esperada. Por eso, tras `Cambiar importe`, el botón de aplicar o el de cancelar
+del mensaje anterior quedan inertes: no aplican ni descartan nada.
+
+Cada transición es **una transacción**: si algo falla, se revierte entera (no queda ni la
+anulación del original ni el movimiento de reemplazo, ni el borrador movido). Un fallo de
+**infraestructura** no se convierte en respuesta: se propaga, el evento queda abierto y el
+transporte **reintenta la pulsación pendiente sin confirmarla**, de modo que el mismo
+evento la completa cuando la base vuelva a responder y se escriba una sola vez. Un
+**rechazo de dominio** (la clave ya usada, el gasto ya revisado) sí es una respuesta
+terminal: se guarda en el evento, el mismo evento la reproduce y no se reintenta.
 
 ### Autorización (falla cerrada)
 

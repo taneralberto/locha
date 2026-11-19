@@ -13,6 +13,8 @@ import { GoalsAndSavings1783209600000 } from './migrations/1783209600000-GoalsAn
 import { Debts1785888000000 } from './migrations/1785888000000-Debts';
 import { DebtCapture1788566400000 } from './migrations/1788566400000-DebtCapture';
 import { TelegramHistory1791158400000 } from './migrations/1791158400000-TelegramHistory';
+import { ExpenseCorrection1792000000000 } from './migrations/1792000000000-ExpenseCorrection';
+import { TelegramButtons1793000000000 } from './migrations/1793000000000-TelegramButtons';
 
 /** Tablas que debe tener una base valida del proyecto. */
 const EXPECTED_TABLES = [
@@ -185,6 +187,7 @@ export function validateDatabase(path: string): void {
     // La columna del borrador de deuda va junto a su migracion: B6 exige B5.
     const captureColumns = database.prepare(`PRAGMA table_info("capture")`).all() as { name: string }[];
     const hasDebtPayload = captureColumns.some((column) => column.name === 'debtPayload');
+    const hasCorrectionTarget = captureColumns.some((column) => column.name === 'correctionTargetEventId');
     const hasB6 = appliedNames.includes(new DebtCapture1788566400000().name);
     if (hasDebtPayload !== hasB6 || (hasB6 && !hasB5)) {
       throw new Error(
@@ -196,6 +199,34 @@ export function validateDatabase(path: string): void {
     if (names.includes('telegram_history') !== hasB7 || (hasB7 && !hasB6)) {
       throw new Error(
         `La base "${path}" no tiene el esquema esperado B7: la tabla telegram_history y su migracion requieren B6, B5, B4, B3, B2 y B1.`,
+      );
+    }
+    // La columna que ancla una correccion de gasto y los metadatos del evento van
+    // junto a su migracion: B8 exige B7.
+    const hasB8 = appliedNames.includes(new ExpenseCorrection1792000000000().name);
+    const eventColumns = database.prepare(`PRAGMA table_info("capture_event")`).all() as { name: string }[];
+    const hasEventMetadata = eventColumns.some((column) => column.name === 'metadata');
+    if (hasCorrectionTarget !== hasB8 || hasEventMetadata !== hasB8 || (hasB8 && !hasB7)) {
+      throw new Error(
+        `La base "${path}" no tiene el esquema esperado B8: las columnas correctionTargetEventId y metadata y su migracion requieren B7, B6, B5, B4, B3, B2 y B1.`,
+      );
+    }
+    // Las columnas de los botones inline van junto a su migracion: B9 exige B8. Una
+    // base anterior a B9 es valida: no tiene las columnas ni la migracion.
+    const outboxColumns = database.prepare(`PRAGMA table_info("telegram_outbox")`).all() as { name: string }[];
+    const hasButtons = outboxColumns.some((column) => column.name === 'markup');
+    const hasMessageId = outboxColumns.some((column) => column.name === 'messageId');
+    const inboxColumns = database.prepare(`PRAGMA table_info("telegram_inbox")`).all() as { name: string }[];
+    const hasCallback = inboxColumns.some((column) => column.name === 'callback');
+    const hasB9 = appliedNames.includes(new TelegramButtons1793000000000().name);
+    if (
+      hasButtons !== hasB9 ||
+      hasMessageId !== hasB9 ||
+      hasCallback !== hasB9 ||
+      (hasB9 && !hasB8)
+    ) {
+      throw new Error(
+        `La base "${path}" no tiene el esquema esperado B9: las columnas de los botones inline y su migracion requieren B8, B7, B6, B5, B4, B3, B2 y B1.`,
       );
     }
     const pending = EXPECTED_MIGRATIONS.filter((migration) => !appliedNames.includes(migration));
